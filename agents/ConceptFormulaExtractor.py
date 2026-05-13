@@ -26,6 +26,14 @@ import httpx
 import requests
 
 warnings.filterwarnings("ignore", category=PendingDeprecationWarning, module=r"langgraph\..*")
+warnings.filterwarnings("ignore", message=r"The default value of `allowed_objects` will change.*")
+warnings.filterwarnings("ignore", category=Warning, message=r".*allowed_objects.*")
+try:
+    from langchain_core._api.deprecation import LangChainPendingDeprecationWarning
+
+    warnings.filterwarnings("ignore", category=LangChainPendingDeprecationWarning)
+except Exception:
+    pass
 
 from langgraph.graph import END, StateGraph
 from langgraph.types import RetryPolicy
@@ -34,6 +42,7 @@ from typing_extensions import TypedDict
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PROMPT_DIR = ROOT / "prompts"
 DEFAULT_INPUT = ROOT / "data" / "raw" / "第一章第一节_映射与函数.md"
 DEFAULT_OUTPUT = ROOT / "KG" / "第一章第一节_映射与函数_concept_formula_kg_agent.json"
 
@@ -64,6 +73,8 @@ RELATIONSHIP_TYPES = [
 ]
 
 
+# Agent outputs are validated against these Pydantic models before they can
+# move to the next LangGraph stage.
 class Evidence(BaseModel):
     source_path: str
     start_line: int
@@ -144,6 +155,7 @@ class DocumentChunk:
 
 
 class ExtractionState(TypedDict, total=False):
+    # Shared LangGraph state passed between workflow nodes.
     input_path: str
     output_path: str
     model: str
@@ -164,6 +176,8 @@ class ExtractionState(TypedDict, total=False):
     chunk_payloads: list[dict[str, Any]]
     relation_payload: dict[str, Any]
     normalized_payload: dict[str, Any]
+    verified_payload: dict[str, Any]
+    verification_batch_size: int
     result: ExtractionResult
     diagnostics: dict[str, Any]
 
@@ -174,6 +188,13 @@ def _env_first(names: list[str]) -> str | None:
         if value:
             return value
     return None
+
+
+def _load_prompt(filename: str) -> str:
+    prompt_path = PROMPT_DIR / filename
+    if not prompt_path.exists():
+        raise FileNotFoundError(f"Prompt file not found: {prompt_path}")
+    return prompt_path.read_text(encoding="utf-8").strip()
 
 
 def _stable_hash(*parts: str) -> str:
@@ -187,6 +208,7 @@ def _slug(text: str, limit: int = 36) -> str:
 
 
 def _node_id(node_type: str, name: str) -> str:
+    # Final node ids are deterministic so repeated runs can be compared.
     return f"{node_type.lower()}_{_slug(name)}_{_stable_hash(node_type, name)}"
 
 
@@ -209,7 +231,50 @@ def _extract_json_object(text: str) -> dict[str, Any]:
         raise
 
 
+def _latex_candidates_from_text(text: str) -> list[str]:
+    text = text.strip()
+    candidates: list[str] = []
+    candidates.extend(match.group(1).strip() for match in re.finditer(r"\$\$(.*?)\$\$", text, flags=re.S))
+    candidates.extend(match.group(1).strip() for match in re.finditer(r"\\\[(.*?)\\\]", text, flags=re.S))
+    candidates.extend(
+        match.group(1).strip()
+        for match in re.finditer(r"(?<!\\)\$(?!\$)(.*?)(?<!\\)\$", text, flags=re.S)
+        if match.group(1).strip()
+    )
+    if not candidates and _looks_like_standalone_latex(text):
+        candidates.append(text)
+    return [candidate for candidate in candidates if candidate]
+
+
+def _looks_like_standalone_latex(text: str) -> bool:
+    if not text or re.search(r"[\u4e00-\u9fff]", text):
+        return False
+    if len(text) > 1600:
+        return False
+    math_markers = ["\\", "=", "<", ">", "\\in", "\\frac", "\\sqrt", "\\left", "\\begin", "^", "_"]
+    return any(marker in text for marker in math_markers)
+
+
+def _best_latex_candidate(candidates: list[str]) -> str | None:
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: (item.count("\\") + item.count("=") + item.count("{"), len(item)))
+
+
+def _unique_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for item in items:
+        normalized = item.strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            unique.append(normalized)
+    return unique
+
+
 def _best_effort_agent_payload(text: str) -> dict[str, Any]:
+    # DeepSeek can occasionally return truncated JSON. Recover complete objects
+    # locally before spending another API call on JSON repair.
     body = text.split("\n\n", 1)[1] if text.startswith("JSONDecodeError:") and "\n\n" in text else text
     body = body.strip()
     if body.startswith("```"):
@@ -224,8 +289,16 @@ def _best_effort_agent_payload(text: str) -> dict[str, Any]:
     if not nodes_match:
         raise
     nodes_start = body.find("[", nodes_match.end() - 1)
-    nodes_text, nodes_end = _extract_balanced_array(body, nodes_start)
-    nodes = json.loads(nodes_text)
+    try:
+        nodes_text, nodes_end = _extract_balanced_array(body, nodes_start)
+        nodes = json.loads(nodes_text)
+    except json.JSONDecodeError:
+        nodes = _extract_complete_json_objects(body[nodes_start + 1 :])
+        return {
+            "nodes": nodes,
+            "relationships": [],
+            "notes": ["Recovered complete node objects from an incomplete JSON response."],
+        }
 
     relationships: list[dict[str, Any]] = []
     rel_match = re.search(r'"relationships"\s*:\s*\[', body[nodes_end:])
@@ -315,7 +388,7 @@ class JsonParseFailure(RuntimeError):
 
 
 class DeepSeekChatClient:
-    """Minimal OpenAI-compatible chat client for DeepSeek-style APIs."""
+    """OpenAI-compatible DeepSeek client with retries and JSON recovery."""
 
     def __init__(
         self,
@@ -346,6 +419,7 @@ class DeepSeekChatClient:
         self.thinking = thinking
 
     def complete_json(self, system_prompt: str, user_prompt: str, label: str = "request") -> dict[str, Any]:
+        # Prefer Python HTTP clients; fall back to PowerShell/.NET on Windows SSL EOF issues.
         payload: dict[str, Any] = {
             "model": self.model,
             "stream": False,
@@ -421,17 +495,34 @@ class DeepSeekChatClient:
         return response.json()["choices"][0]["message"]["content"]
 
     def _post_with_powershell(self, payload: dict[str, Any], label: str) -> str:
+        # Send raw UTF-8 bytes so PowerShell does not reinterpret Chinese text,
+        # LaTeX backslashes, or large JSON strings.
         work_dir = self._runtime_dir("_tmp")
         payload_path = work_dir / f"{int(time.time())}_{_slug(label)}_payload.json"
         response_path = work_dir / f"{int(time.time())}_{_slug(label)}_response.json"
         payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        payload_ps = str(payload_path).replace("'", "''")
+        response_ps = str(response_path).replace("'", "''")
+        url_ps = f"{self.base_url}/chat/completions".replace("'", "''")
         script = f"""
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$body = [System.IO.File]::ReadAllText('{str(payload_path)}', [System.Text.Encoding]::UTF8)
-$headers = @{{ Authorization = "Bearer $env:DEEPSEEK_API_KEY"; 'Content-Type' = 'application/json'; Accept = 'application/json' }}
-$response = Invoke-RestMethod -Uri '{self.base_url}/chat/completions' -Method Post -Headers $headers -Body $body -TimeoutSec {int(self.timeout)}
-$response | ConvertTo-Json -Depth 100 -Compress | Set-Content -LiteralPath '{str(response_path)}' -Encoding UTF8
+Add-Type -AssemblyName System.Net.Http
+$body = [System.IO.File]::ReadAllText('{payload_ps}', [System.Text.Encoding]::UTF8)
+$client = [System.Net.Http.HttpClient]::new()
+$client.Timeout = [System.TimeSpan]::FromSeconds({int(self.timeout)})
+$request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, '{url_ps}')
+$request.Headers.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $env:DEEPSEEK_API_KEY)
+$request.Headers.Accept.ParseAdd('application/json')
+$content = [System.Net.Http.ByteArrayContent]::new([System.Text.Encoding]::UTF8.GetBytes($body))
+$content.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse('application/json; charset=utf-8')
+$request.Content = $content
+$response = $client.SendAsync($request).GetAwaiter().GetResult()
+$responseBody = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+if (-not $response.IsSuccessStatusCode) {{
+    throw "HTTP $([int]$response.StatusCode): $responseBody"
+}}
+[System.IO.File]::WriteAllText('{response_ps}', $responseBody, [System.Text.Encoding]::UTF8)
 """
         env = os.environ.copy()
         env["DEEPSEEK_API_KEY"] = self.api_key
@@ -439,6 +530,8 @@ $response | ConvertTo-Json -Depth 100 -Compress | Set-Content -LiteralPath '{str
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=self.timeout + 30,
             env=env,
         )
@@ -457,10 +550,15 @@ $response | ConvertTo-Json -Depth 100 -Compress | Set-Content -LiteralPath '{str
         raise RuntimeError("无法创建运行时目录")
 
     def _parse_or_repair_json(self, content: str, label: str) -> dict[str, Any]:
+        # Strict parse -> local best-effort recovery -> model-based JSON repair.
         try:
             return _extract_json_object(content)
         except json.JSONDecodeError as exc:
             debug_path = self._write_debug_response(content, label, exc)
+            try:
+                return _best_effort_agent_payload(content)
+            except Exception:
+                pass
             repaired = self._repair_json_with_model(content, str(exc))
             try:
                 return _extract_json_object(repaired)
@@ -541,6 +639,7 @@ class ConceptFormulaExtractor:
         use_response_format: bool = True,
         no_proxy: bool = False,
         request_delay: float = 3.0,
+        verification_batch_size: int = 35,
         resume: bool = True,
         include_exercises: bool = False,
         verbose: bool = True,
@@ -557,6 +656,7 @@ class ConceptFormulaExtractor:
         self.use_response_format = use_response_format
         self.no_proxy = no_proxy
         self.request_delay = request_delay
+        self.verification_batch_size = verification_batch_size
         self.resume = resume
         self.include_exercises = include_exercises
         self.verbose = verbose
@@ -564,6 +664,9 @@ class ConceptFormulaExtractor:
         self.graph = self._build_graph()
 
     def _build_graph(self):
+        # LangGraph pipeline:
+        # markdown -> chunks -> local extraction -> cross-chunk relations
+        # -> normalization -> verification -> deterministic ids -> JSON output.
         workflow = StateGraph(ExtractionState)
         api_retry = RetryPolicy(
             initial_interval=8.0,
@@ -577,6 +680,7 @@ class ConceptFormulaExtractor:
         workflow.add_node("extract_with_agents", self._extract_with_agents, retry_policy=api_retry)
         workflow.add_node("infer_cross_chunk_relationships", self._infer_cross_chunk_relationships, retry_policy=api_retry)
         workflow.add_node("normalize_with_agent", self._normalize_with_agent, retry_policy=api_retry)
+        workflow.add_node("verify_with_agent", self._verify_with_agent, retry_policy=api_retry)
         workflow.add_node("finalize_graph", self._finalize_graph)
         workflow.add_node("save_result", self._save_result)
 
@@ -585,7 +689,8 @@ class ConceptFormulaExtractor:
         workflow.add_edge("chunk_document", "extract_with_agents")
         workflow.add_edge("extract_with_agents", "infer_cross_chunk_relationships")
         workflow.add_edge("infer_cross_chunk_relationships", "normalize_with_agent")
-        workflow.add_edge("normalize_with_agent", "finalize_graph")
+        workflow.add_edge("normalize_with_agent", "verify_with_agent")
+        workflow.add_edge("verify_with_agent", "finalize_graph")
         workflow.add_edge("finalize_graph", "save_result")
         workflow.add_edge("save_result", END)
         return workflow.compile()
@@ -604,6 +709,7 @@ class ConceptFormulaExtractor:
             "use_response_format": self.use_response_format,
             "no_proxy": self.no_proxy,
             "request_delay": self.request_delay,
+            "verification_batch_size": self.verification_batch_size,
             "resume": self.resume,
             "include_exercises": self.include_exercises,
             "verbose": self.verbose,
@@ -634,6 +740,7 @@ class ConceptFormulaExtractor:
         input_path = Path(state["input_path"])
         self._log(state, f"Loading markdown: {input_path}")
         lines = input_path.read_text(encoding="utf-8").splitlines()
+        # Skip exercises by default so this experiment focuses on the textbook section body.
         if not state.get("include_exercises", False):
             for index, line in enumerate(lines):
                 if re.match(r"^#\s*习题", line.strip()):
@@ -658,6 +765,7 @@ class ConceptFormulaExtractor:
             return marker.count("#") if marker.startswith("#") else 99
 
         def flush() -> None:
+            # Keep line numbers and heading context in every chunk for evidence tracing.
             nonlocal current, current_chars
             if not current:
                 return
@@ -708,6 +816,7 @@ class ConceptFormulaExtractor:
         return {**state, "chunks": chunks, "diagnostics": diagnostics}
 
     def _extract_with_agents(self, state: ExtractionState) -> ExtractionState:
+        # ExtractionAgent reads one chunk at a time and proposes local KG facts.
         client = self._client(state)
         chunk_payloads: list[dict[str, Any]] = []
         chunks = state["chunks"]
@@ -746,6 +855,7 @@ class ConceptFormulaExtractor:
         return {**state, "chunk_payloads": chunk_payloads, "diagnostics": diagnostics}
 
     def _infer_cross_chunk_relationships(self, state: ExtractionState) -> ExtractionState:
+        # RelationAgent adds relationships that require context across chunks.
         client = self._client(state)
         self._log(state, "RelationAgent start: inferring cross-chunk relationships")
         cached = self._read_stage_cache("relation", "cross_chunk", state)
@@ -794,6 +904,7 @@ class ConceptFormulaExtractor:
         }
 
     def _normalize_with_agent(self, state: ExtractionState) -> ExtractionState:
+        # NormalizerAgent deduplicates nodes, standardizes names, and removes weak relations.
         client = self._client(state)
         self._log(state, "NormalizerAgent start: deduplicating and cleaning candidate graph")
         cached = self._read_stage_cache("normalize", "normalized", state)
@@ -831,6 +942,27 @@ class ConceptFormulaExtractor:
             label="normalizer",
         )
         validated = AgentGraphPayload.model_validate(payload)
+        fallback_payload = self._candidate_graph_as_payload(state)
+        recovered_from_incomplete_json = any(
+            "incomplete JSON" in note or "incomplete json" in note.lower() for note in validated.notes
+        )
+        if recovered_from_incomplete_json and not validated.relationships and fallback_payload.relationships:
+            diagnostics = dict(state.get("diagnostics", {}))
+            diagnostics["normalizer_fallback"] = "kept_agent_candidate_graph_after_incomplete_normalizer_json"
+            diagnostics["normalized_node_count_from_agent"] = len(validated.nodes)
+            diagnostics["normalized_relationship_count_from_agent"] = len(validated.relationships)
+            diagnostics["fallback_node_count"] = len(fallback_payload.nodes)
+            diagnostics["fallback_relationship_count"] = len(fallback_payload.relationships)
+            self._log(
+                state,
+                "NormalizerAgent produced incomplete JSON; keeping candidate graph before normalization",
+            )
+            self._write_stage_cache("normalize", "normalized", fallback_payload.model_dump(mode="json"), state)
+            return {
+                **state,
+                "normalized_payload": fallback_payload.model_dump(mode="json"),
+                "diagnostics": diagnostics,
+            }
         self._write_stage_cache("normalize", "normalized", validated.model_dump(mode="json"), state)
         diagnostics = dict(state.get("diagnostics", {}))
         diagnostics["normalized_node_count_from_agent"] = len(validated.nodes)
@@ -845,9 +977,125 @@ class ConceptFormulaExtractor:
             "diagnostics": diagnostics,
         }
 
-    def _finalize_graph(self, state: ExtractionState) -> ExtractionState:
-        self._log(state, "Finalizing graph ids and validating references")
+    def _candidate_graph_as_payload(self, state: ExtractionState) -> AgentGraphPayload:
+        # Fallback path: preserve agent-produced candidates if normalization is truncated.
+        nodes: list[KGNode] = []
+        relationships: list[KGRelationship] = []
+        for raw_payload in [*state.get("chunk_payloads", []), state.get("relation_payload", {})]:
+            if not raw_payload:
+                continue
+            payload = AgentGraphPayload.model_validate(raw_payload)
+            nodes.extend(payload.nodes)
+            relationships.extend(payload.relationships)
+        return AgentGraphPayload(
+            nodes=nodes,
+            relationships=relationships,
+            notes=["Normalizer fallback: preserved agent-produced candidate graph."],
+        )
+
+    def _verify_with_agent(self, state: ExtractionState) -> ExtractionState:
+        # VerificationAgent reviews relationships in batches to avoid large JSON responses.
+        client = self._client(state)
+        self._log(state, "VerificationAgent start: validating relationship evidence and direction")
+        cached = self._read_stage_cache("verify", "verified", state)
+        if cached and state.get("resume", True):
+            validated = AgentGraphPayload.model_validate(cached)
+            diagnostics = dict(state.get("diagnostics", {}))
+            diagnostics["verified_node_count"] = len(validated.nodes)
+            diagnostics["verified_relationship_count"] = len(validated.relationships)
+            self._log(
+                state,
+                f"VerificationAgent resume: {len(validated.nodes)} nodes, {len(validated.relationships)} relationships",
+            )
+            return {
+                **state,
+                "verified_payload": validated.model_dump(mode="json"),
+                "diagnostics": diagnostics,
+            }
+
         payload = AgentGraphPayload.model_validate(state["normalized_payload"])
+        relationships = payload.relationships
+        batch_size = max(1, int(state.get("verification_batch_size", 35)))
+        node_summaries = [
+            {
+                "id": node.id,
+                "type": node.type,
+                "name": node.name,
+                "aliases": node.aliases[:5],
+                "description": node.description[:240],
+                "latex": node.latex,
+                "evidence": [ev.model_dump(mode="json") for ev in node.evidence[:1]],
+            }
+            for node in payload.nodes
+        ]
+
+        verified_relationships: list[KGRelationship] = []
+        notes: list[str] = []
+        batches = [relationships[index : index + batch_size] for index in range(0, len(relationships), batch_size)]
+        for index, batch in enumerate(batches, start=1):
+            label = f"batch_{index:03d}_of_{len(batches):03d}_{len(relationships)}rels"
+            cached_batch = self._read_stage_cache("verify", label, state) if state.get("resume", True) else None
+            if cached_batch:
+                batch_payload = AgentGraphPayload.model_validate(cached_batch)
+                self._log(
+                    state,
+                    f"VerificationAgent batch {index}/{len(batches)} resume: "
+                    f"{len(batch_payload.relationships)} relationships",
+                )
+            else:
+                if index > 1 and state.get("request_delay", 0) > 0:
+                    time.sleep(float(state["request_delay"]))
+                self._log(state, f"VerificationAgent batch {index}/{len(batches)} start")
+                response = client.complete_json(
+                    VERIFICATION_SYSTEM_PROMPT,
+                    json.dumps(
+                        {
+                            "source_path": state["input_path"],
+                            "allowed_node_types": NODE_TYPES,
+                            "allowed_relationship_types": RELATIONSHIP_TYPES,
+                            "output_contract": {
+                                "nodes": [],
+                                "relationships": OUTPUT_CONTRACT["relationships"],
+                                "notes": OUTPUT_CONTRACT["notes"],
+                            },
+                            "candidate_nodes": node_summaries,
+                            "relationship_batch": [rel.model_dump(mode="json") for rel in batch],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    label=f"verification_{label}",
+                )
+                batch_payload = AgentGraphPayload.model_validate(response)
+                self._write_stage_cache("verify", label, batch_payload.model_dump(mode="json"), state)
+                self._log(
+                    state,
+                    f"VerificationAgent batch {index}/{len(batches)} done: "
+                    f"{len(batch_payload.relationships)} relationships",
+                )
+            verified_relationships.extend(batch_payload.relationships)
+            notes.extend(batch_payload.notes)
+
+        verified = AgentGraphPayload(nodes=payload.nodes, relationships=verified_relationships, notes=notes)
+        self._write_stage_cache("verify", "verified", verified.model_dump(mode="json"), state)
+        diagnostics = dict(state.get("diagnostics", {}))
+        diagnostics["verification_batch_count"] = len(batches)
+        diagnostics["verified_node_count"] = len(verified.nodes)
+        diagnostics["verified_relationship_count"] = len(verified.relationships)
+        diagnostics["verification_removed_relationship_count"] = max(0, len(relationships) - len(verified.relationships))
+        self._log(
+            state,
+            f"VerificationAgent done: {len(verified.nodes)} nodes, {len(verified.relationships)} relationships",
+        )
+        return {
+            **state,
+            "verified_payload": verified.model_dump(mode="json"),
+            "diagnostics": diagnostics,
+        }
+
+    def _finalize_graph(self, state: ExtractionState) -> ExtractionState:
+        # Local finalization stabilizes ids and drops relationships with invalid endpoints.
+        self._log(state, "Finalizing graph ids and validating references")
+        payload = AgentGraphPayload.model_validate(state.get("verified_payload", state["normalized_payload"]))
         node_map: dict[str, KGNode] = {}
         tmp_to_final: dict[str, str] = {}
 
@@ -857,6 +1105,7 @@ class ConceptFormulaExtractor:
                 tmp_to_final[node.id] = final_id
             node.id = final_id
             self._repair_evidence(node.evidence, state["input_path"])
+            self._preserve_node_latex(node, state["raw_lines"])
             key = node.id
             if key in node_map:
                 node_map[key].aliases = sorted(set(node_map[key].aliases + node.aliases))
@@ -877,6 +1126,7 @@ class ConceptFormulaExtractor:
             if rel.source not in node_map or rel.target not in node_map or rel.source == rel.target:
                 continue
             self._repair_evidence(rel.evidence, state["input_path"])
+            self._preserve_relationship_latex(rel, state["raw_lines"])
             rel.id = _rel_id(rel.type, rel.source, rel.target)
             if rel.id in relationships:
                 relationships[rel.id].evidence.extend(rel.evidence)
@@ -899,6 +1149,13 @@ class ConceptFormulaExtractor:
         diagnostics["relationship_count"] = len(rels)
         diagnostics["node_count_by_type"] = self._count_by_type(nodes)
         diagnostics["relationship_count_by_type"] = self._count_by_type(rels)
+        diagnostics["formula_latex_from_evidence_count"] = sum(
+            1
+            for node in nodes
+            if node.type == "Formula" and node.properties.get("latex_source") in {"source_lines", "evidence"}
+        )
+        diagnostics["node_source_latex_count"] = sum(1 for node in nodes if node.properties.get("source_latex"))
+        diagnostics["relationship_source_latex_count"] = sum(1 for rel in rels if rel.properties.get("source_latex"))
 
         result = ExtractionResult(
             source_path=state["input_path"],
@@ -918,16 +1175,28 @@ class ConceptFormulaExtractor:
             self._log(state, f"Saving result: {output_path}")
             output_path.parent.mkdir(parents=True, exist_ok=True)
             result.diagnostics["output_path"] = str(output_path)
-            output_path.write_text(
-                json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            content = json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2)
+            try:
+                output_path.write_text(content, encoding="utf-8")
+            except OSError as exc:
+                fallback_root = Path("C:/tmp/maf_kg_outputs")
+                fallback_path = fallback_root / output_path.name
+                try:
+                    fallback_path.parent.mkdir(parents=True, exist_ok=True)
+                    fallback_path.write_text(content, encoding="utf-8")
+                except OSError:
+                    fallback_path = Path(tempfile.gettempdir()) / "maf_kg_outputs" / output_path.name
+                    fallback_path.parent.mkdir(parents=True, exist_ok=True)
+                    fallback_path.write_text(content, encoding="utf-8")
+                result.diagnostics["output_path"] = str(fallback_path)
+                result.diagnostics["output_fallback_reason"] = str(exc)
+                self._log(state, f"Primary output failed; saved fallback result: {fallback_path}")
             self._log(state, "Saved result")
         return state
 
     def _chunk_extraction_prompt(self, chunk: DocumentChunk, source_path: str) -> str:
         payload = {
-            "task": "从给定高等数学教材 chunk 中抽取知识图谱候选节点和关系。",
+            "task": "Extract candidate knowledge graph nodes and relationships from the given higher mathematics textbook chunk.",
             "source_path": source_path,
             "chunk_id": chunk.id,
             "line_span": [chunk.start_line, chunk.end_line],
@@ -938,13 +1207,14 @@ class ConceptFormulaExtractor:
             "limits": {
                 "max_nodes": 35,
                 "max_relationships": 60,
-                "instruction": "优先保留数学定义、公式、条件、定理、方法和例题相关事实；不要为了覆盖所有词而过量抽取。",
+                "instruction": "Prioritize facts about mathematical definitions, formulas, conditions, theorems, methods, and examples. Do not over-extract just to cover every term.",
             },
             "text_with_line_numbers": chunk.text,
         }
         return json.dumps(payload, ensure_ascii=False)
 
     def _cache_dir(self) -> Path:
+        # Stage cache prevents successful chunks from being billed again after a failed run.
         cache_dir = ROOT / "KG" / "_cache"
         try:
             cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1003,6 +1273,44 @@ class ConceptFormulaExtractor:
                 ev.end_line = ev.start_line
             ev.text = ev.text.strip()[:1200]
 
+    def _source_latex_from_evidence(self, evidence_items: list[Evidence], raw_lines: list[str]) -> tuple[list[str], str | None]:
+        source_line_candidates: list[str] = []
+        evidence_candidates: list[str] = []
+        for ev in evidence_items:
+            start = max(ev.start_line, 1)
+            end = max(ev.end_line, start)
+            source_text = "\n".join(raw_lines[start - 1 : min(end, len(raw_lines))])
+            source_line_candidates.extend(_latex_candidates_from_text(source_text))
+            evidence_candidates.extend(_latex_candidates_from_text(ev.text))
+        if source_line_candidates:
+            return _unique_preserve_order(source_line_candidates), "source_lines"
+        if evidence_candidates:
+            return _unique_preserve_order(evidence_candidates), "evidence"
+        return [], None
+
+    def _preserve_node_latex(self, node: KGNode, raw_lines: list[str]) -> None:
+        latex_items, latex_source = self._source_latex_from_evidence(node.evidence, raw_lines)
+        if not latex_items:
+            return
+        node.properties["source_latex"] = latex_items
+        node.properties["source_latex_source"] = latex_source
+        if node.latex:
+            raw_latex = _best_latex_candidate(latex_items)
+            if raw_latex and node.latex != raw_latex:
+                node.properties.setdefault("latex_agent", node.latex)
+                node.latex = raw_latex
+            node.properties["latex_source"] = latex_source
+        elif node.type == "Formula":
+            node.latex = _best_latex_candidate(latex_items)
+            node.properties["latex_source"] = latex_source
+
+    def _preserve_relationship_latex(self, rel: KGRelationship, raw_lines: list[str]) -> None:
+        latex_items, latex_source = self._source_latex_from_evidence(rel.evidence, raw_lines)
+        if not latex_items:
+            return
+        rel.properties["source_latex"] = latex_items
+        rel.properties["source_latex_source"] = latex_source
+
     def _count_by_type(self, items: list[KGNode] | list[KGRelationship]) -> dict[str, int]:
         counts: dict[str, int] = {}
         for item in items:
@@ -1020,82 +1328,47 @@ class ConceptFormulaExtractor:
 OUTPUT_CONTRACT = {
     "nodes": [
         {
-            "id": "局部临时ID，例如 c1/f1/d1；关系可引用它",
-            "type": "必须是允许的 node type 之一",
-            "name": "规范中文名称，公式可用 公式(1-3) 或 公式 L15",
-            "aliases": ["可选别名"],
-            "description": "该节点的数学含义，简洁但可解释",
-            "latex": "Formula 节点填写 LaTeX，其他节点可为 null",
+            "id": "Optional temporary id, such as c1, f1, or d1. Relationships may refer to it.",
+            "type": "One allowed node type.",
+            "name": "Canonical mathematical name, preferably faithful to the Chinese textbook wording.",
+            "aliases": ["Optional aliases or equivalent names."],
+            "description": "Concise mathematical meaning of the node.",
+            "latex": "Required for Formula nodes; null for non-formula nodes when not applicable.",
             "properties": {
-                "section": "所在小节或标题路径",
-                "conditions": "适用条件、定义域、变量约束等可放这里",
+                "section": "Heading path or local section name.",
+                "conditions": "Applicability conditions, domains, assumptions, or variable constraints.",
             },
             "evidence": [
                 {
-                    "source_path": "原文件路径",
-                    "start_line": "证据起始行号",
-                    "end_line": "证据结束行号",
-                    "text": "原文证据片段，不要改写",
-                    "chunk_id": "chunk id",
+                    "source_path": "Original markdown source path.",
+                    "start_line": "Evidence start line number.",
+                    "end_line": "Evidence end line number.",
+                    "text": "Original evidence snippet. Do not rewrite it.",
+                    "chunk_id": "Chunk id.",
                 }
             ],
-            "confidence": "0 到 1",
+            "confidence": "Number from 0 to 1.",
         }
     ],
     "relationships": [
         {
-            "id": "可留空或临时ID",
-            "type": "必须是允许的 relationship type 之一",
-            "source": "源节点临时ID",
-            "target": "目标节点临时ID",
-            "evidence": ["同上 Evidence 格式"],
-            "confidence": "0 到 1",
-            "properties": {"reason": "为什么建立这条边"},
+            "id": "Optional temporary id.",
+            "type": "One allowed relationship type.",
+            "source": "Temporary or final source node id.",
+            "target": "Temporary or final target node id.",
+            "evidence": ["Evidence objects with the same format as node evidence."],
+            "confidence": "Number from 0 to 1.",
+            "properties": {"reason": "Why this edge should exist."},
         }
     ],
-    "notes": ["无法确定、需要后续验证的观察"],
+    "notes": ["Uncertain observations or items that need later verification."],
 }
 
 
-EXTRACTION_SYSTEM_PROMPT = """你是 MaF-KG 的 ConceptFormulaExtractor 智能体，任务是从高等数学教材中抽取“公式感知”的知识图谱候选事实。你必须输出严格 JSON。
-
-硬性要求：
-1. 只输出 JSON object，不输出 Markdown、解释或代码块。
-2. 节点类型只能使用：Section, Concept, Definition, Formula, Theorem, Condition, Method, Example。
-3. 关系类型只能使用：belongs_to, contains, has_definition, has_formula, requires, has_condition, derived_from, equivalent_to, applies_to, uses_method, involves_concept, example_of。
-4. 必须保留证据：每个节点和关系都要尽量给 source_path、start_line、end_line、text、chunk_id。
-5. 不要把普通词滥抽成 Concept。优先抽高等数学学习中可诊断、可教学、可与公式/题型关联的对象。
-6. Formula 节点必须保留 LaTeX；公式适用条件要抽成 Condition，并用 requires 或 has_condition 连接。
-7. Definition 节点表示定义文本；Concept --has_definition--> Definition。
-8. Example 节点表示例题或例子；Example --example_of--> Concept，并连接涉及公式。
-9. Section 层级可以抽取本 chunk 明确出现的标题，并用 contains/belongs_to 连接。
-10. 关系是候选关系，不要求入库确定性，但要给置信度。
-11. 单个 chunk 最多输出 35 个 nodes 和 60 条 relationships；宁可少而准。
-12. 如果内容很多，优先输出 Definition、Formula、Theorem、Condition，再输出 Concept/Method/Example。"""
-
-
-RELATION_SYSTEM_PROMPT = """你是 MaF-KG 的跨段关系智能体。给你各 chunk 的候选图谱，请补充跨 chunk 的关键关系。你必须输出严格 JSON。
-
-只输出 JSON object。不要重新抽大量节点；如确实需要节点，只保留必要节点。重点补充：
-- 概念与定义、公式、条件之间的 has_definition/has_formula/has_condition/requires。
-- 公式之间的 derived_from/equivalent_to。
-- 例题与概念/公式/方法之间的 example_of/involves_concept/uses_method。
-- Section 层级的 contains/belongs_to。
-
-证据必须来自输入里的 evidence；如果证据不足，降低 confidence 或不要建边。"""
-
-
-NORMALIZER_SYSTEM_PROMPT = """你是 MaF-KG 的规范化智能体。给你候选图谱，请完成去重、规范命名、关系清洗。你必须输出严格 JSON。
-
-只输出 JSON object，并满足：
-1. nodes 和 relationships 使用给定 schema。
-2. 合并同义节点，例如“一一映射/双射”可用 aliases 或 equivalent_to 表示；不要保留明显重复的定义节点。
-3. 保留原始证据，不要编造行号。
-4. 删除泛泛的、没有教学价值的弱关系。
-5. 对每条关系确认 source/target 都能对应到输出 nodes 中的 id。
-6. 置信度按候选事实可靠性给出，低于 0.55 的关系直接删除。
-7. 输出应该适合后续验证智能体、Neo4j 导入和 Q-matrix 实验。
-8. 如候选图很大，优先保留 120 个以内节点和 220 条以内关系。"""
+EXTRACTION_SYSTEM_PROMPT = _load_prompt("concept_formula_extraction_system.txt")
+RELATION_SYSTEM_PROMPT = _load_prompt("cross_chunk_relation_system.txt")
+NORMALIZER_SYSTEM_PROMPT = _load_prompt("normalizer_system.txt")
+VERIFICATION_SYSTEM_PROMPT = _load_prompt("verification_system.txt")
 
 
 def check_config() -> int:
@@ -1136,6 +1409,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--request-timeout", type=float, default=180)
     parser.add_argument("--max-tokens", type=int, default=16000)
     parser.add_argument("--request-delay", type=float, default=3.0, help="Seconds to sleep between DeepSeek calls.")
+    parser.add_argument("--verification-batch-size", type=int, default=35, help="Relationships per VerificationAgent call.")
     parser.add_argument("--no-save", action="store_true", help="Run graph but do not write output file.")
     parser.add_argument("--no-resume", action="store_true", help="Ignore cached chunk/stage payloads and call the API again.")
     parser.add_argument("--include-exercises", action="store_true", help="Also extract exercise content after the exercise heading.")
@@ -1172,6 +1446,7 @@ def main() -> None:
         use_response_format=not args.no_response_format,
         no_proxy=args.no_proxy,
         request_delay=args.request_delay,
+        verification_batch_size=args.verification_batch_size,
         resume=not args.no_resume,
         include_exercises=args.include_exercises,
         verbose=not args.quiet,
