@@ -37,17 +37,17 @@ DEFAULT_INPUT = ROOT / "data" / "raw" / "第一章第一节_映射与函数.md"
 DEFAULT_OUTPUT = ROOT / "KG" / "第一章第一节_映射与函数_kg_v7.json"
 NODE_TYPES = ["Concept", "Formula", "Property", "Theorem", "Proof", "Example", "Figure"]
 RELATION_SIGNATURES: dict[str, tuple[tuple[str, str], ...]] = {
-    "has_formula": (("Concept", "Formula"), ("Property", "Formula"), ("Theorem", "Formula"), ("Proof", "Formula"), ("Example", "Formula")),
+    "has_formula": (("Concept", "Formula"), ("Property", "Formula"), ("Theorem", "Formula")),
     "has_property": (("Concept", "Property"), ("Theorem", "Property")),
     "example_of": (("Example", "Concept"), ("Example", "Property"), ("Example", "Theorem")),
     "illustrated_by": (("Concept", "Figure"), ("Property", "Figure"), ("Theorem", "Figure"), ("Example", "Figure")),
-    "prerequisite_of": (("Concept", "Concept"), ("Concept", "Property"), ("Property", "Property"), ("Property", "Theorem"), ("Theorem", "Theorem"), ("Theorem", "Concept")),
     "similar_to": (("Concept", "Concept"), ("Property", "Property"), ("Theorem", "Theorem"), ("Formula", "Formula")),
     "proved_by": (("Theorem", "Proof"), ("Property", "Proof")),
 }
 RELATION_TYPES = list(RELATION_SIGNATURES)
 EXAMPLE_PROOF_TYPES = {"Example", "Proof"}
 OCCURRENCE_NODE_TYPES = {"Example", "Proof", "Figure"}
+LINK_REQUIRED_NODE_TYPES = {"Formula", "Example", "Proof", "Figure"}
 
 class Evidence(BaseModel):
     source_path: str
@@ -70,7 +70,7 @@ class KGNode(BaseModel):
 
 class KGRelation(BaseModel):
     source_id: str
-    relation_type: Literal["has_formula", "has_property", "example_of", "illustrated_by", "prerequisite_of", "similar_to", "proved_by"]
+    relation_type: Literal["has_formula", "has_property", "example_of", "illustrated_by", "similar_to", "proved_by"]
     target_id: str
     score: float = Field(ge=0, le=1)
     evidence: Evidence
@@ -100,7 +100,7 @@ class NodeMemoryItem(BaseModel):
 
 class RelationMemoryItem(BaseModel):
     source_id: str
-    relation_type: Literal["has_formula", "has_property", "example_of", "illustrated_by", "prerequisite_of", "similar_to", "proved_by"]
+    relation_type: Literal["has_formula", "has_property", "example_of", "illustrated_by", "similar_to", "proved_by"]
     target_id: str
     score: float = Field(ge=0, le=1)
     evidence: Evidence
@@ -134,7 +134,7 @@ class NodeAction(BaseModel):
 
 class ProposedRelation(BaseModel):
     source_ref: str
-    relation_type: Literal["has_formula", "has_property", "example_of", "illustrated_by", "prerequisite_of", "similar_to", "proved_by"]
+    relation_type: Literal["has_formula", "has_property", "example_of", "illustrated_by", "similar_to", "proved_by"]
     target_ref: str
     score: float = Field(ge=0, le=1)
     evidence: EvidenceRef
@@ -155,7 +155,7 @@ class NodeRecord(BaseModel):
 
 class RelationRecord(BaseModel):
     source_id: str
-    relation_type: Literal["has_formula", "has_property", "example_of", "illustrated_by", "prerequisite_of", "similar_to", "proved_by"]
+    relation_type: Literal["has_formula", "has_property", "example_of", "illustrated_by", "similar_to", "proved_by"]
     target_id: str
     score: float = Field(ge=0, le=1)
     evidences: list[Evidence] = Field(default_factory=list)
@@ -287,7 +287,39 @@ def _best_latex_candidate(items: list[str]) -> str | None:
     return max(items, key=lambda s: (s.count("\\"), s.count("{"), len(s))) if items else None
 
 def _load_source_latex_map(lines: list[str]) -> dict[int, list[str]]:
-    return {idx: cands for idx, line in enumerate(lines, start=1) if (cands := _extract_latex_candidates(line))}
+    candidates_by_line: dict[int, list[str]] = {}
+    for line_no, line in enumerate(lines, start=1):
+        candidates = _extract_latex_candidates(line)
+        if candidates:
+            candidates_by_line[line_no] = candidates
+
+    opening_markers = {"$$": "$$", r"\[": r"\]", "```math": "```", "```latex": "```"}
+    index = 0
+    while index < len(lines):
+        marker = lines[index].strip().lower()
+        closing_marker = opening_markers.get(marker)
+        if closing_marker is None:
+            index += 1
+            continue
+        close_index = index + 1
+        while close_index < len(lines) and lines[close_index].strip().lower() != closing_marker:
+            close_index += 1
+        if close_index >= len(lines):
+            index += 1
+            continue
+        block_lines = lines[index + 1 : close_index]
+        nonempty_offsets = [offset for offset, text in enumerate(block_lines) if text.strip()]
+        if nonempty_offsets:
+            first_offset = nonempty_offsets[0]
+            last_offset = nonempty_offsets[-1]
+            source_line = index + first_offset + 2
+            latex = "\n".join(block_lines[first_offset : last_offset + 1]).strip()
+            existing = candidates_by_line.setdefault(source_line, [])
+            if latex and latex not in existing:
+                existing.append(latex)
+        index = close_index + 1
+
+    return candidates_by_line
 
 def _latex_candidate_id(line_no: int, candidate_index: int) -> str:
     return f"latex_L{line_no}_{candidate_index + 1}"
@@ -1174,12 +1206,29 @@ class Extractor:
     def _relation_memory_item(self, relation: RelationRecord) -> RelationMemoryItem:
         return RelationMemoryItem(source_id=relation.source_id, relation_type=relation.relation_type, target_id=relation.target_id, score=relation.score, evidence=self._best_relation_evidence(relation))
 
-    def _chunk_extraction_prompt(self, chunk: DocumentChunk, source_path: str, node_memory: list[NodeMemoryItem], relation_memory: list[RelationMemoryItem]) -> str:
+    def _chunk_extraction_prompt(
+        self,
+        chunk: DocumentChunk,
+        source_path: str,
+        node_memory: list[NodeMemoryItem],
+        relation_memory: list[RelationMemoryItem],
+    ) -> str:
         evidence_line_numbers = [int(match.group(1)) for line in chunk.text.splitlines() if (match := re.match(r"^([0-9]+):", line))]
-        evidence_line_set = set(evidence_line_numbers)
-        source_latex_candidates = [{"candidate_id": candidate_id, "line": line_no, "latex": latex} for candidate_id, (line_no, latex) in self.source_latex_candidates.items() if line_no in evidence_line_set]
+        source_latex_candidates = self._source_latex_candidates_for_chunk(chunk)
         payload = {"source_path": source_path, "chunk": {"chunk_id": chunk.id, "start_line": chunk.start_line, "end_line": chunk.end_line, "heading_path": chunk.heading_path, "context_before_text": chunk.context_before_text, "text": chunk.text, "context_after_text": chunk.context_after_text, "evidence_line_numbers": evidence_line_numbers}, "source_latex_candidates": source_latex_candidates, "node_memory": [item.model_dump(mode="json") for item in node_memory], "relation_memory": [item.model_dump(mode="json") for item in relation_memory], "allowed_node_types": NODE_TYPES, "allowed_relation_types": RELATION_TYPES, "allowed_relation_signatures": {relation_type: [{"source_type": source_type, "target_type": target_type} for source_type, target_type in signatures] for relation_type, signatures in RELATION_SIGNATURES.items()}, "output_contract": OUTPUT_CONTRACT}
         return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _source_latex_candidates_for_chunk(self, chunk: DocumentChunk) -> list[dict[str, Any]]:
+        visible_lines = {
+            int(match.group(1))
+            for line in chunk.text.splitlines()
+            if (match := re.match(r"^([0-9]+):", line))
+        }
+        return [
+            {"candidate_id": candidate_id, "line": line_no, "latex": latex}
+            for candidate_id, (line_no, latex) in self.source_latex_candidates.items()
+            if line_no in visible_lines
+        ]
 
     def _merge_chunk_response(
         self,
@@ -1196,43 +1245,58 @@ class Extractor:
         new_relation_count = 0
         ref_to_final: dict[str, str] = {}
         created_refs: set[str] = set()
+        link_required_refs: set[str] = set()
         relation_refs: set[str] = set()
         decisions: list[dict[str, Any]] = []
+        skipped_items: list[dict[str, str]] = []
+
+        def skip_item(kind: str, item_ref: str, reason: str) -> None:
+            skipped_items.append({"kind": kind, "ref": item_ref, "reason": reason})
+            self._log(f"Skipping {kind} in {chunk.id} ({item_ref}): {reason}")
 
         for action in response.node_actions:
             ref_id = action.ref_id.strip()
             if ref_id in ref_to_final:
-                raise ValueError(f"Duplicate node action ref_id in {chunk.id}: {ref_id}")
-            evidence = self._sanitize_evidence(action.evidence, chunk, source_path, raw_lines)
-            if action.action == "reuse":
-                existing_id = str(action.existing_id)
-                if existing_id not in allowed_existing_ids:
-                    raise ValueError(f"Reuse target was not supplied in node_memory for {chunk.id}: {existing_id}")
-                if existing_id not in node_store:
-                    raise ValueError(f"Reuse target does not exist in canonical memory: {existing_id}")
-                existing = node_store[existing_id]
-                if action.type is not None and action.type != existing.type:
-                    raise ValueError(f"Reuse type mismatch for {existing_id}: {action.type} != {existing.type}")
-                self._merge_reuse_action(existing, action, evidence)
-                final_id = existing_id
-                reused_node_count += 1
-            else:
-                sanitized = self._sanitize_create_action(action, evidence)
-                node_type = sanitized.type
-                if node_type is None:
-                    raise ValueError(f"Create action missing node type: {ref_id}")
-                final_id = self._allocate_node_id(sanitized, evidence, source_path, node_store)
-                node_store[final_id] = NodeRecord(
-                    id=final_id,
-                    type=node_type,
-                    name=sanitized.name,
-                    aliases=sanitized.aliases,
-                    description=sanitized.description,
-                    content=sanitized.content,
-                    evidence=[evidence],
-                )
-                created_refs.add(ref_id)
-                created_node_count += 1
+                skip_item("node_action", ref_id, "duplicate ref_id")
+                continue
+            try:
+                evidence = self._sanitize_evidence(action.evidence, chunk, source_path, raw_lines)
+                if action.action == "reuse":
+                    existing_id = str(action.existing_id)
+                    if existing_id not in allowed_existing_ids:
+                        raise ValueError(f"reuse target was not supplied in node_memory: {existing_id}")
+                    if existing_id not in node_store:
+                        raise ValueError(f"reuse target does not exist in canonical memory: {existing_id}")
+                    existing = node_store[existing_id]
+                    if action.type is not None and action.type != existing.type:
+                        raise ValueError(
+                            f"reuse type mismatch: {action.type} != canonical {existing.type} for {existing_id}"
+                        )
+                    self._merge_reuse_action(existing, action, evidence)
+                    final_id = existing_id
+                    reused_node_count += 1
+                else:
+                    sanitized = self._sanitize_create_action(action, evidence)
+                    node_type = sanitized.type
+                    if node_type is None:
+                        raise ValueError(f"create action missing node type: {ref_id}")
+                    final_id = self._allocate_node_id(sanitized, evidence, source_path, node_store)
+                    node_store[final_id] = NodeRecord(
+                        id=final_id,
+                        type=node_type,
+                        name=sanitized.name,
+                        aliases=sanitized.aliases,
+                        description=sanitized.description,
+                        content=sanitized.content,
+                        evidence=[evidence],
+                    )
+                    created_refs.add(ref_id)
+                    if node_type in LINK_REQUIRED_NODE_TYPES:
+                        link_required_refs.add(ref_id)
+                    created_node_count += 1
+            except ValueError as exc:
+                skip_item("node_action", ref_id, str(exc))
+                continue
             ref_to_final[ref_id] = final_id
             decisions.append(
                 {
@@ -1244,27 +1308,34 @@ class Extractor:
                     "start_line": evidence.start_line,
                     "end_line": evidence.end_line,
                     "reason": action.reason.strip(),
+                    "status": "accepted",
                 }
             )
 
         for relation in response.relations:
             source_ref = relation.source_ref.strip()
             target_ref = relation.target_ref.strip()
-            if source_ref not in ref_to_final or target_ref not in ref_to_final:
-                raise ValueError(
-                    f"Relation in {chunk.id} references missing node action: {source_ref} -> {target_ref}"
-                )
-            source_id = ref_to_final[source_ref]
-            target_id = ref_to_final[target_ref]
+            relation_ref = f"{source_ref} -[{relation.relation_type}]-> {target_ref}"
+            source_id = ref_to_final.get(source_ref)
+            target_id = ref_to_final.get(target_ref)
+            if source_id is None or target_id is None:
+                skip_item("relation", relation_ref, "endpoint does not reference a valid node_action ref_id")
+                continue
             if source_id == target_id:
-                raise ValueError(f"Self relation is not allowed in {chunk.id}: {source_ref} -> {target_ref}")
+                skip_item("relation", relation_ref, "self relation")
+                continue
             if not self._relation_signature_valid(relation.relation_type, node_store[source_id].type, node_store[target_id].type):
-                self._log(
-                    f"Skipping invalid relation in {chunk.id}: "
-                    f"{node_store[source_id].type} -[{relation.relation_type}]-> {node_store[target_id].type}"
+                skip_item(
+                    "relation",
+                    relation_ref,
+                    f"invalid type signature: {node_store[source_id].type} -> {node_store[target_id].type}",
                 )
                 continue
-            evidence = self._sanitize_evidence(relation.evidence, chunk, source_path, raw_lines)
+            try:
+                evidence = self._sanitize_evidence(relation.evidence, chunk, source_path, raw_lines)
+            except ValueError as exc:
+                skip_item("relation", relation_ref, str(exc))
+                continue
             relation_refs.update([source_ref, target_ref])
             key = _relation_key(source_id, relation.relation_type, target_id)
             if key in relation_store:
@@ -1275,13 +1346,23 @@ class Extractor:
             relation_store[key] = RelationRecord(source_id=left_source, relation_type=rel_type, target_id=left_target, score=_clamp_score(relation.score), evidences=[evidence])
             new_relation_count += 1
 
-        unlinked_created_refs = sorted(created_refs - relation_refs)
+        unlinked_created_refs = sorted(link_required_refs - relation_refs)
         if unlinked_created_refs:
-            self._log(f"Removing orphan nodes in {chunk.id} (created but not linked): {unlinked_created_refs}")
+            self._log(f"Removing unlinked occurrence/formula nodes in {chunk.id}: {unlinked_created_refs}")
             for ref_id in unlinked_created_refs:
                 orphan_id = ref_to_final.pop(ref_id)
                 node_store.pop(orphan_id, None)
                 created_node_count -= 1
+                for decision in decisions:
+                    if decision["ref_id"] == ref_id:
+                        decision["status"] = "removed_unlinked"
+                        break
+        pending_refs = sorted((created_refs - relation_refs) - link_required_refs)
+        for ref_id in pending_refs:
+            for decision in decisions:
+                if decision["ref_id"] == ref_id:
+                    decision["status"] = "pending_unlinked"
+                    break
         return {
             "chunk_id": chunk.id,
             "created_node_count": created_node_count,
@@ -1289,6 +1370,10 @@ class Extractor:
             "new_relation_count": new_relation_count,
             "total_nodes": len(node_store),
             "total_relations": len(relation_store),
+            "skipped_item_count": len(skipped_items),
+            "skipped_items": skipped_items,
+            "pending_node_count": len(pending_refs),
+            "pending_node_refs": pending_refs,
             "decisions": decisions,
         }
 
@@ -1351,8 +1436,7 @@ class Extractor:
                 return {}
             candidate = self.source_latex_candidates.get(candidate_id)
             if candidate is None:
-                self._log(f"Unknown Formula latex_candidate_id: {candidate_id}, keeping formula without latex")
-                return {}
+                raise ValueError(f"Unknown Formula latex_candidate_id: {candidate_id}")
             line_no, latex = candidate
             if line_no < evidence.start_line or line_no > evidence.end_line:
                 raise ValueError(
@@ -1420,7 +1504,7 @@ class Extractor:
             aliases.append(mention)
         existing.aliases = _unique_preserve_order(aliases)
         description = re.sub(r"\s+", " ", action.description).strip()
-        if description and not existing.description:
+        if description:
             existing.description = description
         if action.content:
             incoming = self._sanitize_node_content(existing.type, action.content, evidence, required=False)
@@ -1509,6 +1593,7 @@ class Extractor:
             },
             "node_memory": [item.model_dump(mode="json") for item in node_memory],
             "relation_memory": [item.model_dump(mode="json") for item in relation_memory],
+            "source_latex_candidates": self._source_latex_candidates_for_chunk(chunk),
             "provider": state["provider"],
             "model": state["model"],
             "base_url": state["base_url"],
@@ -1579,7 +1664,7 @@ OUTPUT_CONTRACT = {
             },
         }
     ],
-    "notes": ["Optional short uncertainty notes."],
+    "notes": ["Optional diagnostic observations. Not persistent memory."],
 }
 
 def check_config(
@@ -1698,5 +1783,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
