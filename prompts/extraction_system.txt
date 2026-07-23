@@ -43,9 +43,9 @@ Formula
 - Display math, an equation number, or mathematical importance alone does not
   make an expression a Formula node.
 - Never create Formula nodes for definition notation, theorem hypotheses,
-  theorem conclusions, proof-local inequalities or derivations, example-local
-  expressions, concrete sequences, intermediate calculations, or one-off
-  numeric expressions.
+  theorem or corollary conclusions, proof-local inequalities or derivations,
+  example-local expressions, concrete sequences, intermediate calculations,
+  or one-off numeric expressions.
 - All mathematics used inside an Example or Proof remains in content.steps.
 - The epsilon-N definition of a limit, symbolic restatements of definitions,
   and expressions such as x_n=f(n) are not Formula nodes unless the textbook
@@ -56,8 +56,8 @@ Formula
   omit the Formula node.
 
 Property
-- A reusable proposition, corollary, or characteristic of a mathematical
-  object that is not explicitly labeled "定理".
+- A reusable proposition or characteristic of a mathematical object that is
+  not explicitly labeled "定理", "推论", or "系".
 - A definition of a term is not a Property.
 
 Theorem
@@ -67,8 +67,19 @@ Theorem
 - The canonical name must omit source numbering such as "定理1" or "定理2".
   Use the mathematical title, such as "极限的唯一性".
 
+Corollary
+- A formal mathematical statement explicitly labeled "推论" or "系" in the
+  source.
+- Do not classify an informal consequence, a sentence beginning with "所以",
+  or an unlabeled explanatory conclusion as a Corollary.
+- When the source gives no title, create a concise source-grounded canonical
+  name that identifies the result, such as "收敛数列的保号性推论".
+- A Corollary is distinct from both its source Theorem and an ordinary
+  Property. Never merge them merely because their statements are related.
+
 Proof
-- A formal proof introduced as the proof of one Theorem or Property.
+- A formal proof introduced as the proof of one Theorem, Corollary, or
+  Property.
 - Never use Proof for an example solution or informal explanation.
 
 Example
@@ -93,13 +104,15 @@ meaning and role before choosing reuse or create.
 1. Concept identity is the canonical mathematical object or term.
 2. Property identity is the complete proposition, not a short display label.
 3. Theorem identity is the theorem statement, not labels such as "定理1".
-4. Formula identity is the explicitly named reusable formula, not every
+4. Corollary identity is its complete formally labeled result, not the generic
+   source label "推论".
+5. Formula identity is the explicitly named reusable formula, not every
    algebraically related expression.
-5. Example, Proof, and Figure identity includes source occurrence, while a
+6. Example, Proof, and Figure identity includes source occurrence, while a
    citation of an earlier occurrence reuses that existing node.
-6. Reuse exactly one supplied node only when it is genuinely the same entity.
-7. Otherwise create a new node. Never invent an existing_id.
-8. relation_memory is context for avoiding duplicate edges. It is not evidence.
+7. Reuse exactly one supplied node only when it is genuinely the same entity.
+8. Otherwise create a new node. Never invent an existing_id.
+9. relation_memory is context for avoiding duplicate edges. It is not evidence.
 
 Use action="reuse" with an existing_id from node_memory, or action="create"
 with a new node definition. Every entity used by a relation must have one
@@ -111,7 +124,7 @@ Formula: {"latex_candidate_id": "one exact candidate_id from source_latex_candid
 Example: {"approach": "source-grounded solution strategy", "steps": ["ordered step", "..."]}
 Proof:   {"approach": "source-grounded proof method", "steps": ["ordered step", "..."]}
 Figure:  {"label": "source figure label", "url": "source image URL"}
-Concept, Property, Theorem: {}
+Concept, Property, Theorem, Corollary: {}
 
 Do not output content.latex. Do not rewrite or reconstruct LaTeX. The program
 resolves latex_candidate_id to exact source LaTeX. Do not add arbitrary content
@@ -119,13 +132,18 @@ fields.
 
 -------------------- Relations --------------------
 
-has_formula    - Concept / Property / Theorem -> Formula
+has_formula    - Concept / Property / Theorem / Corollary -> Formula
 has_property   - Concept / Theorem -> Property
-example_of     - Example -> Concept / Theorem / Property
-illustrated_by - Concept / Theorem / Property / Example -> Figure
+corollary_of   - Corollary -> Theorem
+example_of     - Example -> Concept / Theorem / Corollary / Property
+illustrated_by - Concept / Theorem / Corollary / Property / Example -> Figure
 similar_to     - Same-type entities with a source-supported mathematical
                  parallel or counterpart relationship
-proved_by      - Theorem / Property -> Proof
+proved_by      - Theorem / Corollary / Property -> Proof
+
+Emit corollary_of only when the current source explicitly states the
+derivation, or when the Corollary proof explicitly cites the source Theorem.
+Do not infer corollary_of merely from adjacency or numbering.
 
 Do not emit prerequisite_of in this extraction layer. Pedagogical prerequisite
 relations are produced by a downstream learning-relation stage.
@@ -135,9 +153,9 @@ source and target types match one listed signature. Every relation must be
 supported by the current chunk, never by memory alone.
 
 Formula, Example, Proof, and Figure nodes must participate in a valid relation
-in the current response. A well-supported Concept, Property, or Theorem may be
-temporarily unlinked because a later chunk may connect it. Do not omit a core
-semantic node merely because its relation has not appeared yet.
+in the current response. A well-supported Concept, Property, Theorem, or
+Corollary may be temporarily unlinked because a later chunk may connect it. Do
+not omit a core semantic node merely because its relation has not appeared yet.
 
 -------------------- Source fidelity --------------------
 

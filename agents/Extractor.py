@@ -34,15 +34,17 @@ from langgraph.graph import END, StateGraph
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT_DIR = ROOT / "prompts"
 DEFAULT_INPUT = ROOT / "data" / "raw" / "第一章第一节_映射与函数.md"
-DEFAULT_OUTPUT = ROOT / "KG" / "第一章第一节_映射与函数_kg_v7.json"
-NODE_TYPES = ["Concept", "Formula", "Property", "Theorem", "Proof", "Example", "Figure"]
+DEFAULT_OUTPUT = ROOT / "KG" / "第一章第一节_映射与函数_kg_v8.json"
+SCHEMA_VERSION = "maf-kg.agent.v8"
+NODE_TYPES = ["Concept", "Formula", "Property", "Theorem", "Corollary", "Proof", "Example", "Figure"]
 RELATION_SIGNATURES: dict[str, tuple[tuple[str, str], ...]] = {
-    "has_formula": (("Concept", "Formula"), ("Property", "Formula"), ("Theorem", "Formula")),
+    "has_formula": (("Concept", "Formula"), ("Property", "Formula"), ("Theorem", "Formula"), ("Corollary", "Formula")),
     "has_property": (("Concept", "Property"), ("Theorem", "Property")),
-    "example_of": (("Example", "Concept"), ("Example", "Property"), ("Example", "Theorem")),
-    "illustrated_by": (("Concept", "Figure"), ("Property", "Figure"), ("Theorem", "Figure"), ("Example", "Figure")),
-    "similar_to": (("Concept", "Concept"), ("Property", "Property"), ("Theorem", "Theorem"), ("Formula", "Formula")),
-    "proved_by": (("Theorem", "Proof"), ("Property", "Proof")),
+    "corollary_of": (("Corollary", "Theorem"),),
+    "example_of": (("Example", "Concept"), ("Example", "Property"), ("Example", "Theorem"), ("Example", "Corollary")),
+    "illustrated_by": (("Concept", "Figure"), ("Property", "Figure"), ("Theorem", "Figure"), ("Corollary", "Figure"), ("Example", "Figure")),
+    "similar_to": (("Concept", "Concept"), ("Property", "Property"), ("Theorem", "Theorem"), ("Corollary", "Corollary"), ("Formula", "Formula")),
+    "proved_by": (("Theorem", "Proof"), ("Corollary", "Proof"), ("Property", "Proof")),
 }
 RELATION_TYPES = list(RELATION_SIGNATURES)
 EXAMPLE_PROOF_TYPES = {"Example", "Proof"}
@@ -62,7 +64,7 @@ class EvidenceRef(BaseModel):
 
 class KGNode(BaseModel):
     id: str
-    type: Literal["Concept", "Formula", "Property", "Theorem", "Proof", "Example", "Figure"]
+    type: Literal["Concept", "Formula", "Property", "Theorem", "Corollary", "Proof", "Example", "Figure"]
     name: str
     aliases: list[str] = Field(default_factory=list)
     description: str = ""
@@ -70,13 +72,13 @@ class KGNode(BaseModel):
 
 class KGRelation(BaseModel):
     source_id: str
-    relation_type: Literal["has_formula", "has_property", "example_of", "illustrated_by", "similar_to", "proved_by"]
+    relation_type: Literal["has_formula", "has_property", "corollary_of", "example_of", "illustrated_by", "similar_to", "proved_by"]
     target_id: str
     score: float = Field(ge=0, le=1)
     evidence: Evidence
 
 class ExtractionResult(BaseModel):
-    schema_version: str = "maf-kg.agent.v7"
+    schema_version: str = SCHEMA_VERSION
     source_path: str
     title: str
     provider: str
@@ -89,7 +91,7 @@ class ExtractionResult(BaseModel):
 
 class NodeMemoryItem(BaseModel):
     id: str
-    type: Literal["Concept", "Formula", "Property", "Theorem", "Proof", "Example", "Figure"]
+    type: Literal["Concept", "Formula", "Property", "Theorem", "Corollary", "Proof", "Example", "Figure"]
     name: str
     aliases: list[str] = Field(default_factory=list)
     description: str = ""
@@ -100,7 +102,7 @@ class NodeMemoryItem(BaseModel):
 
 class RelationMemoryItem(BaseModel):
     source_id: str
-    relation_type: Literal["has_formula", "has_property", "example_of", "illustrated_by", "similar_to", "proved_by"]
+    relation_type: Literal["has_formula", "has_property", "corollary_of", "example_of", "illustrated_by", "similar_to", "proved_by"]
     target_id: str
     score: float = Field(ge=0, le=1)
     evidence: Evidence
@@ -110,7 +112,7 @@ class NodeAction(BaseModel):
     action: Literal["reuse", "create"]
     existing_id: str | None = None
     mention: str
-    type: Literal["Concept", "Formula", "Property", "Theorem", "Proof", "Example", "Figure"] | None = None
+    type: Literal["Concept", "Formula", "Property", "Theorem", "Corollary", "Proof", "Example", "Figure"] | None = None
     name: str = ""
     aliases: list[str] = Field(default_factory=list)
     description: str = ""
@@ -134,7 +136,7 @@ class NodeAction(BaseModel):
 
 class ProposedRelation(BaseModel):
     source_ref: str
-    relation_type: Literal["has_formula", "has_property", "example_of", "illustrated_by", "similar_to", "proved_by"]
+    relation_type: Literal["has_formula", "has_property", "corollary_of", "example_of", "illustrated_by", "similar_to", "proved_by"]
     target_ref: str
     score: float = Field(ge=0, le=1)
     evidence: EvidenceRef
@@ -146,7 +148,7 @@ class ChunkExtractionResponse(BaseModel):
 
 class NodeRecord(BaseModel):
     id: str
-    type: Literal["Concept", "Formula", "Property", "Theorem", "Proof", "Example", "Figure"]
+    type: Literal["Concept", "Formula", "Property", "Theorem", "Corollary", "Proof", "Example", "Figure"]
     name: str
     aliases: list[str] = Field(default_factory=list)
     description: str = ""
@@ -155,7 +157,7 @@ class NodeRecord(BaseModel):
 
 class RelationRecord(BaseModel):
     source_id: str
-    relation_type: Literal["has_formula", "has_property", "example_of", "illustrated_by", "similar_to", "proved_by"]
+    relation_type: Literal["has_formula", "has_property", "corollary_of", "example_of", "illustrated_by", "similar_to", "proved_by"]
     target_id: str
     score: float = Field(ge=0, le=1)
     evidences: list[Evidence] = Field(default_factory=list)
@@ -1567,7 +1569,7 @@ class Extractor:
         return self.input_path.stem
 
     def _cache_dir(self) -> Path:
-        path = ROOT / "node_cache" / "sequential_extractor_v7"
+        path = ROOT / "node_cache" / "sequential_extractor_v8"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -1579,7 +1581,7 @@ class Extractor:
         relation_memory: list[RelationMemoryItem],
     ) -> str:
         payload = {
-            "schema_version": "maf-kg.agent.v7",
+            "schema_version": SCHEMA_VERSION,
             "system_prompt_sha256": hashlib.sha256(self.system_prompt.encode("utf-8")).hexdigest(),
             "output_contract": OUTPUT_CONTRACT,
             "chunk": {
@@ -1695,7 +1697,7 @@ def check_config(
                 "response_format_supported": adapter_class.supports_response_format,
                 "chunk_context_before_lines": 6,
                 "chunk_context_after_lines": 4,
-                "schema_version": "maf-kg.agent.v7",
+                "schema_version": SCHEMA_VERSION,
             },
             ensure_ascii=False,
             indent=2,
