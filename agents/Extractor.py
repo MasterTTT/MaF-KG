@@ -34,22 +34,32 @@ from langgraph.graph import END, StateGraph
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT_DIR = ROOT / "prompts"
 DEFAULT_INPUT = ROOT / "data" / "raw" / "第一章第一节_映射与函数.md"
-DEFAULT_OUTPUT = ROOT / "KG" / "第一章第一节_映射与函数_kg_v8.json"
-SCHEMA_VERSION = "maf-kg.agent.v8"
-NODE_TYPES = ["Concept", "Formula", "Property", "Theorem", "Corollary", "Proof", "Example", "Figure"]
+DEFAULT_OUTPUT = ROOT / "KG" / "第一章第一节_映射与函数_semantic_v1_1.json"
+SCHEMA_VERSION = "maf-kg.semantic.v1.1"
+NODE_TYPES = ["Concept", "Claim", "Method"]
 RELATION_SIGNATURES: dict[str, tuple[tuple[str, str], ...]] = {
-    "has_formula": (("Concept", "Formula"), ("Property", "Formula"), ("Theorem", "Formula"), ("Corollary", "Formula")),
-    "has_property": (("Concept", "Property"), ("Theorem", "Property")),
-    "corollary_of": (("Corollary", "Theorem"),),
-    "example_of": (("Example", "Concept"), ("Example", "Property"), ("Example", "Theorem"), ("Example", "Corollary")),
-    "illustrated_by": (("Concept", "Figure"), ("Property", "Figure"), ("Theorem", "Figure"), ("Corollary", "Figure"), ("Example", "Figure")),
-    "similar_to": (("Concept", "Concept"), ("Property", "Property"), ("Theorem", "Theorem"), ("Corollary", "Corollary"), ("Formula", "Formula")),
-    "proved_by": (("Theorem", "Proof"), ("Corollary", "Proof"), ("Property", "Proof")),
+    "involves": (("Claim", "Concept"),),
+    "uses": (("Method", "Concept"), ("Method", "Claim"), ("Method", "Method")),
+    "establishes": (("Method", "Claim"),),
+    "derived_from": (("Claim", "Claim"),),
+    "equivalent_to": (("Claim", "Claim"),),
+    "special_case_of": (("Concept", "Concept"),),
+    "defined_in_terms_of": (("Concept", "Concept"),),
 }
 RELATION_TYPES = list(RELATION_SIGNATURES)
-EXAMPLE_PROOF_TYPES = {"Example", "Proof"}
-OCCURRENCE_NODE_TYPES = {"Example", "Proof", "Figure"}
-LINK_REQUIRED_NODE_TYPES = {"Formula", "Example", "Proof", "Figure"}
+EXPRESSION_ROLES = ["definition_representation", "claim_representation", "method_template"]
+
+NodeType = Literal["Concept", "Claim", "Method"]
+RelationType = Literal[
+    "involves",
+    "uses",
+    "establishes",
+    "derived_from",
+    "equivalent_to",
+    "special_case_of",
+    "defined_in_terms_of",
+]
+ExpressionRole = Literal["definition_representation", "claim_representation", "method_template"]
 
 class Evidence(BaseModel):
     source_path: str
@@ -64,18 +74,25 @@ class EvidenceRef(BaseModel):
 
 class KGNode(BaseModel):
     id: str
-    type: Literal["Concept", "Formula", "Property", "Theorem", "Corollary", "Proof", "Example", "Figure"]
+    type: NodeType
     name: str
     aliases: list[str] = Field(default_factory=list)
     description: str = ""
-    content: dict[str, Any] = Field(default_factory=dict)
+    evidence: list[Evidence] = Field(default_factory=list)
 
 class KGRelation(BaseModel):
+    id: str
+    type: RelationType
     source_id: str
-    relation_type: Literal["has_formula", "has_property", "corollary_of", "example_of", "illustrated_by", "similar_to", "proved_by"]
     target_id: str
-    score: float = Field(ge=0, le=1)
-    evidence: Evidence
+    evidence: list[Evidence] = Field(default_factory=list)
+
+class MathExpression(BaseModel):
+    id: str
+    owner_id: str
+    role: ExpressionRole
+    latex: str
+    evidence: list[Evidence] = Field(default_factory=list)
 
 class ExtractionResult(BaseModel):
     schema_version: str = SCHEMA_VERSION
@@ -83,28 +100,31 @@ class ExtractionResult(BaseModel):
     title: str
     provider: str
     model: str
-    node_types: list[str] = Field(default_factory=lambda: list(NODE_TYPES))
-    relation_types: list[str] = Field(default_factory=lambda: list(RELATION_TYPES))
     nodes: list[KGNode] = Field(default_factory=list)
     relations: list[KGRelation] = Field(default_factory=list)
+    math_expressions: list[MathExpression] = Field(default_factory=list)
     diagnostics: dict[str, Any] = Field(default_factory=dict)
+
+class ExpressionMemoryItem(BaseModel):
+    id: str
+    role: ExpressionRole
+    latex: str
 
 class NodeMemoryItem(BaseModel):
     id: str
-    type: Literal["Concept", "Formula", "Property", "Theorem", "Corollary", "Proof", "Example", "Figure"]
+    type: NodeType
     name: str
     aliases: list[str] = Field(default_factory=list)
     description: str = ""
-    content: dict[str, Any] = Field(default_factory=dict)
+    math_expressions: list[ExpressionMemoryItem] = Field(default_factory=list)
     occurrences: list[Evidence] = Field(default_factory=list)
     retrieval_score: float = 0.0
     retrieval_reasons: list[str] = Field(default_factory=list)
 
 class RelationMemoryItem(BaseModel):
     source_id: str
-    relation_type: Literal["has_formula", "has_property", "corollary_of", "example_of", "illustrated_by", "similar_to", "proved_by"]
+    relation_type: RelationType
     target_id: str
-    score: float = Field(ge=0, le=1)
     evidence: Evidence
 
 class NodeAction(BaseModel):
@@ -112,11 +132,10 @@ class NodeAction(BaseModel):
     action: Literal["reuse", "create"]
     existing_id: str | None = None
     mention: str
-    type: Literal["Concept", "Formula", "Property", "Theorem", "Corollary", "Proof", "Example", "Figure"] | None = None
+    type: NodeType | None = None
     name: str = ""
     aliases: list[str] = Field(default_factory=list)
     description: str = ""
-    content: dict[str, Any] = Field(default_factory=dict)
     evidence: EvidenceRef
     reason: str = ""
 
@@ -136,30 +155,41 @@ class NodeAction(BaseModel):
 
 class ProposedRelation(BaseModel):
     source_ref: str
-    relation_type: Literal["has_formula", "has_property", "corollary_of", "example_of", "illustrated_by", "similar_to", "proved_by"]
+    relation_type: RelationType
     target_ref: str
-    score: float = Field(ge=0, le=1)
+    evidence: EvidenceRef
+
+class ProposedExpression(BaseModel):
+    owner_ref: str
+    role: ExpressionRole
+    latex_candidate_id: str
     evidence: EvidenceRef
 
 class ChunkExtractionResponse(BaseModel):
     node_actions: list[NodeAction] = Field(default_factory=list)
     relations: list[ProposedRelation] = Field(default_factory=list)
+    expressions: list[ProposedExpression] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
 
 class NodeRecord(BaseModel):
     id: str
-    type: Literal["Concept", "Formula", "Property", "Theorem", "Corollary", "Proof", "Example", "Figure"]
+    type: NodeType
     name: str
     aliases: list[str] = Field(default_factory=list)
     description: str = ""
-    content: dict[str, Any] = Field(default_factory=dict)
     evidence: list[Evidence] = Field(default_factory=list)
 
 class RelationRecord(BaseModel):
     source_id: str
-    relation_type: Literal["has_formula", "has_property", "corollary_of", "example_of", "illustrated_by", "similar_to", "proved_by"]
+    relation_type: RelationType
     target_id: str
-    score: float = Field(ge=0, le=1)
+    evidences: list[Evidence] = Field(default_factory=list)
+
+class MathExpressionRecord(BaseModel):
+    id: str
+    owner_id: str
+    role: ExpressionRole
+    latex: str
     evidences: list[Evidence] = Field(default_factory=list)
 
 @dataclass
@@ -251,18 +281,22 @@ def _node_id(node_type: str, name: str) -> str:
     return f"{node_type.lower()}_{_slug(name)}_{_stable_hash(node_type, _normalize_name(name))}"
 
 def _relation_key(source_id: str, relation_type: str, target_id: str) -> tuple[str, str, str]:
-    if relation_type == "similar_to":
+    if relation_type == "equivalent_to":
         left, right = sorted([source_id, target_id])
         return left, relation_type, right
     return source_id, relation_type, target_id
+
+def _relation_id(source_id: str, relation_type: str, target_id: str) -> str:
+    left, relation, right = _relation_key(source_id, relation_type, target_id)
+    return f"relation_{_stable_hash(left, relation, right)}"
+
+def _expression_id(owner_id: str, role: str, latex: str) -> str:
+    return f"expression_{_stable_hash(owner_id, role, latex)}"
 
 def _text_snippet(lines: list[str], start_line: int, end_line: int) -> str:
     start = max(1, start_line)
     end = min(len(lines), end_line)
     return "\n".join(lines[start - 1 : end]) if start <= end else ""
-
-def _clamp_score(value: float | int | None, default: float = 0.8) -> float:
-    return max(0.0, min(1.0, float(value))) if isinstance(value, (int, float)) else default
 
 def _unique_preserve_order(items: list[str]) -> list[str]:
     seen, out = set(), []
@@ -284,9 +318,6 @@ def _extract_latex_candidates(text: str) -> list[str]:
     if not items and _looks_like_latex(text.strip()):
         items.append(text.strip())
     return [item for item in items if item]
-
-def _best_latex_candidate(items: list[str]) -> str | None:
-    return max(items, key=lambda s: (s.count("\\"), s.count("{"), len(s))) if items else None
 
 def _load_source_latex_map(lines: list[str]) -> dict[int, list[str]]:
     candidates_by_line: dict[int, list[str]] = {}
@@ -631,7 +662,7 @@ class ProviderChatClient:
             "Content-Type": "application/json",
             "Accept": "application/json",
             "Connection": "close",
-            "User-Agent": f"MaF-KG-SequentialExtractor/0.2 ({self.provider})",
+            "User-Agent": f"MaF-KG-SemanticExtractor/0.1 ({self.provider})",
         }
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
@@ -1013,6 +1044,7 @@ class Extractor:
         lines = state["raw_lines"]
         node_store: dict[str, NodeRecord] = {}
         relation_store: dict[tuple[str, str, str], RelationRecord] = {}
+        expression_store: dict[tuple[str, str, str], MathExpressionRecord] = {}
         chunk_summaries: list[dict[str, Any]] = []
         decision_ledger: list[dict[str, Any]] = []
         processed_chunk_ids: list[str] = []
@@ -1023,6 +1055,7 @@ class Extractor:
                 chunk,
                 node_store,
                 relation_store,
+                expression_store,
                 recent_chunk_ids=set(processed_chunk_ids[-2:]),
             )
             cache_fingerprint = self._cache_fingerprint(chunk, state, node_memory, relation_memory)
@@ -1052,6 +1085,7 @@ class Extractor:
                 response = ChunkExtractionResponse.model_validate(payload)
             working_node_store = {node_id: node.model_copy(deep=True) for node_id, node in node_store.items()}
             working_relation_store = {key: relation.model_copy(deep=True) for key, relation in relation_store.items()}
+            working_expression_store = {key: expression.model_copy(deep=True) for key, expression in expression_store.items()}
             summary = self._merge_chunk_response(
                 response,
                 chunk,
@@ -1059,10 +1093,12 @@ class Extractor:
                 lines,
                 working_node_store,
                 working_relation_store,
+                working_expression_store,
                 allowed_existing_ids={item.id for item in node_memory},
             )
             node_store = working_node_store
             relation_store = working_relation_store
+            expression_store = working_expression_store
             if not cache_hit:
                 self._write_chunk_cache(chunk.id, cache_fingerprint, response.model_dump(mode="json"), state)
             decision_ledger.extend(summary.pop("decisions"))
@@ -1074,13 +1110,15 @@ class Extractor:
             self._log(
                 f"Extractor chunk {idx}/{len(state['chunks'])} done: "
                 f"create={summary['created_node_count']}, reuse={summary['reused_node_count']}, "
-                f"+{summary['new_relation_count']} relations, totals={len(node_store)} nodes/{len(relation_store)} relations"
+                f"+{summary['new_relation_count']} relations, +{summary['new_expression_count']} expressions, "
+                f"totals={len(node_store)} nodes/{len(relation_store)} relations/{len(expression_store)} expressions"
             )
         result = self._finalize_result(
             state["input_path"],
             lines,
             node_store,
             relation_store,
+            expression_store,
             {
                 **dict(state.get("diagnostics", {})),
                 "cache_hits": cache_hits,
@@ -1102,6 +1140,7 @@ class Extractor:
         chunk: DocumentChunk,
         node_store: dict[str, NodeRecord],
         relation_store: dict[tuple[str, str, str], RelationRecord],
+        expression_store: dict[tuple[str, str, str], MathExpressionRecord],
         recent_chunk_ids: set[str],
         max_nodes: int = 40,
         max_relations: int = 60,
@@ -1109,9 +1148,18 @@ class Extractor:
         if not node_store:
             return [], []
 
+        expressions_by_owner: dict[str, list[MathExpressionRecord]] = {}
+        for expression in expression_store.values():
+            expressions_by_owner.setdefault(expression.owner_id, []).append(expression)
+
         ranked: list[tuple[float, list[str], NodeRecord]] = []
         for node in node_store.values():
-            score, reasons = self._node_memory_relevance(chunk, node, recent_chunk_ids)
+            score, reasons = self._node_memory_relevance(
+                chunk,
+                node,
+                expressions_by_owner.get(node.id, []),
+                recent_chunk_ids,
+            )
             if score > 0:
                 ranked.append((score, reasons, node))
         ranked.sort(key=lambda item: (-item[0], item[2].type, item[2].name, item[2].id))
@@ -1126,25 +1174,32 @@ class Extractor:
         neighbor_candidates: list[tuple[float, str, NodeRecord]] = []
         for rel in relation_store.values():
             if rel.source_id in seed_ids and rel.target_id not in selected and rel.target_id in node_store:
-                neighbor_candidates.append((rel.score, rel.source_id, node_store[rel.target_id]))
+                neighbor_candidates.append((selected[rel.source_id][1] * 0.5, rel.source_id, node_store[rel.target_id]))
             if rel.target_id in seed_ids and rel.source_id not in selected and rel.source_id in node_store:
-                neighbor_candidates.append((rel.score, rel.target_id, node_store[rel.source_id]))
-        for rel_score, seed_id, node in sorted(neighbor_candidates, key=lambda item: (-item[0], item[2].name, item[2].id)):
+                neighbor_candidates.append((selected[rel.target_id][1] * 0.5, rel.target_id, node_store[rel.source_id]))
+        for neighbor_score, seed_id, node in sorted(neighbor_candidates, key=lambda item: (-item[0], item[2].name, item[2].id)):
             if len(selected) >= max_nodes:
                 break
-            selected.setdefault(node.id, (node, rel_score, [f"one_hop:{seed_id}"]))
+            selected.setdefault(node.id, (node, neighbor_score, [f"one_hop:{seed_id}"]))
 
         selected_ids = set(selected)
         selected_rels = [
             relation
             for relation in sorted(
                 relation_store.values(),
-                key=lambda rel: (-rel.score, rel.relation_type, rel.source_id, rel.target_id),
+                key=lambda rel: (
+                    -(selected[rel.source_id][1] + selected[rel.target_id][1])
+                    if rel.source_id in selected and rel.target_id in selected
+                    else 0.0,
+                    rel.relation_type,
+                    rel.source_id,
+                    rel.target_id,
+                ),
             )
             if relation.source_id in selected_ids and relation.target_id in selected_ids
         ][:max_relations]
         memory_nodes = [
-            self._node_memory_item(node, score, reasons)
+            self._node_memory_item(node, expressions_by_owner.get(node.id, []), score, reasons)
             for node, score, reasons in sorted(
                 selected.values(),
                 key=lambda item: (-item[1], item[0].type, item[0].name, item[0].id),
@@ -1156,6 +1211,7 @@ class Extractor:
         self,
         chunk: DocumentChunk,
         node: NodeRecord,
+        expressions: list[MathExpressionRecord],
         recent_chunk_ids: set[str],
     ) -> tuple[float, list[str]]:
         haystack = "\n".join(
@@ -1181,8 +1237,7 @@ class Extractor:
                 score += overlap * 4.0
                 reasons.append(f"semantic_ngram:{overlap:.2f}")
 
-        latex = str(node.content.get("latex") or "").strip()
-        if latex and latex in chunk.text:
+        if any(expression.latex and expression.latex in haystack for expression in expressions):
             score += 8.0
             reasons.append("exact_latex")
 
@@ -1191,7 +1246,13 @@ class Extractor:
             reasons.append("recent_chunk")
         return score, _unique_preserve_order(reasons)
 
-    def _node_memory_item(self, node: NodeRecord, score: float, reasons: list[str]) -> NodeMemoryItem:
+    def _node_memory_item(
+        self,
+        node: NodeRecord,
+        expressions: list[MathExpressionRecord],
+        score: float,
+        reasons: list[str],
+    ) -> NodeMemoryItem:
         occurrences = sorted(node.evidence, key=lambda evidence: (evidence.start_line, evidence.end_line))[-3:]
         return NodeMemoryItem(
             id=node.id,
@@ -1199,14 +1260,22 @@ class Extractor:
             name=node.name,
             aliases=node.aliases,
             description=node.description,
-            content=node.content,
+            math_expressions=[
+                ExpressionMemoryItem(id=expression.id, role=expression.role, latex=expression.latex)
+                for expression in sorted(expressions, key=lambda item: (item.role, item.id))[:4]
+            ],
             occurrences=occurrences,
             retrieval_score=round(score, 4),
             retrieval_reasons=reasons,
         )
 
     def _relation_memory_item(self, relation: RelationRecord) -> RelationMemoryItem:
-        return RelationMemoryItem(source_id=relation.source_id, relation_type=relation.relation_type, target_id=relation.target_id, score=relation.score, evidence=self._best_relation_evidence(relation))
+        return RelationMemoryItem(
+            source_id=relation.source_id,
+            relation_type=relation.relation_type,
+            target_id=relation.target_id,
+            evidence=self._best_relation_evidence(relation),
+        )
 
     def _chunk_extraction_prompt(
         self,
@@ -1217,7 +1286,33 @@ class Extractor:
     ) -> str:
         evidence_line_numbers = [int(match.group(1)) for line in chunk.text.splitlines() if (match := re.match(r"^([0-9]+):", line))]
         source_latex_candidates = self._source_latex_candidates_for_chunk(chunk)
-        payload = {"source_path": source_path, "chunk": {"chunk_id": chunk.id, "start_line": chunk.start_line, "end_line": chunk.end_line, "heading_path": chunk.heading_path, "context_before_text": chunk.context_before_text, "text": chunk.text, "context_after_text": chunk.context_after_text, "evidence_line_numbers": evidence_line_numbers}, "source_latex_candidates": source_latex_candidates, "node_memory": [item.model_dump(mode="json") for item in node_memory], "relation_memory": [item.model_dump(mode="json") for item in relation_memory], "allowed_node_types": NODE_TYPES, "allowed_relation_types": RELATION_TYPES, "allowed_relation_signatures": {relation_type: [{"source_type": source_type, "target_type": target_type} for source_type, target_type in signatures] for relation_type, signatures in RELATION_SIGNATURES.items()}, "output_contract": OUTPUT_CONTRACT}
+        payload = {
+            "source_path": source_path,
+            "chunk": {
+                "chunk_id": chunk.id,
+                "start_line": chunk.start_line,
+                "end_line": chunk.end_line,
+                "heading_path": chunk.heading_path,
+                "context_before_text": chunk.context_before_text,
+                "text": chunk.text,
+                "context_after_text": chunk.context_after_text,
+                "evidence_line_numbers": evidence_line_numbers,
+            },
+            "source_latex_candidates": source_latex_candidates,
+            "node_memory": [item.model_dump(mode="json") for item in node_memory],
+            "relation_memory": [item.model_dump(mode="json") for item in relation_memory],
+            "allowed_node_types": NODE_TYPES,
+            "allowed_relation_types": RELATION_TYPES,
+            "allowed_relation_signatures": {
+                relation_type: [
+                    {"source_type": source_type, "target_type": target_type}
+                    for source_type, target_type in signatures
+                ]
+                for relation_type, signatures in RELATION_SIGNATURES.items()
+            },
+            "allowed_expression_roles": EXPRESSION_ROLES,
+            "output_contract": OUTPUT_CONTRACT,
+        }
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
     def _source_latex_candidates_for_chunk(self, chunk: DocumentChunk) -> list[dict[str, Any]]:
@@ -1240,21 +1335,31 @@ class Extractor:
         raw_lines: list[str],
         node_store: dict[str, NodeRecord],
         relation_store: dict[tuple[str, str, str], RelationRecord],
+        expression_store: dict[tuple[str, str, str], MathExpressionRecord],
         allowed_existing_ids: set[str],
     ) -> dict[str, Any]:
         created_node_count = 0
         reused_node_count = 0
         new_relation_count = 0
+        new_expression_count = 0
         ref_to_final: dict[str, str] = {}
         created_refs: set[str] = set()
-        link_required_refs: set[str] = set()
         relation_refs: set[str] = set()
+        expression_owner_refs: set[str] = set()
         decisions: list[dict[str, Any]] = []
         skipped_items: list[dict[str, str]] = []
 
         def skip_item(kind: str, item_ref: str, reason: str) -> None:
             skipped_items.append({"kind": kind, "ref": item_ref, "reason": reason})
             self._log(f"Skipping {kind} in {chunk.id} ({item_ref}): {reason}")
+
+        def resolve_node_reference(reference: str) -> str | None:
+            local_id = ref_to_final.get(reference)
+            if local_id is not None:
+                return local_id
+            if reference in allowed_existing_ids and reference in node_store:
+                return reference
+            return None
 
         for action in response.node_actions:
             ref_id = action.ref_id.strip()
@@ -1282,19 +1387,16 @@ class Extractor:
                     node_type = sanitized.type
                     if node_type is None:
                         raise ValueError(f"create action missing node type: {ref_id}")
-                    final_id = self._allocate_node_id(sanitized, evidence, source_path, node_store)
+                    final_id = self._allocate_node_id(sanitized, node_store)
                     node_store[final_id] = NodeRecord(
                         id=final_id,
                         type=node_type,
                         name=sanitized.name,
                         aliases=sanitized.aliases,
                         description=sanitized.description,
-                        content=sanitized.content,
                         evidence=[evidence],
                     )
                     created_refs.add(ref_id)
-                    if node_type in LINK_REQUIRED_NODE_TYPES:
-                        link_required_refs.add(ref_id)
                     created_node_count += 1
             except ValueError as exc:
                 skip_item("node_action", ref_id, str(exc))
@@ -1318,10 +1420,14 @@ class Extractor:
             source_ref = relation.source_ref.strip()
             target_ref = relation.target_ref.strip()
             relation_ref = f"{source_ref} -[{relation.relation_type}]-> {target_ref}"
-            source_id = ref_to_final.get(source_ref)
-            target_id = ref_to_final.get(target_ref)
+            source_id = resolve_node_reference(source_ref)
+            target_id = resolve_node_reference(target_ref)
             if source_id is None or target_id is None:
-                skip_item("relation", relation_ref, "endpoint does not reference a valid node_action ref_id")
+                skip_item(
+                    "relation",
+                    relation_ref,
+                    "endpoint is neither a valid local ref_id nor a supplied node_memory id",
+                )
                 continue
             if source_id == target_id:
                 skip_item("relation", relation_ref, "self relation")
@@ -1338,28 +1444,79 @@ class Extractor:
             except ValueError as exc:
                 skip_item("relation", relation_ref, str(exc))
                 continue
-            relation_refs.update([source_ref, target_ref])
+            relation_refs.update(
+                reference
+                for reference in (source_ref, target_ref)
+                if reference in ref_to_final
+            )
             key = _relation_key(source_id, relation.relation_type, target_id)
             if key in relation_store:
-                relation_store[key].score = max(relation_store[key].score, _clamp_score(relation.score))
                 self._append_relation_evidence(relation_store[key], evidence)
                 continue
             left_source, rel_type, left_target = key
-            relation_store[key] = RelationRecord(source_id=left_source, relation_type=rel_type, target_id=left_target, score=_clamp_score(relation.score), evidences=[evidence])
+            relation_store[key] = RelationRecord(
+                source_id=left_source,
+                relation_type=rel_type,
+                target_id=left_target,
+                evidences=[evidence],
+            )
             new_relation_count += 1
 
-        unlinked_created_refs = sorted(link_required_refs - relation_refs)
-        if unlinked_created_refs:
-            self._log(f"Removing unlinked occurrence/formula nodes in {chunk.id}: {unlinked_created_refs}")
-            for ref_id in unlinked_created_refs:
-                orphan_id = ref_to_final.pop(ref_id)
-                node_store.pop(orphan_id, None)
-                created_node_count -= 1
-                for decision in decisions:
-                    if decision["ref_id"] == ref_id:
-                        decision["status"] = "removed_unlinked"
-                        break
-        pending_refs = sorted((created_refs - relation_refs) - link_required_refs)
+        expected_role_by_type: dict[str, str] = {
+            "Concept": "definition_representation",
+            "Claim": "claim_representation",
+            "Method": "method_template",
+        }
+        for expression in response.expressions:
+            owner_ref = expression.owner_ref.strip()
+            expression_ref = f"{owner_ref}:{expression.role}:{expression.latex_candidate_id}"
+            owner_id = resolve_node_reference(owner_ref)
+            if owner_id is None:
+                skip_item(
+                    "expression",
+                    expression_ref,
+                    "owner_ref is neither a valid local ref_id nor a supplied node_memory id",
+                )
+                continue
+            owner_type = node_store[owner_id].type
+            if expression.role != expected_role_by_type[owner_type]:
+                skip_item(
+                    "expression",
+                    expression_ref,
+                    f"invalid expression role {expression.role} for {owner_type}",
+                )
+                continue
+            try:
+                evidence = self._sanitize_evidence(expression.evidence, chunk, source_path, raw_lines)
+                candidate_id = expression.latex_candidate_id.strip()
+                candidate = self.source_latex_candidates.get(candidate_id)
+                if candidate is None:
+                    raise ValueError(f"unknown latex_candidate_id: {candidate_id}")
+                line_no, latex = candidate
+                if line_no < evidence.start_line or line_no > evidence.end_line:
+                    raise ValueError(
+                        f"LaTeX candidate {candidate_id} at L{line_no} is outside evidence "
+                        f"L{evidence.start_line}-L{evidence.end_line}"
+                    )
+            except ValueError as exc:
+                skip_item("expression", expression_ref, str(exc))
+                continue
+            if owner_ref in ref_to_final:
+                expression_owner_refs.add(owner_ref)
+            key = (owner_id, expression.role, latex)
+            if key in expression_store:
+                self._append_expression_evidence(expression_store[key], evidence)
+                continue
+            expression_store[key] = MathExpressionRecord(
+                id=_expression_id(owner_id, expression.role, latex),
+                owner_id=owner_id,
+                role=expression.role,
+                latex=latex,
+                evidences=[evidence],
+            )
+            new_expression_count += 1
+
+        pending_refs = sorted(created_refs - relation_refs - expression_owner_refs)
         for ref_id in pending_refs:
             for decision in decisions:
                 if decision["ref_id"] == ref_id:
@@ -1370,8 +1527,10 @@ class Extractor:
             "created_node_count": created_node_count,
             "reused_node_count": reused_node_count,
             "new_relation_count": new_relation_count,
+            "new_expression_count": new_expression_count,
             "total_nodes": len(node_store),
             "total_relations": len(relation_store),
+            "total_expressions": len(expression_store),
             "skipped_item_count": len(skipped_items),
             "skipped_items": skipped_items,
             "pending_node_count": len(pending_refs),
@@ -1395,7 +1554,6 @@ class Extractor:
             name=name,
             aliases=_unique_preserve_order(action.aliases),
             description=description,
-            content=self._sanitize_node_content(node_type, action.content, evidence, required=True),
             evidence=EvidenceRef(start_line=evidence.start_line, end_line=evidence.end_line),
             reason=action.reason.strip(),
         )
@@ -1403,74 +1561,17 @@ class Extractor:
     def _allocate_node_id(
         self,
         action: NodeAction,
-        evidence: Evidence,
-        source_path: str,
         node_store: dict[str, NodeRecord],
     ) -> str:
         if action.type is None:
             raise ValueError(f"Cannot allocate id without node type: {action.ref_id}")
         base_id = _node_id(action.type, action.name)
-        if action.type in OCCURRENCE_NODE_TYPES:
-            candidate_id = f"{base_id}_{_stable_hash(source_path, str(evidence.start_line), str(evidence.end_line))[:8]}"
-        elif base_id not in node_store:
-            candidate_id = base_id
-        else:
-            # The model explicitly chose create after seeing memory. Respect that
-            # semantic decision and disambiguate the id by source occurrence.
-            candidate_id = f"{base_id}_{_stable_hash(source_path, str(evidence.start_line), str(evidence.end_line))[:8]}"
-        if candidate_id in node_store:
-            raise ValueError(f"Duplicate create action resolved to existing id: {candidate_id}")
-        return candidate_id
-
-    def _sanitize_node_content(
-        self,
-        node_type: str,
-        content: dict[str, Any],
-        evidence: Evidence,
-        required: bool,
-    ) -> dict[str, Any]:
-        content = dict(content or {})
-        if node_type == "Formula":
-            candidate_id = str(content.get("latex_candidate_id") or "").strip()
-            if required and not candidate_id:
-                raise ValueError("Formula content requires latex_candidate_id")
-            if not candidate_id:
-                return {}
-            candidate = self.source_latex_candidates.get(candidate_id)
-            if candidate is None:
-                raise ValueError(f"Unknown Formula latex_candidate_id: {candidate_id}")
-            line_no, latex = candidate
-            if line_no < evidence.start_line or line_no > evidence.end_line:
-                raise ValueError(
-                    f"Formula candidate {candidate_id} at L{line_no} is outside evidence "
-                    f"L{evidence.start_line}-L{evidence.end_line}"
-                )
-            return {"latex": latex}
-        if node_type in EXAMPLE_PROOF_TYPES:
-            result = {}
-            approach = str(content.get("approach") or "").strip()
-            steps = [str(step).strip() for step in content.get("steps", []) if str(step).strip()] if isinstance(content.get("steps", []), list) else []
-            if required and (not approach or not steps):
-                raise ValueError(f"{node_type} content requires approach and non-empty steps")
-            if approach:
-                result["approach"] = approach
-            if steps:
-                result["steps"] = steps
-            return result
-        if node_type == "Figure":
-            result = {}
-            label = str(content.get("label") or "").strip()
-            url = str(content.get("url") or "").strip()
-            if required and not label and not url:
-                raise ValueError("Figure content requires label or url")
-            if label:
-                result["label"] = label
-            if url:
-                result["url"] = url
-            return result
-        if content:
-            raise ValueError(f"{node_type} nodes must not contain type-specific content")
-        return {}
+        if base_id in node_store:
+            raise ValueError(
+                f"Canonical {action.type} name already exists: {action.name}. "
+                "The model must reuse the supplied node or choose a genuinely disambiguated canonical name."
+            )
+        return base_id
 
     def _sanitize_evidence(self, evidence: EvidenceRef, chunk: DocumentChunk, source_path: str, raw_lines: list[str]) -> Evidence:
         start = evidence.start_line
@@ -1508,11 +1609,6 @@ class Extractor:
         description = re.sub(r"\s+", " ", action.description).strip()
         if description:
             existing.description = description
-        if action.content:
-            incoming = self._sanitize_node_content(existing.type, action.content, evidence, required=False)
-            for key, value in incoming.items():
-                if key not in existing.content or not existing.content[key]:
-                    existing.content[key] = value
         self._append_node_evidence(existing, evidence)
 
     def _append_node_evidence(self, node: NodeRecord, evidence: Evidence) -> None:
@@ -1532,21 +1628,111 @@ class Extractor:
         if sig not in existing:
             relation.evidences.append(evidence)
 
+    def _append_expression_evidence(self, expression: MathExpressionRecord, evidence: Evidence) -> None:
+        sig = (evidence.start_line, evidence.end_line, evidence.text.strip())
+        existing = {(e.start_line, e.end_line, e.text.strip()) for e in expression.evidences}
+        if sig not in existing:
+            expression.evidences.append(evidence)
+
     def _best_relation_evidence(self, relation: RelationRecord) -> Evidence:
         if not relation.evidences:
-            return Evidence(source_path=str(self.input_path), start_line=1, end_line=1, text="")
+            raise ValueError(
+                f"Relation has no source evidence: {relation.source_id} "
+                f"-[{relation.relation_type}]-> {relation.target_id}"
+            )
         return max(relation.evidences, key=lambda e: (len(e.text.strip()), -(e.end_line - e.start_line)))
 
-    def _finalize_result(self, source_path: str, lines: list[str], node_store: dict[str, NodeRecord], relation_store: dict[tuple[str, str, str], RelationRecord], diagnostics: dict[str, Any]) -> ExtractionResult:
-        nodes = [KGNode(id=node.id, type=node.type, name=node.name, aliases=_unique_preserve_order(node.aliases), description=node.description, content=node.content) for node in sorted(node_store.values(), key=lambda x: (x.type, x.name, x.id))]
-        relations = [KGRelation(source_id=rel.source_id, relation_type=rel.relation_type, target_id=rel.target_id, score=rel.score, evidence=self._best_relation_evidence(rel)) for rel in sorted(relation_store.values(), key=lambda x: (x.relation_type, x.source_id, x.target_id))]
+    def _finalize_result(
+        self,
+        source_path: str,
+        lines: list[str],
+        node_store: dict[str, NodeRecord],
+        relation_store: dict[tuple[str, str, str], RelationRecord],
+        expression_store: dict[tuple[str, str, str], MathExpressionRecord],
+        diagnostics: dict[str, Any],
+    ) -> ExtractionResult:
+        nodes = [
+            KGNode(
+                id=node.id,
+                type=node.type,
+                name=node.name,
+                aliases=_unique_preserve_order(node.aliases),
+                description=node.description,
+                evidence=sorted(node.evidence, key=lambda item: (item.start_line, item.end_line)),
+            )
+            for node in sorted(node_store.values(), key=lambda item: (item.type, item.name, item.id))
+        ]
+        relations = [
+            KGRelation(
+                id=_relation_id(relation.source_id, relation.relation_type, relation.target_id),
+                type=relation.relation_type,
+                source_id=relation.source_id,
+                target_id=relation.target_id,
+                evidence=sorted(relation.evidences, key=lambda item: (item.start_line, item.end_line)),
+            )
+            for relation in sorted(
+                relation_store.values(),
+                key=lambda item: (item.relation_type, item.source_id, item.target_id),
+            )
+        ]
+        expressions = [
+            MathExpression(
+                id=expression.id,
+                owner_id=expression.owner_id,
+                role=expression.role,
+                latex=expression.latex,
+                evidence=sorted(expression.evidences, key=lambda item: (item.start_line, item.end_line)),
+            )
+            for expression in sorted(
+                expression_store.values(),
+                key=lambda item: (item.role, item.owner_id, item.id),
+            )
+        ]
         diagnostics = dict(diagnostics)
         diagnostics["node_count"] = len(nodes)
         diagnostics["relation_count"] = len(relations)
+        diagnostics["math_expression_count"] = len(expressions)
         diagnostics["node_type_counts"] = self._count_by_type(nodes)
         diagnostics["relation_type_counts"] = self._count_by_relation_type(relations)
+        diagnostics["math_expression_role_counts"] = self._count_by_expression_role(expressions)
+        incident_node_ids = {
+            endpoint_id
+            for relation in relations
+            for endpoint_id in (relation.source_id, relation.target_id)
+        }
+        isolated_nodes = [node.id for node in nodes if node.id not in incident_node_ids]
+        wide_evidence_nodes = [
+            {
+                "node_id": node.id,
+                "max_span_lines": max(
+                    evidence.end_line - evidence.start_line + 1
+                    for evidence in node.evidence
+                ),
+            }
+            for node in nodes
+            if node.evidence
+            and max(
+                evidence.end_line - evidence.start_line + 1
+                for evidence in node.evidence
+            ) > 20
+        ]
+        diagnostics["audit"] = {
+            "isolated_node_count": len(isolated_nodes),
+            "isolated_node_ids": isolated_nodes,
+            "wide_evidence_node_count": len(wide_evidence_nodes),
+            "wide_evidence_nodes": wide_evidence_nodes,
+        }
         diagnostics["title"] = self._title_from_lines(lines)
-        return ExtractionResult(source_path=source_path, title=self._title_from_lines(lines), provider=self.provider, model=self.model, nodes=nodes, relations=relations, diagnostics=diagnostics)
+        return ExtractionResult(
+            source_path=source_path,
+            title=self._title_from_lines(lines),
+            provider=self.provider,
+            model=self.model,
+            nodes=nodes,
+            relations=relations,
+            math_expressions=expressions,
+            diagnostics=diagnostics,
+        )
 
     def _count_by_type(self, nodes: list[KGNode]) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -1557,7 +1743,13 @@ class Extractor:
     def _count_by_relation_type(self, relations: list[KGRelation]) -> dict[str, int]:
         counts: dict[str, int] = {}
         for relation in relations:
-            counts[relation.relation_type] = counts.get(relation.relation_type, 0) + 1
+            counts[relation.type] = counts.get(relation.type, 0) + 1
+        return dict(sorted(counts.items()))
+
+    def _count_by_expression_role(self, expressions: list[MathExpression]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for expression in expressions:
+            counts[expression.role] = counts.get(expression.role, 0) + 1
         return dict(sorted(counts.items()))
 
     def _title_from_lines(self, lines: list[str]) -> str:
@@ -1569,7 +1761,7 @@ class Extractor:
         return self.input_path.stem
 
     def _cache_dir(self) -> Path:
-        path = ROOT / "node_cache" / "sequential_extractor_v8"
+        path = ROOT / "node_cache" / "semantic_layer_v1_1"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -1640,13 +1832,6 @@ OUTPUT_CONTRACT = {
             "name": "Required only for create.",
             "aliases": ["Optional aliases."],
             "description": "Required for create; optional enrichment for reuse.",
-            "content": {
-                "latex_candidate_id": "Formula only; exact candidate_id from source_latex_candidates.",
-                "approach": "Example or Proof only.",
-                "steps": ["Example or Proof only."],
-                "label": "Figure only.",
-                "url": "Figure only.",
-            },
             "evidence": {
                 "start_line": "Inclusive supporting line from chunk.evidence_line_numbers.",
                 "end_line": "Inclusive supporting line from chunk.evidence_line_numbers.",
@@ -1656,13 +1841,23 @@ OUTPUT_CONTRACT = {
     ],
     "relations": [
         {
-            "source_ref": "ref_id from node_actions",
+            "source_ref": "Local ref_id from node_actions or an id supplied in node_memory.",
             "relation_type": "Allowed type whose source/target types exactly match allowed_relation_signatures.",
-            "target_ref": "ref_id from node_actions",
-            "score": "Number from 0 to 1.",
+            "target_ref": "Local ref_id from node_actions or an id supplied in node_memory.",
             "evidence": {
                 "start_line": "Inclusive supporting line from chunk.evidence_line_numbers.",
                 "end_line": "Inclusive supporting line from chunk.evidence_line_numbers.",
+            },
+        }
+    ],
+    "expressions": [
+        {
+            "owner_ref": "Local ref_id from node_actions or an id supplied in node_memory.",
+            "role": "Role allowed for the owner's node type.",
+            "latex_candidate_id": "Exact candidate_id from source_latex_candidates.",
+            "evidence": {
+                "start_line": "Inclusive line covering the expression and its semantic role.",
+                "end_line": "Inclusive line covering the expression and its semantic role.",
             },
         }
     ],
@@ -1707,7 +1902,7 @@ def check_config(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Sequential multi-provider KG extractor using LangGraph.")
+    parser = argparse.ArgumentParser(description="Sequential first-layer mathematical semantic extractor using LangGraph.")
     parser.add_argument("--input", default=str(DEFAULT_INPUT), help="Markdown source path.")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help="JSON output path.")
     parser.add_argument(
