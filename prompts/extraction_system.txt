@@ -34,6 +34,11 @@ Concept
   mathematical conditions and meaning.
 - The description should be concise and specific. It must not merely repeat the
   name.
+- A Concept description contains only the concept's defining meaning, including
+  intrinsic domain restrictions or canonical defining representation when they
+  are part of that definition. Do not absorb separately stated monotonicity,
+  parity, symmetry, bounds, consequences, derivations, or other properties into
+  the Concept description. Extract each eligible reusable property as a Claim.
 - A Concept may remain without a relation in the current graph. Do not create a
   false relation merely to connect it.
 - A named mathematical family is an eligible Concept when the body text
@@ -73,6 +78,19 @@ Claim
   Concept description merely because the paragraphs are adjacent.
 - A proof-local inequality, an example-specific conclusion, an intermediate
   derivation, and a one-off observation are not Claims.
+- Every Claim has exactly one claim_kind:
+  * property: a characteristic or structural fact about a mathematical object,
+    such as monotonicity, parity, symmetry, boundedness, or closure;
+  * criterion: a necessary, sufficient, necessary-and-sufficient, equality,
+    existence, uniqueness, or applicability condition;
+  * identity: a canonical reusable identity, transformation formula, or named
+    symbolic law;
+  * result: a general theorem-level conclusion that is not primarily a
+    property, criterion, or identity.
+- claim_kind describes mathematical semantic function. Textbook labels such as
+  theorem, property, corollary, or formula are discourse roles and do not
+  override this classification. A corollary identity is still identity; a
+  theorem giving an applicability condition is criterion.
 
 Method
 - An explicitly taught, reusable process for a class of mathematical problems,
@@ -107,7 +125,7 @@ provided for semantic identity resolution, not as source evidence.
 1. Compare full mathematical meaning and node type, not spelling alone.
 2. Reuse a Concept only for the same canonical concept or named object.
 3. Reuse a Claim only for the same complete proposition with the same material
-   conditions and conclusion.
+   conditions, conclusion, and claim_kind.
 4. Reuse a Method only for the same reusable procedure and purpose.
 5. Use action="reuse" only with an existing_id supplied in node_memory.
 6. Use action="create" when the current entity is genuinely new among the
@@ -149,6 +167,12 @@ involves: Claim -> Concept
 - The Claim is explicitly about the Concept or requires it as an essential part
   of the statement.
 - Do not link every incidental symbol or passing term in the Claim.
+- When the same source passage explicitly names an eligible core Concept that
+  the Claim is about, emit the involves edge. A Claim about a named function or
+  concept must not be left unlinked to that principal Concept when the endpoint
+  is created in this response or supplied in node_memory. This does not license
+  inventing a Concept from an unsupported passing mention or forcing an edge to
+  an unrelated memory node.
 
 uses: Method -> Concept | Claim | Method
 - The source explicitly presents the target as an ingredient, governing result,
@@ -247,14 +271,18 @@ For every expression:
    chunk.evidence_line_numbers and must lie inside chunk.text.
 5. context_before_text and context_after_text are orientation only; never use
    them as evidence.
-6. The program fills evidence text from the source. Output only start_line and
+6. heading_path is source-structure metadata, not mathematical evidence. If
+   MinerU reading order places an explicit local body label such as
+   "(2) monotonicity" after a conflicting heading, trust the substantive body
+   text for extraction and do not reinterpret it to fit the heading.
+7. The program fills evidence text from the source. Output only start_line and
    end_line.
-7. If the current chunk contains no eligible semantic unit, return empty arrays.
-8. Use the smallest contiguous evidence span that supports the emitted item.
+8. If the current chunk contains no eligible semantic unit, return empty arrays.
+9. Use the smallest contiguous evidence span that supports the emitted item.
    Do not cite an entire example, proof, derivation, or subsection when a
    narrower definition or statement span is sufficient. A span over 20 lines
    should be exceptional and justified by genuinely distributed source text.
-9. Node-action evidence supports only the node name and description. An
+10. Node-action evidence supports only the node name and description. An
    expression has its own evidence, so do not widen node evidence to include a
    distant formula, derivation, or property. Keep a Concept description focused
    on its defining meaning rather than copying every later property.
@@ -274,6 +302,8 @@ For every expression:
    evidence lines before returning JSON.
 9. Confirm that every relation and expression endpoint is either one of this
    response's local ref_id values or an exact id supplied in node_memory.
+10. Confirm that every created Claim has one allowed claim_kind and that every
+    created Concept description excludes independently stated properties.
 
 -------------------- Output --------------------
 
@@ -286,8 +316,6 @@ Return exactly this shape, including empty arrays when needed:
       "action": "reuse",
       "existing_id": "concept_函数_...",
       "mention": "函数",
-      "type": "Concept",
-      "name": "",
       "aliases": [],
       "description": "",
       "evidence": {"start_line": 20, "end_line": 20},
@@ -302,6 +330,7 @@ Return exactly this shape, including empty arrays when needed:
       "name": "canonical mathematical result name",
       "aliases": [],
       "description": "complete source-grounded assertion",
+      "claim_kind": "criterion",
       "evidence": {"start_line": 21, "end_line": 24},
       "reason": "new reusable general claim"
     }
@@ -325,7 +354,8 @@ Return exactly this shape, including empty arrays when needed:
   "notes": []
 }
 
-For reuse, existing_id is required and must come from node_memory. For create,
-existing_id must be null, and type, name, and description are required. Do not
-output content, score, confidence, quality, evidence text, or extra top-level
-keys.
+For reuse, existing_id is required and must come from node_memory; omit type,
+name, and claim_kind entirely. Never emit an empty string for an enum field.
+For create, existing_id must be null, and type, name, and description are
+required. Do not output content, score, confidence, quality, evidence text, or
+extra top-level keys.

@@ -11,10 +11,12 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import warnings
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import httpx
 import requests
@@ -34,9 +36,10 @@ from langgraph.graph import END, StateGraph
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT_DIR = ROOT / "prompts"
 DEFAULT_INPUT = ROOT / "data" / "raw" / "第一章第一节_映射与函数.md"
-DEFAULT_OUTPUT = ROOT / "KG" / "第一章第一节_映射与函数_semantic_v1_1.json"
-SCHEMA_VERSION = "maf-kg.semantic.v1.1"
+DEFAULT_OUTPUT = ROOT / "KG" / "第一章第一节_映射与函数_semantic_v1_3.json"
+SCHEMA_VERSION = "maf-kg.semantic.v1.3"
 NODE_TYPES = ["Concept", "Claim", "Method"]
+CLAIM_KINDS = ["property", "criterion", "identity", "result"]
 RELATION_SIGNATURES: dict[str, tuple[tuple[str, str], ...]] = {
     "involves": (("Claim", "Concept"),),
     "uses": (("Method", "Concept"), ("Method", "Claim"), ("Method", "Method")),
@@ -50,6 +53,7 @@ RELATION_TYPES = list(RELATION_SIGNATURES)
 EXPRESSION_ROLES = ["definition_representation", "claim_representation", "method_template"]
 
 NodeType = Literal["Concept", "Claim", "Method"]
+ClaimKind = Literal["property", "criterion", "identity", "result"]
 RelationType = Literal[
     "involves",
     "uses",
@@ -67,6 +71,9 @@ class Evidence(BaseModel):
     end_line: int
     text: str
     chunk_id: str
+    heading_path: list[str] = Field(default_factory=list)
+    teaching_block_id: str
+    discourse_role: str
 
 class EvidenceRef(BaseModel):
     start_line: int
@@ -78,6 +85,7 @@ class KGNode(BaseModel):
     name: str
     aliases: list[str] = Field(default_factory=list)
     description: str = ""
+    claim_kind: ClaimKind | None = None
     evidence: list[Evidence] = Field(default_factory=list)
 
 class KGRelation(BaseModel):
@@ -116,6 +124,7 @@ class NodeMemoryItem(BaseModel):
     name: str
     aliases: list[str] = Field(default_factory=list)
     description: str = ""
+    claim_kind: ClaimKind | None = None
     math_expressions: list[ExpressionMemoryItem] = Field(default_factory=list)
     occurrences: list[Evidence] = Field(default_factory=list)
     retrieval_score: float = 0.0
@@ -136,6 +145,7 @@ class NodeAction(BaseModel):
     name: str = ""
     aliases: list[str] = Field(default_factory=list)
     description: str = ""
+    claim_kind: ClaimKind | None = None
     evidence: EvidenceRef
     reason: str = ""
 
@@ -149,6 +159,10 @@ class NodeAction(BaseModel):
                 raise ValueError("create actions must not include existing_id")
             if self.type is None or not self.name.strip():
                 raise ValueError("create actions require type and name")
+            if self.type == "Claim" and self.claim_kind is None:
+                raise ValueError("create Claim actions require claim_kind")
+            if self.type != "Claim" and self.claim_kind is not None:
+                raise ValueError("claim_kind is valid only for Claim nodes")
         if not self.ref_id.strip():
             raise ValueError("node action ref_id must not be empty")
         return self
@@ -177,6 +191,7 @@ class NodeRecord(BaseModel):
     name: str
     aliases: list[str] = Field(default_factory=list)
     description: str = ""
+    claim_kind: ClaimKind | None = None
     evidence: list[Evidence] = Field(default_factory=list)
 
 class RelationRecord(BaseModel):
@@ -199,6 +214,7 @@ class DocumentBlock:
     heading_path: list[str]
     lines: list[tuple[int, str]]
     kind: str
+    teaching_block_id: str = ""
     @property
     def char_count(self) -> int:
         return sum(len(f"{n}: {t}") + 1 for n, t in self.lines)
@@ -214,6 +230,7 @@ class DocumentChunk:
     context_after_text: str = ""
     block_count: int = 0
     block_types: tuple[str, ...] = ()
+    teaching_block_ids: tuple[str, ...] = ()
     break_reason: str = ""
 
 class ExtractionState(TypedDict, total=False):
@@ -239,6 +256,7 @@ class ExtractionState(TypedDict, total=False):
     verbose: bool
     thinking: str
     reasoning_effort: str
+    run_started_at: str
     raw_lines: list[str]
     chunks: list[DocumentChunk]
     result: ExtractionResult
@@ -264,11 +282,127 @@ def _stable_hash(*parts: str) -> str:
 def _slug(text: str, limit: int = 48) -> str:
     return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "_", text).strip("_")[:limit] or "item"
 
+
+_LATEX_SEMANTIC_REPLACEMENTS: tuple[tuple[str, str], ...] = (
+    (r"\longleftrightarrow", "⇔"),
+    (r"\Longleftrightarrow", "⇔"),
+    (r"\leftrightarrow", "↔"),
+    (r"\Leftrightarrow", "⇔"),
+    (r"\longrightarrow", "→"),
+    (r"\Longrightarrow", "⇒"),
+    (r"\rightarrow", "→"),
+    (r"\Rightarrow", "⇒"),
+    (r"\longleftarrow", "←"),
+    (r"\Longleftarrow", "⇐"),
+    (r"\leftarrow", "←"),
+    (r"\Leftarrow", "⇐"),
+    (r"\geqslant", "≥"),
+    (r"\leqslant", "≤"),
+    (r"\subseteq", "⊆"),
+    (r"\supseteq", "⊇"),
+    (r"\implies", "⇒"),
+    (r"\infty", "∞"),
+    (r"\forall", "∀"),
+    (r"\exists", "∃"),
+    (r"\notin", "∉"),
+    (r"\subset", "⊂"),
+    (r"\supset", "⊃"),
+    (r"\times", "×"),
+    (r"\cdot", "·"),
+    (r"\partial", "∂"),
+    (r"\propto", "∝"),
+    (r"\sqrt", "√"),
+    (r"\circ", "∘"),
+    (r"\sum", "∑"),
+    (r"\prod", "∏"),
+    (r"\int", "∫"),
+    (r"\neq", "≠"),
+    (r"\ne", "≠"),
+    (r"\geq", "≥"),
+    (r"\leq", "≤"),
+    (r"\iff", "⇔"),
+    (r"\to", "→"),
+    (r"\in", "∈"),
+    (r"\pm", "±"),
+    (r"\mp", "∓"),
+)
+
+_SEMANTIC_SYMBOL_TOKENS: dict[str, str] = {
+    "→": "<to>",
+    "←": "<from>",
+    "↔": "<leftrightarrow>",
+    "⇒": "<implies>",
+    "⇐": "<impliedby>",
+    "⇔": "<iff>",
+    "+": "<plus>",
+    "-": "<minus>",
+    "−": "<minus>",
+    "±": "<plusminus>",
+    "∓": "<minusplus>",
+    "∞": "<infinity>",
+    ">": "<gt>",
+    "<": "<lt>",
+    "=": "<eq>",
+    "≠": "<neq>",
+    "≥": "<ge>",
+    "≤": "<le>",
+    "∀": "<forall>",
+    "∃": "<exists>",
+    "∈": "<in>",
+    "∉": "<notin>",
+    "⊂": "<subset>",
+    "⊆": "<subseteq>",
+    "⊃": "<supset>",
+    "⊇": "<supseteq>",
+    "/": "<div>",
+    "÷": "<div>",
+    "*": "<mul>",
+    "×": "<mul>",
+    "·": "<mul>",
+    "^": "<pow>",
+    "|": "<bar>",
+    ".": "<dot>",
+    ",": "<comma>",
+    ":": "<colon>",
+    ";": "<semicolon>",
+    "'": "<prime>",
+    "′": "<prime>",
+    "″": "<doubleprime>",
+    "!": "<factorial>",
+    "%": "<percent>",
+    "∘": "<compose>",
+    "√": "<sqrt>",
+    "∑": "<sum>",
+    "∏": "<product>",
+    "∫": "<integral>",
+    "∂": "<partial>",
+    "∝": "<proportional>",
+    "¬": "<not>",
+    "∧": "<and>",
+    "∨": "<or>",
+}
+
+
+def _semantic_compact(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    for latex, symbol in _LATEX_SEMANTIC_REPLACEMENTS:
+        normalized = normalized.replace(latex.casefold(), symbol)
+    parts: list[str] = []
+    for char in normalized:
+        if char.isalnum():
+            parts.append(char)
+            continue
+        token = _SEMANTIC_SYMBOL_TOKENS.get(char)
+        if token:
+            parts.append(token)
+    return "".join(parts)
+
+
 def _normalize_name(text: str) -> str:
-    return re.sub(r"[\W_]+", "", text.strip().lower(), flags=re.UNICODE)
+    return _semantic_compact(text.strip())
 
 def _normalized_text(text: str) -> str:
-    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", text.lower())
+    return _semantic_compact(text)
 
 def _char_ngrams(text: str, sizes: tuple[int, ...] = (2, 3)) -> set[str]:
     compact = _normalized_text(text)
@@ -306,6 +440,19 @@ def _unique_preserve_order(items: list[str]) -> list[str]:
             seen.add(item)
             out.append(item)
     return out
+
+
+def _canonical_aliases(name: str, aliases: list[str]) -> list[str]:
+    canonical_key = _normalize_name(name)
+    seen_keys = {canonical_key}
+    canonical_aliases: list[str] = []
+    for alias in _unique_preserve_order(aliases):
+        alias_key = _normalize_name(alias)
+        if not alias_key or alias_key in seen_keys:
+            continue
+        seen_keys.add(alias_key)
+        canonical_aliases.append(alias)
+    return canonical_aliases
 
 def _looks_like_latex(text: str) -> bool:
     return bool(text) and not re.search(r"[\u4e00-\u9fff]", text) and any(x in text for x in ["\\", "^", "_", "=", "\\frac", "\\sqrt", "\\lim", "\\in", "\\to"])
@@ -384,6 +531,12 @@ class JsonParseFailure(RuntimeError):
         self.raw_content = raw_content
 
 
+class CompletionTruncated(RuntimeError):
+    def __init__(self, message: str, metadata: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.metadata = metadata
+
+
 def _runtime_dir(name: str) -> Path:
     for candidate in [ROOT / "KG" / name, ROOT / "agents" / name, Path(tempfile.gettempdir()) / "maf_kg" / name]:
         try:
@@ -393,12 +546,38 @@ def _runtime_dir(name: str) -> Path:
             continue
     raise RuntimeError("Unable to create runtime directory.")
 
-def _parse_response(content: str, label: str) -> dict[str, Any]:
+def _write_invalid_response(
+    content: str,
+    label: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> Path:
+    debug = _runtime_dir("_debug") / f"{int(time.time())}_{_slug(label)}_invalid.json.txt"
+    debug.write_text(
+        json.dumps(
+            {
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "response_metadata": metadata or {},
+                "content": content,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return debug
+
+
+def _parse_response(
+    content: str,
+    label: str,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     try:
         return _extract_json_object(content)
     except json.JSONDecodeError as exc:
-        debug = _runtime_dir("_debug") / f"{int(time.time())}_{_slug(label)}_invalid.json.txt"
-        debug.write_text(f"JSONDecodeError: {exc}\n\n{content}", encoding="utf-8")
+        debug = _write_invalid_response(content, label, exc, metadata)
         raise JsonParseFailure(f"JSON parsing failed and the raw response was saved to {debug}: {exc}", content) from exc
 
 def _completion_url(base_url: str) -> str:
@@ -507,6 +686,24 @@ class ModelProviderAdapter:
             raise RuntimeError(f"{self.name} API returned non-text message content")
         return content
 
+    def extract_metadata(self, response: dict[str, Any]) -> dict[str, Any]:
+        try:
+            choice = response["choices"][0]
+            message = choice["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(f"{self.name} API response does not contain a valid first choice") from exc
+        reasoning_content = message.get("reasoning_content") if isinstance(message, dict) else None
+        usage = response.get("usage")
+        return {
+            "response_id": response.get("id"),
+            "response_model": response.get("model"),
+            "created": response.get("created"),
+            "system_fingerprint": response.get("system_fingerprint"),
+            "finish_reason": choice.get("finish_reason") if isinstance(choice, dict) else None,
+            "usage": usage if isinstance(usage, dict) else {},
+            "reasoning_content_chars": len(reasoning_content) if isinstance(reasoning_content, str) else 0,
+        }
+
 
 class DeepSeekProviderAdapter(ModelProviderAdapter):
     name = "deepseek"
@@ -540,7 +737,7 @@ class DeepSeekProviderAdapter(ModelProviderAdapter):
         }
         if thinking == "disabled":
             payload["temperature"] = temperature
-        elif reasoning_effort and "pro" in model.lower():
+        elif reasoning_effort:
             payload["reasoning_effort"] = reasoning_effort
         if use_response_format:
             payload["response_format"] = {"type": "json_object"}
@@ -645,6 +842,70 @@ class ProviderChatClient:
         self.trust_env = trust_env
         self.thinking = thinking
         self.reasoning_effort = reasoning_effort
+        self.request_history: list[dict[str, Any]] = []
+
+    def _execute_request(
+        self,
+        request: Callable[[], dict[str, Any]],
+        transport: str,
+        attempt: int,
+        label: str,
+    ) -> dict[str, Any]:
+        started_at = datetime.now(timezone.utc).isoformat()
+        started = time.perf_counter()
+        metadata: dict[str, Any] = {}
+        content = ""
+        try:
+            response = request()
+            content = self.adapter.extract_content(response)
+            metadata = self.adapter.extract_metadata(response)
+            record = {
+                "label": label,
+                "transport": transport,
+                "attempt": attempt,
+                "started_at": started_at,
+                "latency_seconds": round(time.perf_counter() - started, 4),
+                "content_chars": len(content),
+                **metadata,
+            }
+            if metadata.get("finish_reason") in {"length", "max_tokens"}:
+                error = CompletionTruncated(
+                    f"{self.provider} response for {label} was truncated with "
+                    f"finish_reason={metadata.get('finish_reason')} at max_tokens={self.max_tokens}. "
+                    "Increase --max-tokens or lower reasoning effort before retrying.",
+                    metadata,
+                )
+                debug = _write_invalid_response(content, label, error, metadata)
+                record.update({"status": "truncated", "debug_path": str(debug)})
+                self.request_history.append(record)
+                raise error
+            try:
+                parsed = _parse_response(content, label, metadata)
+            except JsonParseFailure as exc:
+                record.update({"status": "invalid_json", "error": str(exc)})
+                self.request_history.append(record)
+                raise
+            record["status"] = "success"
+            self.request_history.append(record)
+            return parsed
+        except (CompletionTruncated, JsonParseFailure):
+            raise
+        except Exception as exc:
+            self.request_history.append(
+                {
+                    "label": label,
+                    "transport": transport,
+                    "attempt": attempt,
+                    "started_at": started_at,
+                    "latency_seconds": round(time.perf_counter() - started, 4),
+                    "status": "request_error",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "content_chars": len(content),
+                    **metadata,
+                }
+            )
+            raise
 
     def complete_json(self, system_prompt: str, user_prompt: str, label: str = "request") -> dict[str, Any]:
         payload = self.adapter.build_payload(
@@ -667,19 +928,43 @@ class ProviderChatClient:
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                response = _post_httpx(self.endpoint_url, self.trust_env, self.timeout, headers, payload)
-                return _parse_response(self.adapter.extract_content(response), label)
+                return self._execute_request(
+                    lambda: _post_httpx(self.endpoint_url, self.trust_env, self.timeout, headers, payload),
+                    "httpx",
+                    attempt + 1,
+                    label,
+                )
+            except CompletionTruncated:
+                raise
             except Exception as exc:
                 last_error = exc
                 if attempt == self.max_retries:
                     fallbacks = [
-                        lambda: _post_requests(self.endpoint_url, self.trust_env, self.timeout, headers, payload),
-                        lambda: _post_powershell(self.endpoint_url, str(self.api_key), self.timeout, payload, label),
+                        (
+                            "requests",
+                            lambda: _post_requests(self.endpoint_url, self.trust_env, self.timeout, headers, payload),
+                        ),
+                        (
+                            "powershell",
+                            lambda: _post_powershell(
+                                self.endpoint_url,
+                                str(self.api_key),
+                                self.timeout,
+                                payload,
+                                label,
+                            ),
+                        ),
                     ]
-                    for fallback in fallbacks:
+                    for fallback_index, (transport, fallback) in enumerate(fallbacks, start=1):
                         try:
-                            response = fallback()
-                            return _parse_response(self.adapter.extract_content(response), label)
+                            return self._execute_request(
+                                fallback,
+                                transport,
+                                self.max_retries + 1 + fallback_index,
+                                label,
+                            )
+                        except CompletionTruncated:
+                            raise
                         except Exception as fallback_exc:
                             last_error = fallback_exc
                 else:
@@ -718,7 +1003,7 @@ class Extractor:
         no_proxy: bool = False,
         request_delay: float = 3.0,
         thinking: str = "disabled",
-        reasoning_effort: str = "medium",
+        reasoning_effort: str = "high",
         resume: bool = True,
         include_exercises: bool = False,
         verbose: bool = True,
@@ -750,6 +1035,7 @@ class Extractor:
         self.client: ProviderChatClient | None = None
         self.source_latex_map: dict[int, list[str]] = {}
         self.source_latex_candidates: dict[str, tuple[int, str]] = {}
+        self.source_context_by_line: dict[int, tuple[list[str], str, str]] = {}
         self.graph = self._build_graph()
 
     def run(self) -> ExtractionResult:
@@ -777,6 +1063,7 @@ class Extractor:
             "verbose": self.verbose,
             "thinking": self.thinking,
             "reasoning_effort": self.reasoning_effort,
+            "run_started_at": datetime.now(timezone.utc).isoformat(),
             "diagnostics": {},
         }
         return self.graph.invoke(state)["result"]
@@ -848,12 +1135,26 @@ class Extractor:
         before_lines = int(state["chunk_context_before_lines"])
         after_lines = int(state["chunk_context_after_lines"])
 
+        def semantic_heading_level(title: str, markdown_level: int) -> int:
+            stripped_title = title.strip()
+            if re.match(r"^第[一二三四五六七八九十百0-9]+章\b", stripped_title):
+                return 1
+            if re.match(r"^第[一二三四五六七八九十百0-9]+节\b", stripped_title):
+                return 2
+            if re.match(r"^[一二三四五六七八九十百]+、", stripped_title):
+                return 3
+            if re.match(r"^[0-9]+[.、]", stripped_title):
+                return 4
+            return markdown_level
+
         heading_path: list[str] = []
         line_items: list[tuple[int, str, list[str]]] = []
         for line_no, line in enumerate(lines, start=1):
             if line.startswith("#"):
-                level = len(line) - len(line.lstrip("#"))
-                heading_path = heading_path[: level - 1] + [line[level:].strip()]
+                markdown_level = len(line) - len(line.lstrip("#"))
+                title = line[markdown_level:].strip()
+                level = semantic_heading_level(title, markdown_level)
+                heading_path = heading_path[: level - 1] + [title]
             line_items.append((line_no, line, list(heading_path)))
 
         def is_heading(line: str) -> bool:
@@ -873,7 +1174,10 @@ class Extractor:
             return bool(re.match(r"^\s*(定理\s*\d+|定理\b)", text))
 
         def is_property(text: str) -> bool:
-            return bool(re.match(r"^\s*(性质\s*\d*|推论\s*\d*)", text))
+            return bool(re.match(r"^\s*性质\s*\d*", text))
+
+        def is_corollary(text: str) -> bool:
+            return bool(re.match(r"^\s*推论\s*\d*", text))
 
         def is_proof(text: str) -> bool:
             return bool(re.match(r"^\s*(证|证明)\s*[:：]?", text))
@@ -884,6 +1188,7 @@ class Extractor:
                 or is_example(text)
                 or is_theorem(text)
                 or is_property(text)
+                or is_corollary(text)
                 or is_proof(text)
                 or is_image(text)
                 or is_math(text)
@@ -935,6 +1240,8 @@ class Extractor:
                 kind_fn = "theorem"
             elif is_property(stripped):
                 kind_fn = "property"
+            elif is_corollary(stripped):
+                kind_fn = "corollary"
             elif is_proof(stripped):
                 kind_fn = "proof"
 
@@ -943,7 +1250,13 @@ class Extractor:
                 i += 1
                 while i < len(line_items):
                     nxt = line_items[i][1].strip()
-                    if nxt and (is_heading(nxt) or is_example(nxt) or is_theorem(nxt) or (kind_fn in {"property", "proof"} and is_property(nxt))):
+                    if nxt and (
+                        is_heading(nxt)
+                        or is_example(nxt)
+                        or is_theorem(nxt)
+                        or is_corollary(nxt)
+                        or (kind_fn in {"property", "corollary", "proof"} and is_property(nxt))
+                    ):
                         break
                     i += 1
                 blocks.append(block(line_items[start:i], kind_fn))
@@ -960,6 +1273,57 @@ class Extractor:
             while i < len(line_items) and not line_items[i][1].strip():
                 i += 1
 
+        # Keep an introductory paragraph, its display formula, and the following
+        # conclusion together. Splitting this pattern loses definitions such as
+        # monotone increase exactly at a character-budget boundary.
+        bundled_blocks: list[DocumentBlock] = []
+        i = 0
+        bundle_char_limit = max(max_chars + 1200, int(max_chars * 1.5))
+        while i < len(blocks):
+            current_bundle = [blocks[i]]
+            if blocks[i].kind == "paragraph":
+                j = i
+                while (
+                    j + 2 < len(blocks)
+                    and blocks[j + 1].kind == "formula_block"
+                    and blocks[j + 2].kind == "paragraph"
+                    and blocks[j + 1].heading_path == blocks[i].heading_path
+                    and blocks[j + 2].heading_path == blocks[i].heading_path
+                ):
+                    candidate = [*current_bundle, blocks[j + 1], blocks[j + 2]]
+                    if sum(item.char_count for item in candidate) > bundle_char_limit:
+                        break
+                    current_bundle = candidate
+                    j += 2
+                if len(current_bundle) > 1:
+                    bundled_blocks.append(
+                        DocumentBlock(
+                            start_line=current_bundle[0].start_line,
+                            end_line=current_bundle[-1].end_line,
+                            heading_path=list(current_bundle[0].heading_path),
+                            lines=[line for item in current_bundle for line in item.lines],
+                            kind="formula_exposition",
+                        )
+                    )
+                    i = j + 1
+                    continue
+            bundled_blocks.append(blocks[i])
+            i += 1
+        blocks = bundled_blocks
+
+        self.source_context_by_line = {}
+        for block_index, source_block in enumerate(blocks, start=1):
+            source_block.teaching_block_id = (
+                f"teaching_{block_index:04d}_{source_block.start_line}_{source_block.end_line}_"
+                f"{_stable_hash(' / '.join(source_block.heading_path), source_block.kind)[:8]}"
+            )
+            for line_no, _ in source_block.lines:
+                self.source_context_by_line[line_no] = (
+                    list(source_block.heading_path),
+                    source_block.teaching_block_id,
+                    source_block.kind,
+                )
+
         groups: list[tuple[list[DocumentBlock], str]] = []
         current: list[DocumentBlock] = []
         current_chars = 0
@@ -975,7 +1339,14 @@ class Extractor:
             current_has_content = any(x.kind != "heading" for x in current)
             if blk.kind == "heading" and current and current_has_content:
                 flush("heading_boundary")
-            elif current and current_chars + blk.char_count > max_chars:
+            elif (
+                current
+                and current_chars + blk.char_count > max_chars
+                and not (
+                    blk.kind == "formula_exposition"
+                    and current_chars + blk.char_count <= int(max_chars * 1.2)
+                )
+            ):
                 flush("char_budget")
             current.append(blk)
             current_chars += blk.char_count
@@ -1019,6 +1390,7 @@ class Extractor:
                     context_after_text=after,
                     block_count=len(group_blocks),
                     block_types=tuple(blk.kind for blk in group_blocks),
+                    teaching_block_ids=tuple(blk.teaching_block_id for blk in group_blocks),
                     break_reason=reason,
                 )
             )
@@ -1032,6 +1404,8 @@ class Extractor:
                 "end_line": c.end_line,
                 "block_count": c.block_count,
                 "block_types": list(c.block_types),
+                "heading_path": c.heading_path,
+                "teaching_block_ids": list(c.teaching_block_ids),
                 "break_reason": c.break_reason,
             }
             for c in chunks
@@ -1125,6 +1499,9 @@ class Extractor:
                 "chunk_summaries": chunk_summaries,
                 "memory_decisions": decision_ledger,
                 "notes": notes,
+                "run_config": self._run_config(state),
+                "api_summary": self._api_summary(client.request_history),
+                "api_requests": client.request_history,
             },
         )
         return {**state, "result": result}
@@ -1132,7 +1509,10 @@ class Extractor:
     def _save_result(self, state: ExtractionState) -> ExtractionState:
         if state.get("save_output", True):
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
-            self.output_path.write_text(state["result"].model_dump_json(indent=2, ensure_ascii=False), encoding="utf-8")
+            self.output_path.write_text(
+                state["result"].model_dump_json(indent=2, ensure_ascii=False, exclude_none=True),
+                encoding="utf-8",
+            )
             self._log(f"Saved result to {self.output_path}")
         return state
     def _build_memory_for_chunk(
@@ -1260,6 +1640,7 @@ class Extractor:
             name=node.name,
             aliases=node.aliases,
             description=node.description,
+            claim_kind=node.claim_kind,
             math_expressions=[
                 ExpressionMemoryItem(id=expression.id, role=expression.role, latex=expression.latex)
                 for expression in sorted(expressions, key=lambda item: (item.role, item.id))[:4]
@@ -1293,6 +1674,7 @@ class Extractor:
                 "start_line": chunk.start_line,
                 "end_line": chunk.end_line,
                 "heading_path": chunk.heading_path,
+                "teaching_block_ids": list(chunk.teaching_block_ids),
                 "context_before_text": chunk.context_before_text,
                 "text": chunk.text,
                 "context_after_text": chunk.context_after_text,
@@ -1302,6 +1684,7 @@ class Extractor:
             "node_memory": [item.model_dump(mode="json") for item in node_memory],
             "relation_memory": [item.model_dump(mode="json") for item in relation_memory],
             "allowed_node_types": NODE_TYPES,
+            "allowed_claim_kinds": CLAIM_KINDS,
             "allowed_relation_types": RELATION_TYPES,
             "allowed_relation_signatures": {
                 relation_type: [
@@ -1348,6 +1731,7 @@ class Extractor:
         expression_owner_refs: set[str] = set()
         decisions: list[dict[str, Any]] = []
         skipped_items: list[dict[str, str]] = []
+        identity_conflicts: list[dict[str, Any]] = []
 
         def skip_item(kind: str, item_ref: str, reason: str) -> None:
             skipped_items.append({"kind": kind, "ref": item_ref, "reason": reason})
@@ -1366,6 +1750,11 @@ class Extractor:
             if ref_id in ref_to_final:
                 skip_item("node_action", ref_id, "duplicate ref_id")
                 continue
+            merge_outcome: dict[str, Any] = {
+                "mention_matches_known_surface": None,
+                "aliases_added": [],
+                "description_action": "created" if action.action == "create" else "kept",
+            }
             try:
                 evidence = self._sanitize_evidence(action.evidence, chunk, source_path, raw_lines)
                 if action.action == "reuse":
@@ -1379,7 +1768,7 @@ class Extractor:
                         raise ValueError(
                             f"reuse type mismatch: {action.type} != canonical {existing.type} for {existing_id}"
                         )
-                    self._merge_reuse_action(existing, action, evidence)
+                    merge_outcome = self._merge_reuse_action(existing, action, evidence)
                     final_id = existing_id
                     reused_node_count += 1
                 else:
@@ -1387,13 +1776,39 @@ class Extractor:
                     node_type = sanitized.type
                     if node_type is None:
                         raise ValueError(f"create action missing node type: {ref_id}")
-                    final_id = self._allocate_node_id(sanitized, node_store)
+                    final_id = _node_id(node_type, sanitized.name)
+                    if final_id in node_store:
+                        conflict_kind = (
+                            "model_decision_conflict"
+                            if final_id in allowed_existing_ids
+                            else "memory_retrieval_miss"
+                        )
+                        conflict = {
+                            "chunk_id": chunk.id,
+                            "ref_id": ref_id,
+                            "conflict_kind": conflict_kind,
+                            "proposed_type": node_type,
+                            "proposed_name": sanitized.name,
+                            "existing_id": final_id,
+                            "existing_type": node_store[final_id].type,
+                            "existing_name": node_store[final_id].name,
+                            "existing_was_in_node_memory": final_id in allowed_existing_ids,
+                            "start_line": evidence.start_line,
+                            "end_line": evidence.end_line,
+                            "reason": action.reason.strip(),
+                        }
+                        identity_conflicts.append(conflict)
+                        raise ValueError(
+                            f"{conflict_kind}: canonical {node_type} name already exists as {final_id}: "
+                            f"{sanitized.name}"
+                        )
                     node_store[final_id] = NodeRecord(
                         id=final_id,
                         type=node_type,
                         name=sanitized.name,
-                        aliases=sanitized.aliases,
+                        aliases=_canonical_aliases(sanitized.name, sanitized.aliases),
                         description=sanitized.description,
+                        claim_kind=sanitized.claim_kind,
                         evidence=[evidence],
                     )
                     created_refs.add(ref_id)
@@ -1413,6 +1828,7 @@ class Extractor:
                     "end_line": evidence.end_line,
                     "reason": action.reason.strip(),
                     "status": "accepted",
+                    **merge_outcome,
                 }
             )
 
@@ -1533,6 +1949,8 @@ class Extractor:
             "total_expressions": len(expression_store),
             "skipped_item_count": len(skipped_items),
             "skipped_items": skipped_items,
+            "identity_conflict_count": len(identity_conflicts),
+            "identity_conflicts": identity_conflicts,
             "pending_node_count": len(pending_refs),
             "pending_node_refs": pending_refs,
             "decisions": decisions,
@@ -1552,26 +1970,12 @@ class Extractor:
             mention=action.mention.strip(),
             type=node_type,
             name=name,
-            aliases=_unique_preserve_order(action.aliases),
+            aliases=_canonical_aliases(name, action.aliases),
             description=description,
+            claim_kind=action.claim_kind,
             evidence=EvidenceRef(start_line=evidence.start_line, end_line=evidence.end_line),
             reason=action.reason.strip(),
         )
-
-    def _allocate_node_id(
-        self,
-        action: NodeAction,
-        node_store: dict[str, NodeRecord],
-    ) -> str:
-        if action.type is None:
-            raise ValueError(f"Cannot allocate id without node type: {action.ref_id}")
-        base_id = _node_id(action.type, action.name)
-        if base_id in node_store:
-            raise ValueError(
-                f"Canonical {action.type} name already exists: {action.name}. "
-                "The model must reuse the supplied node or choose a genuinely disambiguated canonical name."
-            )
-        return base_id
 
     def _sanitize_evidence(self, evidence: EvidenceRef, chunk: DocumentChunk, source_path: str, raw_lines: list[str]) -> Evidence:
         start = evidence.start_line
@@ -1593,23 +1997,72 @@ class Extractor:
         source_excerpt = _text_snippet(raw_lines, start, end)
         if not source_excerpt.strip():
             raise ValueError(f"Evidence lines contain no source text in {chunk.id}: L{start}-L{end}")
+        source_context = self.source_context_by_line.get(start)
+        if source_context is None:
+            raise ValueError(f"Evidence start line has no source structure metadata in {chunk.id}: L{start}")
+        heading_path, teaching_block_id, discourse_role = source_context
         return Evidence(
             source_path=source_path,
             start_line=start,
             end_line=end,
             text=source_excerpt,
             chunk_id=chunk.id,
+            heading_path=heading_path,
+            teaching_block_id=teaching_block_id,
+            discourse_role=discourse_role,
         )
-    def _merge_reuse_action(self, existing: NodeRecord, action: NodeAction, evidence: Evidence) -> None:
-        aliases = [*existing.aliases, *action.aliases]
+    def _merge_reuse_action(
+        self,
+        existing: NodeRecord,
+        action: NodeAction,
+        evidence: Evidence,
+    ) -> dict[str, Any]:
         mention = action.mention.strip()
-        if mention and _normalize_name(mention) != _normalize_name(existing.name):
-            aliases.append(mention)
-        existing.aliases = _unique_preserve_order(aliases)
+        known_surface_keys = {
+            _normalize_name(surface)
+            for surface in [existing.name, *existing.aliases]
+            if _normalize_name(surface)
+        }
+        mention_key = _normalize_name(mention)
+        mention_matches_known_surface = bool(mention_key and mention_key in known_surface_keys)
+
+        if action.claim_kind is not None:
+            if existing.type != "Claim":
+                raise ValueError(f"claim_kind supplied for non-Claim reuse: {existing.id}")
+            if existing.claim_kind is not None and action.claim_kind != existing.claim_kind:
+                raise ValueError(
+                    f"claim_kind mismatch for {existing.id}: {action.claim_kind} != {existing.claim_kind}"
+                )
+            existing.claim_kind = action.claim_kind
+
+        previous_aliases = list(existing.aliases)
+        existing.aliases = _canonical_aliases(existing.name, [*existing.aliases, *action.aliases])
+        aliases_added = [alias for alias in existing.aliases if alias not in previous_aliases]
+
         description = re.sub(r"\s+", " ", action.description).strip()
-        if description:
+        current_description = re.sub(r"\s+", " ", existing.description).strip()
+        description_action = "kept"
+        description_revision: dict[str, Any] | None = None
+        if description and description != current_description:
+            description_action = "initialized" if not current_description else "replaced"
+            description_revision = {
+                "action": description_action,
+                "previous_description": current_description,
+                "new_description": description,
+                "start_line": evidence.start_line,
+                "end_line": evidence.end_line,
+                "reason": action.reason.strip(),
+            }
             existing.description = description
+        elif description:
+            description_action = "unchanged"
         self._append_node_evidence(existing, evidence)
+        return {
+            "mention_matches_known_surface": mention_matches_known_surface,
+            "aliases_added": aliases_added,
+            "description_action": description_action,
+            "description_revision": description_revision,
+        }
 
     def _append_node_evidence(self, node: NodeRecord, evidence: Evidence) -> None:
         signature = (evidence.source_path, evidence.start_line, evidence.end_line, evidence.text.strip())
@@ -1642,6 +2095,89 @@ class Extractor:
             )
         return max(relation.evidences, key=lambda e: (len(e.text.strip()), -(e.end_line - e.start_line)))
 
+    def _run_config(self, state: ExtractionState) -> dict[str, Any]:
+        reasoning_effort_sent = (
+            state.get("reasoning_effort")
+            if state.get("provider") == "deepseek" and state.get("thinking") == "enabled"
+            else None
+        )
+        temperature_sent = not (
+            state.get("provider") == "deepseek" and state.get("thinking") == "enabled"
+        )
+        return {
+            "run_started_at": state.get("run_started_at"),
+            "run_finished_at": datetime.now(timezone.utc).isoformat(),
+            "schema_version": SCHEMA_VERSION,
+            "extractor_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "system_prompt_sha256": hashlib.sha256(self.system_prompt.encode("utf-8")).hexdigest(),
+            "provider": state.get("provider"),
+            "model_requested": state.get("model"),
+            "base_url": state.get("base_url"),
+            "thinking": state.get("thinking"),
+            "reasoning_effort_requested": state.get("reasoning_effort"),
+            "reasoning_effort_sent": reasoning_effort_sent,
+            "temperature_requested": state.get("temperature"),
+            "temperature_sent": state.get("temperature") if temperature_sent else None,
+            "max_tokens": state.get("max_tokens"),
+            "max_chunk_chars": state.get("max_chunk_chars"),
+            "chunk_context_before_lines": state.get("chunk_context_before_lines"),
+            "chunk_context_after_lines": state.get("chunk_context_after_lines"),
+            "max_retries": state.get("max_retries"),
+            "request_timeout": state.get("request_timeout"),
+            "request_delay": state.get("request_delay"),
+            "response_format_enabled": state.get("use_response_format"),
+            "resume_enabled": state.get("resume"),
+            "include_exercises": state.get("include_exercises"),
+        }
+
+    def _api_summary(self, records: list[dict[str, Any]]) -> dict[str, Any]:
+        usage_keys = (
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "prompt_cache_hit_tokens",
+            "prompt_cache_miss_tokens",
+        )
+        usage_totals = {key: 0 for key in usage_keys}
+        reasoning_tokens = 0
+        for record in records:
+            usage = record.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            for key in usage_keys:
+                value = usage.get(key)
+                if isinstance(value, int):
+                    usage_totals[key] += value
+            completion_details = usage.get("completion_tokens_details")
+            if isinstance(completion_details, dict):
+                value = completion_details.get("reasoning_tokens")
+                if isinstance(value, int):
+                    reasoning_tokens += value
+        return {
+            "request_count": len(records),
+            "successful_request_count": sum(record.get("status") == "success" for record in records),
+            "failed_request_count": sum(record.get("status") != "success" for record in records),
+            "total_latency_seconds": round(
+                sum(float(record.get("latency_seconds", 0.0)) for record in records),
+                4,
+            ),
+            "usage_totals": {**usage_totals, "reasoning_tokens": reasoning_tokens},
+            "response_models": sorted(
+                {
+                    str(record["response_model"])
+                    for record in records
+                    if record.get("response_model")
+                }
+            ),
+            "system_fingerprints": sorted(
+                {
+                    str(record["system_fingerprint"])
+                    for record in records
+                    if record.get("system_fingerprint")
+                }
+            ),
+        }
+
     def _finalize_result(
         self,
         source_path: str,
@@ -1656,8 +2192,9 @@ class Extractor:
                 id=node.id,
                 type=node.type,
                 name=node.name,
-                aliases=_unique_preserve_order(node.aliases),
+                aliases=_canonical_aliases(node.name, node.aliases),
                 description=node.description,
+                claim_kind=node.claim_kind,
                 evidence=sorted(node.evidence, key=lambda item: (item.start_line, item.end_line)),
             )
             for node in sorted(node_store.values(), key=lambda item: (item.type, item.name, item.id))
@@ -1693,6 +2230,7 @@ class Extractor:
         diagnostics["relation_count"] = len(relations)
         diagnostics["math_expression_count"] = len(expressions)
         diagnostics["node_type_counts"] = self._count_by_type(nodes)
+        diagnostics["claim_kind_counts"] = self._count_by_claim_kind(nodes)
         diagnostics["relation_type_counts"] = self._count_by_relation_type(relations)
         diagnostics["math_expression_role_counts"] = self._count_by_expression_role(expressions)
         incident_node_ids = {
@@ -1716,11 +2254,40 @@ class Extractor:
                 for evidence in node.evidence
             ) > 20
         ]
+        chunk_summaries = diagnostics.get("chunk_summaries", [])
+        identity_conflicts = [
+            conflict
+            for summary in chunk_summaries
+            for conflict in summary.get("identity_conflicts", [])
+        ]
+        memory_decisions = diagnostics.get("memory_decisions", [])
+        reuse_surface_reviews = [
+            decision
+            for decision in memory_decisions
+            if decision.get("action") == "reuse"
+            and decision.get("mention_matches_known_surface") is False
+        ]
+        description_revisions = [
+            decision
+            for decision in memory_decisions
+            if decision.get("description_revision")
+        ]
         diagnostics["audit"] = {
             "isolated_node_count": len(isolated_nodes),
             "isolated_node_ids": isolated_nodes,
             "wide_evidence_node_count": len(wide_evidence_nodes),
             "wide_evidence_nodes": wide_evidence_nodes,
+            "identity_conflict_count": len(identity_conflicts),
+            "memory_retrieval_miss_count": sum(
+                conflict.get("conflict_kind") == "memory_retrieval_miss"
+                for conflict in identity_conflicts
+            ),
+            "model_decision_conflict_count": sum(
+                conflict.get("conflict_kind") == "model_decision_conflict"
+                for conflict in identity_conflicts
+            ),
+            "reuse_surface_review_count": len(reuse_surface_reviews),
+            "description_revision_count": len(description_revisions),
         }
         diagnostics["title"] = self._title_from_lines(lines)
         return ExtractionResult(
@@ -1746,6 +2313,13 @@ class Extractor:
             counts[relation.type] = counts.get(relation.type, 0) + 1
         return dict(sorted(counts.items()))
 
+    def _count_by_claim_kind(self, nodes: list[KGNode]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for node in nodes:
+            if node.type == "Claim" and node.claim_kind is not None:
+                counts[node.claim_kind] = counts.get(node.claim_kind, 0) + 1
+        return dict(sorted(counts.items()))
+
     def _count_by_expression_role(self, expressions: list[MathExpression]) -> dict[str, int]:
         counts: dict[str, int] = {}
         for expression in expressions:
@@ -1761,7 +2335,7 @@ class Extractor:
         return self.input_path.stem
 
     def _cache_dir(self) -> Path:
-        path = ROOT / "node_cache" / "semantic_layer_v1_1"
+        path = ROOT / "node_cache" / "semantic_layer_v1_3"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -1781,6 +2355,7 @@ class Extractor:
                 "start_line": chunk.start_line,
                 "end_line": chunk.end_line,
                 "heading_path": chunk.heading_path,
+                "teaching_block_ids": list(chunk.teaching_block_ids),
                 "context_before_text": chunk.context_before_text,
                 "text": chunk.text,
                 "context_after_text": chunk.context_after_text,
@@ -1828,10 +2403,14 @@ OUTPUT_CONTRACT = {
             "action": "reuse or create",
             "existing_id": "Required only for reuse; must come from node_memory.",
             "mention": "Exact current-chunk mention.",
-            "type": "Required only for create.",
+            "type": "Required only for create; omit for reuse and never emit an empty string.",
             "name": "Required only for create.",
             "aliases": ["Optional aliases."],
             "description": "Required for create; optional enrichment for reuse.",
+            "claim_kind": (
+                "Required for create Claim: property, criterion, identity, or result. "
+                "Omit for Concept, Method, and every reuse action; never emit an empty string."
+            ),
             "evidence": {
                 "start_line": "Inclusive supporting line from chunk.evidence_line_numbers.",
                 "end_line": "Inclusive supporting line from chunk.evidence_line_numbers.",
@@ -1870,7 +2449,7 @@ def check_config(
     base_url: str | None = None,
     api_key_env: str | None = None,
     thinking: str = "disabled",
-    reasoning_effort: str = "medium",
+    reasoning_effort: str = "high",
 ) -> int:
     provider_name = _provider_name(provider)
     adapter_class = _provider_class(provider_name)
@@ -1888,7 +2467,12 @@ def check_config(
                 "endpoint_url": _completion_url(resolved_base_url),
                 "model": resolved_model,
                 "thinking": thinking,
-                "reasoning_effort": reasoning_effort if provider_name == "deepseek" else None,
+                "reasoning_effort_requested": reasoning_effort,
+                "reasoning_effort_sent": (
+                    reasoning_effort
+                    if provider_name == "deepseek" and thinking == "enabled"
+                    else None
+                ),
                 "response_format_supported": adapter_class.supports_response_format,
                 "chunk_context_before_lines": 6,
                 "chunk_context_after_lines": 4,
@@ -1923,7 +2507,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tokens", type=int, default=12000)
     parser.add_argument("--request-delay", type=float, default=3.0, help="Seconds to sleep between API calls.")
     parser.add_argument("--thinking", default="disabled", choices=["enabled", "disabled"], help="Provider thinking mode when supported.")
-    parser.add_argument("--reasoning-effort", default="medium", choices=["low", "medium", "high"], help="Reasoning effort for providers/models that support it.")
+    parser.add_argument(
+        "--reasoning-effort",
+        default="high",
+        choices=["low", "medium", "high", "max"],
+        help="Requested reasoning effort. DeepSeek currently maps medium to high.",
+    )
     parser.add_argument("--no-save", action="store_true", help="Run the graph but do not write output file.")
     parser.add_argument("--no-resume", action="store_true", help="Ignore cached chunk outputs.")
     parser.add_argument("--include-exercises", action="store_true", help="Also extract exercise content.")
