@@ -14,6 +14,16 @@ Use only information explicitly present in the current chunk. Prefer omission
 over speculation. Do not infer pedagogical prerequisites, unstated logical
 consequences, or facts supplied only by general mathematical knowledge.
 
+chunk.teaching_blocks maps each teaching_block_id to a discourse_role and an
+inclusive source-line range. Use these parser-produced roles only as navigation
+hints for locating definitions, exposition, examples, theorems, corollaries,
+proofs, and figures. They are not mathematical evidence and may be imperfect.
+The line-numbered chunk.text remains the sole source of evidence and must govern
+whenever a role label and the source wording disagree. In particular, do not
+create a node merely because a block is labeled theorem or paragraph. Continue
+to exclude example-local and proof-local material, while independently applying
+the ontology admission tests to eligible content in every block.
+
 A heading, chapter roadmap, section preview, table of contents, or sentence
 that merely lists topics is document metadata. For example, "this chapter will
 study functions, limits, and continuity" does not establish three Concept
@@ -45,12 +55,27 @@ Concept
   substantively introduces its common characterization or several named
   members. Do not omit the family merely because its name first appears in a
   heading. A heading with no substantive body remains ineligible.
+- Do not require a Concept to be the chunk's single central topic. A supporting
+  concept is also eligible when the textbook body explicitly defines it,
+  assigns it a reusable mathematical meaning, introduces its standard notation,
+  or uses it as the named subject of a general result or method. Examples include
+  a neighborhood, a quantifier, convergence, and a named mathematical family.
+- Apply an independent-reference test before splitting a passage: the candidate
+  must denote a mathematical idea that later statements can refer to as a unit.
+  Do not atomize every phrase, symbol, parameter, component of one definition,
+  or synonymous wording into separate Concepts.
 - Do not create Concepts for local variables, a particular function f, a
   particular sequence, one value, one set introduced only for an example,
   historical people, section labels, or every noun appearing in a formula.
 
 Claim
 - An explicit, reusable, truth-evaluable general mathematical assertion.
+- Truth-evaluability alone is not sufficient. Admit a Claim only when the source
+  presents it as a theorem, property, corollary, criterion, identity, law, or
+  formula, or clearly states it as a standalone reusable general conclusion.
+  Explanatory observations, motivation, semantic paraphrases, and algebraic
+  equivalences used only to explain the current passage remain context rather
+  than Claim nodes.
 - Claim includes theorem results, properties, corollaries, criteria, laws,
   identities, necessary or sufficient conditions, explicit non-implications,
   and other general conclusions taught by the source.
@@ -72,21 +97,32 @@ Claim
 - If a definition passage also states a logically independent theorem,
   property, criterion, or consequence, only that independent assertion may be
   a Claim.
-- A general criterion for equality, existence, symmetry, decomposition,
-  closure, or applicability is normally an independent Claim even when it
-  immediately follows a definition. Do not absorb such a result into the
-  Concept description merely because the paragraphs are adjacent.
+- A source-presented general criterion for equality, existence, uniqueness,
+  membership, validity, or applicability is an independent Claim even when it
+  immediately follows a definition. A mathematical equivalence is not
+  automatically a criterion: it must function as a reusable test for a named
+  judgment, not merely rewrite one inequality or expression during an
+  explanation.
 - A proof-local inequality, an example-specific conclusion, an intermediate
-  derivation, and a one-off observation are not Claims.
+  derivation, a motivational measurement observation, and a one-off observation
+  are not Claims.
 - Every Claim has exactly one claim_kind:
   * property: a characteristic or structural fact about a mathematical object,
-    such as monotonicity, parity, symmetry, boundedness, or closure;
-  * criterion: a necessary, sufficient, necessary-and-sufficient, equality,
-    existence, uniqueness, or applicability condition;
+    class, or operation, such as monotonicity, parity, symmetry, boundedness,
+    uniqueness of an associated object, closure, or non-commutativity;
+  * criterion: an explicit reusable test whose condition decides a named
+    judgment, including a necessary, sufficient, necessary-and-sufficient,
+    equality, existence, membership, validity, or applicability condition;
   * identity: a canonical reusable identity, transformation formula, or named
     symbolic law;
   * result: a general theorem-level conclusion that is not primarily a
     property, criterion, or identity.
+- Classify by this precedence: identity for a canonical symbolic law; criterion
+  only for a decision condition; property for an attributed behavior or
+  structural characteristic; result for the remaining theorem-level
+  implication or conclusion. Thus a theorem asserting that a class is bounded
+  or has a unique associated object is a property, while a theorem supplying a
+  test for whether an object exists or belongs to a class is a criterion.
 - claim_kind describes mathematical semantic function. Textbook labels such as
   theorem, property, corollary, or formula are discourse roles and do not
   override this classification. A corollary identity is still identity; a
@@ -130,26 +166,29 @@ provided for semantic identity resolution, not as source evidence.
 5. Use action="reuse" only with an existing_id supplied in node_memory.
 6. Use action="create" when the current entity is genuinely new among the
    supplied candidates. Never invent an existing_id.
-7. For an ordinary repeated mention, leave a reuse action's description empty.
-8. When the current source adds an authoritative definition, claim statement,
+7. A reuse action must copy the exact current-chunk wording into mention so the
+   identity decision remains auditable. A create action does not need mention;
+   its canonical name and evidence lines already identify the new node.
+8. For an ordinary repeated mention, leave a reuse action's description empty.
+9. When the current source adds an authoritative definition, claim statement,
    or method specification, a reuse action may provide a non-empty description.
    That description must be the complete updated canonical description because
    it replaces the stored description.
-9. Every new entity referenced by a relation or expression must have exactly
+10. Every new entity referenced by a relation or expression must have exactly
    one node_actions entry with a unique local ref_id in this response. An
    unchanged existing node may instead be referenced directly by its exact id
    from node_memory.
-10. It is valid for an eligible node to have no relation in this chunk. Never
+11. It is valid for an eligible node to have no relation in this chunk. Never
     use special_case_of or another relation as a connectivity placeholder.
-11. Equivalent definitions or complementary parts of one definition remain one
+12. Equivalent definitions or complementary parts of one definition remain one
     Concept. For example, an upper/lower-bound characterization and an
     absolute-value bound characterize the same boundedness Concept. Reuse the
     existing node and provide one complete updated description; never create a
     second node with the same canonical type and name.
-12. If two genuinely different entities share a surface word, give each a
+13. If two genuinely different entities share a surface word, give each a
     mathematically disambiguated canonical name. Exact duplicate canonical
     type-and-name pairs are invalid.
-13. For a relation or expression endpoint, use either a local ref_id from this
+14. For a relation or expression endpoint, use either a local ref_id from this
     response or an exact id supplied in node_memory. A memory id is appropriate
     when the current source only connects to that existing node. Emit a reuse
     node_action instead when the current passage should add node evidence,
@@ -289,20 +328,28 @@ For every expression:
 
 -------------------- Extraction procedure --------------------
 
-1. Identify the chunk's central reusable Concepts, Claims, and Methods.
+1. Identify all source-substantiated reusable Concepts, Claims, and Methods;
+   centrality is not required for an explicitly introduced supporting Concept.
 2. Exclude roadmap, discourse-only, and local example/proof material.
 3. For every apparent Claim, first test whether it is actually a definition;
    if so, represent only the defined Concept.
-4. Resolve each eligible node against node_memory with create or reuse.
-5. Attach only qualifying exact-source mathematical expressions.
-6. Emit only relations explicitly supported by the current chunk and valid
+4. Apply the Claim admission gate and then assign claim_kind using the stated
+   precedence. Reject explanatory equivalences and observations that are not
+   independently taught results.
+5. Resolve each eligible node against node_memory with create or reuse.
+6. Perform a Concept coverage pass over the chunk body. Check every explicit
+   definitional act, reusable notation introduction, named mathematical family,
+   and named subject of a general result. Add any omitted eligible Concept, but
+   do not create nodes from context-only text, examples, proofs, or local symbols.
+7. Attach only qualifying exact-source mathematical expressions.
+8. Emit only relations explicitly supported by the current chunk and valid
    under allowed_relation_signatures.
-7. Apply the strict subsumption test to every special_case_of candidate.
-8. Check local ref_ids, memory IDs, relation directions, expression roles, and
+9. Apply the strict subsumption test to every special_case_of candidate.
+10. Check local ref_ids, memory IDs, relation directions, expression roles, and
    evidence lines before returning JSON.
-9. Confirm that every relation and expression endpoint is either one of this
+11. Confirm that every relation and expression endpoint is either one of this
    response's local ref_id values or an exact id supplied in node_memory.
-10. Confirm that every created Claim has one allowed claim_kind and that every
+12. Confirm that every created Claim has one allowed claim_kind and that every
     created Concept description excludes independently stated properties.
 
 -------------------- Output --------------------
@@ -325,12 +372,11 @@ Return exactly this shape, including empty arrays when needed:
       "ref_id": "q1",
       "action": "create",
       "existing_id": null,
-      "mention": "source wording for the result",
       "type": "Claim",
-      "name": "canonical mathematical result name",
+      "name": "canonical mathematical property name",
       "aliases": [],
       "description": "complete source-grounded assertion",
-      "claim_kind": "criterion",
+      "claim_kind": "property",
       "evidence": {"start_line": 21, "end_line": 24},
       "reason": "new reusable general claim"
     }
@@ -354,8 +400,9 @@ Return exactly this shape, including empty arrays when needed:
   "notes": []
 }
 
-For reuse, existing_id is required and must come from node_memory; omit type,
-name, and claim_kind entirely. Never emit an empty string for an enum field.
-For create, existing_id must be null, and type, name, and description are
-required. Do not output content, score, confidence, quality, evidence text, or
-extra top-level keys.
+For reuse, existing_id and a non-empty exact-source mention are required;
+existing_id must come from node_memory. Omit type, name, and claim_kind. Never
+emit an empty string for an enum field. For create, existing_id must be null;
+type, name, and description are required, while mention may be omitted. Do not
+output content, score, confidence, quality, evidence text, or extra top-level
+keys.

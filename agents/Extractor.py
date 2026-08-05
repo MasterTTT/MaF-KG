@@ -36,8 +36,9 @@ from langgraph.graph import END, StateGraph
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT_DIR = ROOT / "prompts"
 DEFAULT_INPUT = ROOT / "data" / "raw" / "第一章第一节_映射与函数.md"
-DEFAULT_OUTPUT = ROOT / "KG" / "第一章第一节_映射与函数_semantic_v1_3.json"
-SCHEMA_VERSION = "maf-kg.semantic.v1.3"
+DEFAULT_OUTPUT = ROOT / "KG" / "第一章第一节_映射与函数_semantic_v1_5_9.json"
+SCHEMA_VERSION = "maf-kg.semantic.v1.5.9"
+CHUNK_STRATEGIES = ["budget", "teaching-units"]
 NODE_TYPES = ["Concept", "Claim", "Method"]
 CLAIM_KINDS = ["property", "criterion", "identity", "result"]
 RELATION_SIGNATURES: dict[str, tuple[tuple[str, str], ...]] = {
@@ -140,7 +141,7 @@ class NodeAction(BaseModel):
     ref_id: str
     action: Literal["reuse", "create"]
     existing_id: str | None = None
-    mention: str
+    mention: str = ""
     type: NodeType | None = None
     name: str = ""
     aliases: list[str] = Field(default_factory=list)
@@ -154,6 +155,8 @@ class NodeAction(BaseModel):
         if self.action == "reuse":
             if not self.existing_id:
                 raise ValueError("reuse actions require existing_id")
+            if not self.mention.strip():
+                raise ValueError("reuse actions require the exact current-chunk mention")
         else:
             if self.existing_id is not None:
                 raise ValueError("create actions must not include existing_id")
@@ -231,7 +234,18 @@ class DocumentChunk:
     block_count: int = 0
     block_types: tuple[str, ...] = ()
     teaching_block_ids: tuple[str, ...] = ()
+    teaching_blocks: tuple[dict[str, int | str], ...] = ()
     break_reason: str = ""
+    teaching_unit_kind: str = ""
+    anchor_block_ids: tuple[str, ...] = ()
+
+@dataclass
+class TeachingUnitGroup:
+    blocks: list[DocumentBlock]
+    unit_kind: str
+    grouping_reason: str
+    anchor_block_ids: tuple[str, ...] = ()
+    skipped: bool = False
 
 class ExtractionState(TypedDict, total=False):
     input_path: str
@@ -242,8 +256,11 @@ class ExtractionState(TypedDict, total=False):
     api_key_env: str | None
     temperature: float
     max_chunk_chars: int
+    chunk_strategy: str
     chunk_context_before_lines: int
     chunk_context_after_lines: int
+    experimental_chunk_spans: tuple[tuple[int, int], ...]
+    experimental_skip_pure_example_chunks: bool
     max_retries: int
     request_timeout: float
     max_tokens: int
@@ -276,11 +293,340 @@ def _load_prompt(filename: str) -> str:
         raise FileNotFoundError(f"Prompt file not found: {path}")
     return path.read_text(encoding="utf-8").strip()
 
+def _parse_experimental_chunk_spans(value: str) -> tuple[tuple[int, int], ...]:
+    spans: list[tuple[int, int]] = []
+    for item in value.split(","):
+        match = re.fullmatch(r"\s*(\d+)\s*-\s*(\d+)\s*", item)
+        if not match:
+            raise argparse.ArgumentTypeError(
+                "experimental chunk spans must use START-END pairs separated by commas"
+            )
+        start_line, end_line = (int(part) for part in match.groups())
+        if start_line < 1 or end_line < start_line:
+            raise argparse.ArgumentTypeError(
+                f"invalid experimental chunk span: {start_line}-{end_line}"
+            )
+        spans.append((start_line, end_line))
+    return tuple(spans)
+
 def _stable_hash(*parts: str) -> str:
     return hashlib.sha1("::".join(p.strip() for p in parts).encode("utf-8")).hexdigest()[:14]
 
 def _slug(text: str, limit: int = 48) -> str:
     return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "_", text).strip("_")[:limit] or "item"
+
+def _document_block_text(block: DocumentBlock) -> str:
+    return " ".join(text.strip() for _, text in block.lines if text.strip())
+
+def _group_char_count(blocks: list[DocumentBlock]) -> int:
+    return sum(block.char_count for block in blocks)
+
+def _theorem_label(block: DocumentBlock) -> tuple[str, bool] | None:
+    if block.kind != "theorem":
+        return None
+    text = re.sub(r"^\s*[-+*]\s+", "", _document_block_text(block))
+    match = re.match(
+        r"^\s*定理\s*([0-9一二三四五六七八九十百]+)?\s*([\u2032'’]?)",
+        text,
+    )
+    if not match:
+        return None
+    return (match.group(1) or "", bool(match.group(2)))
+
+def _is_theorem_leadin(block: DocumentBlock) -> bool:
+    if block.kind not in {"paragraph", "formula_exposition"}:
+        return False
+    text = _document_block_text(block).strip()
+    return bool(
+        re.search(r"(下面|以下|下列|下述).{0,24}(定理|结论)", text)
+        or re.search(r"有如下.{0,16}(定理|结论)", text)
+        or re.search(r"(定理|结论).{0,18}(说明|表明|给出)", text)
+        or re.search(r"(?:即|如下)\s*[。.]?$", text)
+    )
+
+def _is_standalone_core_statement(block: DocumentBlock) -> bool:
+    if block.kind not in {"paragraph", "formula_exposition", "property"}:
+        return False
+    text = _document_block_text(block).strip()
+    conditional = bool(
+        re.search(r"如果.+(?:那么|则)", text)
+        or re.search(r"若.+(?:那么|则)", text)
+        or "充分必要条件" in text
+    )
+    general_marker = bool(re.match(r"^\s*(一般地(?:说)?|由此|根据.+(?:可知|容易证明))", text))
+    return conditional and general_marker
+
+def _teaching_unit_kind(blocks: list[DocumentBlock], reason: str) -> str:
+    substantive = [block for block in blocks if block.kind != "heading"]
+    if not substantive:
+        return "heading_only"
+    theorem_blocks = [block for block in substantive if block.kind == "theorem"]
+    if theorem_blocks:
+        labels = [_theorem_label(block) for block in theorem_blocks]
+        root_count = sum(label is None or not label[1] for label in labels)
+        has_dependents = any(block.kind == "corollary" for block in substantive) or any(
+            label is not None and label[1] for label in labels
+        )
+        if has_dependents:
+            return "theorem_family"
+        if root_count > 1:
+            return "theorem_group"
+        return "theorem"
+    if any(block.kind == "corollary" for block in substantive):
+        return "corollary"
+    if any(block.kind == "property" for block in substantive):
+        return "property"
+    if reason == "core_statement_before_theorem" or (
+        len(substantive) == 1 and _is_standalone_core_statement(substantive[0])
+    ):
+        return "core_statement"
+    return "exposition"
+
+def _teaching_unit_anchor_ids(blocks: list[DocumentBlock], unit_kind: str) -> tuple[str, ...]:
+    substantive = [block for block in blocks if block.kind != "heading"]
+    if unit_kind.startswith("theorem"):
+        anchors = [block for block in substantive if block.kind in {"theorem", "corollary"}]
+    elif unit_kind in {"property", "corollary", "core_statement"}:
+        anchors = [
+            block
+            for block in substantive
+            if block.kind in {"property", "corollary"} or _is_standalone_core_statement(block)
+        ]
+    elif unit_kind == "example_sequence":
+        anchors = [block for block in substantive if block.kind == "example"]
+    else:
+        anchors = substantive[:1]
+    return tuple(block.teaching_block_id for block in anchors)
+
+def _make_teaching_unit_group(
+    blocks: list[DocumentBlock],
+    reason: str,
+    *,
+    skipped: bool = False,
+) -> TeachingUnitGroup:
+    unit_kind = "example_sequence" if skipped else _teaching_unit_kind(blocks, reason)
+    return TeachingUnitGroup(
+        blocks=list(blocks),
+        unit_kind=unit_kind,
+        grouping_reason=reason,
+        anchor_block_ids=_teaching_unit_anchor_ids(blocks, unit_kind),
+        skipped=skipped,
+    )
+
+def _build_teaching_unit_groups(
+    blocks: list[DocumentBlock],
+    max_chars: int,
+) -> list[TeachingUnitGroup]:
+    if max_chars < 1:
+        raise ValueError("max_chunk_chars must be positive")
+
+    groups: list[TeachingUnitGroup] = []
+    current: list[DocumentBlock] = []
+    pending_headings: list[DocumentBlock] = []
+    theorem_root_count = 0
+    theorem_has_dependents = False
+
+    def current_substantive() -> list[DocumentBlock]:
+        return [block for block in current if block.kind != "heading"]
+
+    def current_has_theorem() -> bool:
+        return any(block.kind == "theorem" for block in current)
+
+    def seed_pending_headings() -> None:
+        if pending_headings:
+            current.extend(pending_headings)
+            pending_headings.clear()
+
+    def reset_theorem_state() -> None:
+        nonlocal theorem_root_count, theorem_has_dependents
+        theorem_root_count = 0
+        theorem_has_dependents = False
+
+    def flush(reason: str) -> None:
+        nonlocal current
+        if current:
+            groups.append(_make_teaching_unit_group(current, reason))
+        current = []
+        reset_theorem_state()
+
+    def last_root_label() -> str | None:
+        for candidate in reversed(current):
+            label = _theorem_label(candidate)
+            if label is not None and not label[1]:
+                return label[0]
+        return None
+
+    def theorem_has_following_dependent(index: int, label: tuple[str, bool] | None) -> bool:
+        if index + 1 >= len(blocks):
+            return False
+        following = blocks[index + 1]
+        if following.kind == "corollary":
+            return True
+        following_label = _theorem_label(following)
+        return bool(
+            label is not None
+            and following_label is not None
+            and not label[1]
+            and following_label[1]
+            and label[0] == following_label[0]
+        )
+
+    def should_attach_short_preface() -> bool:
+        substantive = current_substantive()
+        if not substantive:
+            return True
+        if _is_theorem_leadin(substantive[-1]):
+            return True
+        preface_limit = min(800, max(120, max_chars // 4))
+        return (
+            any(block.kind == "heading" for block in current)
+            and len(substantive) <= 1
+            and _group_char_count(current) <= preface_limit
+            and not _is_standalone_core_statement(substantive[-1])
+        )
+
+    i = 0
+    while i < len(blocks):
+        block = blocks[i]
+
+        if block.kind == "heading":
+            flush("heading_boundary")
+            pending_headings.append(block)
+            i += 1
+            continue
+
+        if block.kind == "example":
+            flush("example_boundary")
+            skipped_blocks = list(pending_headings)
+            pending_headings.clear()
+            while i < len(blocks) and blocks[i].kind == "example":
+                skipped_blocks.append(blocks[i])
+                i += 1
+            groups.append(
+                _make_teaching_unit_group(
+                    skipped_blocks,
+                    "explicit_example_sequence",
+                    skipped=True,
+                )
+            )
+            continue
+
+        if block.kind == "theorem":
+            label = _theorem_label(block)
+            following_dependent = theorem_has_following_dependent(i, label)
+            if current_has_theorem():
+                variant_of_current = bool(
+                    label is not None
+                    and label[1]
+                    and label[0] == last_root_label()
+                )
+                if variant_of_current:
+                    current.append(block)
+                    theorem_has_dependents = True
+                    i += 1
+                    continue
+
+                combined_chars = _group_char_count(current) + block.char_count
+                if (
+                    theorem_has_dependents
+                    or theorem_root_count >= 2
+                    or following_dependent
+                    or combined_chars > max_chars
+                ):
+                    reason = "char_budget" if combined_chars > max_chars else "theorem_cluster_boundary"
+                    flush(reason)
+                    seed_pending_headings()
+                current.append(block)
+                theorem_root_count = 1
+                theorem_has_dependents = False
+                i += 1
+                continue
+
+            seed_pending_headings()
+            if current_substantive() and not should_attach_short_preface():
+                flush("theorem_boundary")
+                seed_pending_headings()
+            current.append(block)
+            theorem_root_count = 1
+            theorem_has_dependents = False
+            i += 1
+            continue
+
+        if block.kind == "corollary":
+            seed_pending_headings()
+            if current_has_theorem():
+                current.append(block)
+                theorem_has_dependents = True
+            else:
+                if current_substantive():
+                    flush("corollary_boundary")
+                    seed_pending_headings()
+                current.append(block)
+                theorem_has_dependents = True
+            i += 1
+            continue
+
+        if block.kind == "property":
+            flush("property_boundary")
+            seed_pending_headings()
+            current.append(block)
+            flush("property_unit")
+            i += 1
+            continue
+
+        if block.kind == "proof" and current_has_theorem():
+            current.append(block)
+            i += 1
+            continue
+
+        if current_has_theorem():
+            flush("post_theorem_boundary")
+
+        seed_pending_headings()
+        next_is_theorem = i + 1 < len(blocks) and blocks[i + 1].kind == "theorem"
+        if _is_theorem_leadin(block) and next_is_theorem:
+            substantive = current_substantive()
+            if substantive and (
+                _is_standalone_core_statement(substantive[-1])
+                or _group_char_count(current) > max(600, max_chars // 3)
+            ):
+                reason = (
+                    "core_statement_before_theorem"
+                    if _is_standalone_core_statement(substantive[-1])
+                    else "theorem_leadin_boundary"
+                )
+                flush(reason)
+                seed_pending_headings()
+            current.append(block)
+            i += 1
+            continue
+
+        if current_substantive() and _group_char_count(current) + block.char_count > max_chars:
+            flush("char_budget")
+            seed_pending_headings()
+        current.append(block)
+        i += 1
+
+    flush("end")
+    if pending_headings:
+        groups.append(_make_teaching_unit_group(pending_headings, "end_heading"))
+
+    expected_ids = [id(block) for block in blocks]
+    assigned_ids = [id(block) for group in groups for block in group.blocks]
+    counts: dict[int, int] = {}
+    for block_id in assigned_ids:
+        counts[block_id] = counts.get(block_id, 0) + 1
+    missing = [block for block in blocks if counts.get(id(block), 0) == 0]
+    duplicated = [block for block in blocks if counts.get(id(block), 0) > 1]
+    unexpected = [block_id for block_id in counts if block_id not in set(expected_ids)]
+    if missing or duplicated or unexpected or len(assigned_ids) != len(expected_ids):
+        details = {
+            "missing": [(block.start_line, block.end_line, block.kind) for block in missing],
+            "duplicated": [(block.start_line, block.end_line, block.kind) for block in duplicated],
+            "unexpected_count": len(unexpected),
+        }
+        raise ValueError(f"Teaching-unit coverage validation failed: {details}")
+    return groups
 
 
 _LATEX_SEMANTIC_REPLACEMENTS: tuple[tuple[str, str], ...] = (
@@ -993,8 +1339,11 @@ class Extractor:
         api_key_env: str | None = None,
         temperature: float = 0.1,
         max_chunk_chars: int = 3200,
+        chunk_strategy: str = "budget",
         chunk_context_before_lines: int = 6,
         chunk_context_after_lines: int = 4,
+        experimental_chunk_spans: tuple[tuple[int, int], ...] = (),
+        experimental_skip_pure_example_chunks: bool = False,
         max_retries: int = 2,
         request_timeout: float = 180,
         max_tokens: int = 12000,
@@ -1017,8 +1366,15 @@ class Extractor:
         self.api_key_env = api_key_env
         self.temperature = temperature
         self.max_chunk_chars = max_chunk_chars
+        if chunk_strategy not in CHUNK_STRATEGIES:
+            raise ValueError(
+                f"Unsupported chunk strategy {chunk_strategy!r}; expected one of {CHUNK_STRATEGIES}"
+            )
+        self.chunk_strategy = chunk_strategy
         self.chunk_context_before_lines = chunk_context_before_lines
         self.chunk_context_after_lines = chunk_context_after_lines
+        self.experimental_chunk_spans = tuple(experimental_chunk_spans)
+        self.experimental_skip_pure_example_chunks = experimental_skip_pure_example_chunks
         self.max_retries = max_retries
         self.request_timeout = request_timeout
         self.max_tokens = max_tokens
@@ -1049,8 +1405,11 @@ class Extractor:
             "api_key_env": self.api_key_env,
             "temperature": self.temperature,
             "max_chunk_chars": self.max_chunk_chars,
+            "chunk_strategy": self.chunk_strategy,
             "chunk_context_before_lines": self.chunk_context_before_lines,
             "chunk_context_after_lines": self.chunk_context_after_lines,
+            "experimental_chunk_spans": self.experimental_chunk_spans,
+            "experimental_skip_pure_example_chunks": self.experimental_skip_pure_example_chunks,
             "max_retries": self.max_retries,
             "request_timeout": self.request_timeout,
             "max_tokens": self.max_tokens,
@@ -1135,7 +1494,7 @@ class Extractor:
         before_lines = int(state["chunk_context_before_lines"])
         after_lines = int(state["chunk_context_after_lines"])
 
-        def semantic_heading_level(title: str, markdown_level: int) -> int:
+        def semantic_heading_rank(title: str) -> int | None:
             stripped_title = title.strip()
             if re.match(r"^第[一二三四五六七八九十百0-9]+章\b", stripped_title):
                 return 1
@@ -1145,7 +1504,20 @@ class Extractor:
                 return 3
             if re.match(r"^[0-9]+[.、]", stripped_title):
                 return 4
-            return markdown_level
+            return None
+
+        recognized_heading_ranks = [
+            rank
+            for line in lines
+            if line.startswith("#")
+            for rank in [semantic_heading_rank(line.lstrip("#").strip())]
+            if rank is not None
+        ]
+        heading_rank_offset = min(recognized_heading_ranks, default=1) - 1
+
+        def semantic_heading_level(title: str, markdown_level: int) -> int:
+            rank = semantic_heading_rank(title)
+            return max(1, rank - heading_rank_offset) if rank is not None else markdown_level
 
         heading_path: list[str] = []
         line_items: list[tuple[int, str, list[str]]] = []
@@ -1167,20 +1539,39 @@ class Extractor:
         def is_image(line: str) -> bool:
             return bool(re.search(r"!\[.*?\]\((.*?)\)", line) or re.search(r"<img\s", line, flags=re.I))
 
+        def without_markdown_list_marker(text: str) -> str:
+            return re.sub(r"^\s*[-+*]\s+", "", text)
+
         def is_example(text: str) -> bool:
-            return bool(re.match(r"^\s*(例\s*\d+|例题\s*\d+)", text))
+            return bool(re.match(r"^\s*(例\s*\d+|例题\s*\d+)", without_markdown_list_marker(text)))
 
         def is_theorem(text: str) -> bool:
-            return bool(re.match(r"^\s*(定理\s*\d+|定理\b)", text))
+            return bool(re.match(r"^\s*(定理\s*\d+|定理\b)", without_markdown_list_marker(text)))
 
         def is_property(text: str) -> bool:
-            return bool(re.match(r"^\s*性质\s*\d*", text))
+            return bool(re.match(r"^\s*性质\s*\d*", without_markdown_list_marker(text)))
 
         def is_corollary(text: str) -> bool:
-            return bool(re.match(r"^\s*推论\s*\d*", text))
+            return bool(re.match(r"^\s*推论\s*\d*", without_markdown_list_marker(text)))
 
         def is_proof(text: str) -> bool:
-            return bool(re.match(r"^\s*(证|证明)\s*[:：]?", text))
+            return bool(re.match(r"^\s*(证|证明)\s*[:：]?", without_markdown_list_marker(text)))
+
+        def is_conclusion_transition(text: str) -> bool:
+            return bool(
+                re.search(
+                    r"(?:^|[，,。；;：:\s])(所以|从而|故|因此|由此可知|这就证明)",
+                    text,
+                )
+            )
+
+        def is_exposition_restart(text: str) -> bool:
+            return bool(
+                re.match(
+                    r"^\s*(注意|上述|下面|以下|现在|一般地|类似地|回到|我们(?:指出|给出|再来|现在))",
+                    text,
+                )
+            )
 
         def is_special(text: str) -> bool:
             return (
@@ -1248,6 +1639,7 @@ class Extractor:
             if kind_fn:
                 start = i
                 i += 1
+                saw_conclusion = is_conclusion_transition(stripped)
                 while i < len(line_items):
                     nxt = line_items[i][1].strip()
                     if nxt and (
@@ -1258,6 +1650,10 @@ class Extractor:
                         or (kind_fn in {"property", "corollary", "proof"} and is_property(nxt))
                     ):
                         break
+                    if kind_fn in {"example", "proof"} and saw_conclusion and is_exposition_restart(nxt):
+                        break
+                    if is_conclusion_transition(nxt):
+                        saw_conclusion = True
                     i += 1
                 blocks.append(block(line_items[start:i], kind_fn))
                 continue
@@ -1324,60 +1720,167 @@ class Extractor:
                     source_block.kind,
                 )
 
-        groups: list[tuple[list[DocumentBlock], str]] = []
-        current: list[DocumentBlock] = []
-        current_chars = 0
+        chunk_strategy = str(state.get("chunk_strategy", "budget"))
+        if chunk_strategy not in CHUNK_STRATEGIES:
+            raise ValueError(
+                f"Unsupported chunk strategy {chunk_strategy!r}; expected one of {CHUNK_STRATEGIES}"
+            )
+        experimental_spans = tuple(state.get("experimental_chunk_spans", ()))
+        skip_pure_examples = bool(state.get("experimental_skip_pure_example_chunks", False))
+        if experimental_spans and chunk_strategy == "teaching-units":
+            raise ValueError(
+                "experimental_chunk_spans cannot be combined with chunk_strategy='teaching-units'"
+            )
+        if skip_pure_examples and not experimental_spans:
+            raise ValueError(
+                "experimental_skip_pure_example_chunks requires experimental_chunk_spans"
+            )
+        grouped_units: list[TeachingUnitGroup] = []
+        if experimental_spans:
+            previous_end = 0
+            covered_block_ids: set[int] = set()
+            for start_line, end_line in experimental_spans:
+                if end_line > len(lines):
+                    raise ValueError(
+                        f"Experimental chunk span {start_line}-{end_line} exceeds document line count {len(lines)}"
+                    )
+                if start_line <= previous_end:
+                    raise ValueError("Experimental chunk spans must be strictly ordered and non-overlapping")
+                overlapping = [
+                    blk
+                    for blk in blocks
+                    if blk.start_line <= end_line and blk.end_line >= start_line
+                ]
+                crossing = [
+                    blk
+                    for blk in overlapping
+                    if blk.start_line < start_line or blk.end_line > end_line
+                ]
+                if crossing:
+                    blk = crossing[0]
+                    raise ValueError(
+                        f"Experimental chunk span {start_line}-{end_line} cuts through "
+                        f"{blk.kind} teaching block L{blk.start_line}-L{blk.end_line}"
+                    )
+                if not overlapping:
+                    raise ValueError(
+                        f"Experimental chunk span {start_line}-{end_line} contains no teaching block"
+                    )
+                if overlapping[0].start_line != start_line or overlapping[-1].end_line != end_line:
+                    raise ValueError(
+                        f"Experimental chunk span {start_line}-{end_line} must align with teaching-block boundaries"
+                    )
+                grouped_units.append(
+                    _make_teaching_unit_group(overlapping, "experimental_manual_span")
+                )
+                covered_block_ids.update(id(blk) for blk in overlapping)
+                previous_end = end_line
 
-        def flush(reason: str) -> None:
-            nonlocal current, current_chars
-            if current:
-                groups.append((current, reason))
-            current = []
+            uncovered_blocks = [blk for blk in blocks if id(blk) not in covered_block_ids]
+            if uncovered_blocks:
+                blk = uncovered_blocks[0]
+                raise ValueError(
+                    f"Experimental chunk spans omit {blk.kind} teaching block "
+                    f"L{blk.start_line}-L{blk.end_line}"
+                )
+            uncovered_text_lines = [
+                line_no
+                for line_no, text in enumerate(lines, start=1)
+                if text.strip()
+                and not any(start <= line_no <= end for start, end in experimental_spans)
+            ]
+            if uncovered_text_lines:
+                raise ValueError(
+                    f"Experimental chunk spans omit nonblank source line L{uncovered_text_lines[0]}"
+                )
+        elif chunk_strategy == "teaching-units":
+            grouped_units = _build_teaching_unit_groups(blocks, max_chars)
+        else:
+            groups: list[tuple[list[DocumentBlock], str]] = []
+            current: list[DocumentBlock] = []
             current_chars = 0
 
-        for blk in blocks:
-            current_has_content = any(x.kind != "heading" for x in current)
-            if blk.kind == "heading" and current and current_has_content:
-                flush("heading_boundary")
-            elif (
-                current
-                and current_chars + blk.char_count > max_chars
-                and not (
-                    blk.kind == "formula_exposition"
-                    and current_chars + blk.char_count <= int(max_chars * 1.2)
-                )
-            ):
-                flush("char_budget")
-            current.append(blk)
-            current_chars += blk.char_count
-        flush("end")
+            def flush(reason: str) -> None:
+                nonlocal current, current_chars
+                if current:
+                    groups.append((current, reason))
+                current = []
+                current_chars = 0
 
-        merged: list[tuple[list[DocumentBlock], str]] = []
-        min_tail_chars = max(600, max_chars // 5)
-        for group_blocks, reason in groups:
-            group_chars = sum(b.char_count for b in group_blocks)
-            if merged:
-                prev_blocks, prev_reason = merged[-1]
-                prev_chars = sum(b.char_count for b in prev_blocks)
-                if group_chars < min_tail_chars and prev_blocks[-1].heading_path == group_blocks[0].heading_path and group_blocks[0].kind != "heading" and prev_chars + group_chars <= int(max_chars * 1.35):
-                    merged[-1] = (prev_blocks + group_blocks, f"{prev_reason}+merged_small")
+            for blk in blocks:
+                current_has_content = any(x.kind != "heading" for x in current)
+                if blk.kind == "heading" and current and current_has_content:
+                    flush("heading_boundary")
+                elif (
+                    current
+                    and current_chars + blk.char_count > max_chars
+                    and not (
+                        blk.kind == "formula_exposition"
+                        and current_chars + blk.char_count <= int(max_chars * 1.2)
+                    )
+                ):
+                    flush("char_budget")
+                current.append(blk)
+                current_chars += blk.char_count
+            flush("end")
+
+            min_tail_chars = max(600, max_chars // 5)
+            merged_budget_groups: list[tuple[list[DocumentBlock], str]] = []
+            for group_blocks, reason in groups:
+                group_chars = sum(b.char_count for b in group_blocks)
+                if merged_budget_groups:
+                    prev_blocks, prev_reason = merged_budget_groups[-1]
+                    prev_chars = sum(b.char_count for b in prev_blocks)
+                    if group_chars < min_tail_chars and prev_blocks[-1].heading_path == group_blocks[0].heading_path and group_blocks[0].kind != "heading" and prev_chars + group_chars <= int(max_chars * 1.35):
+                        merged_budget_groups[-1] = (
+                            prev_blocks + group_blocks,
+                            f"{prev_reason}+merged_small",
+                        )
+                        continue
+                merged_budget_groups.append((group_blocks, reason))
+            grouped_units = [
+                _make_teaching_unit_group(group_blocks, reason)
+                for group_blocks, reason in merged_budget_groups
+            ]
+
+        skipped_experimental_groups: list[TeachingUnitGroup] = []
+        if skip_pure_examples:
+            retained_groups: list[TeachingUnitGroup] = []
+            for group in grouped_units:
+                if group.blocks and all(blk.kind == "example" for blk in group.blocks):
+                    skipped_group = _make_teaching_unit_group(
+                        group.blocks,
+                        "experimental_pure_example_skip",
+                        skipped=True,
+                    )
+                    skipped_experimental_groups.append(skipped_group)
                     continue
-            merged.append((group_blocks, reason))
+                retained_groups.append(group)
+            grouped_units = [*retained_groups, *skipped_experimental_groups]
+
+        processed_groups = [group for group in grouped_units if not group.skipped]
+        skipped_groups = [group for group in grouped_units if group.skipped]
+        skipped_line_numbers = {
+            line_no
+            for group in skipped_groups
+            for line_no in range(group.blocks[0].start_line, group.blocks[-1].end_line + 1)
+        }
 
         chunks: list[DocumentChunk] = []
-        for idx, (group_blocks, reason) in enumerate(merged, start=1):
+        for idx, group in enumerate(processed_groups, start=1):
+            group_blocks = group.blocks
             start_line = group_blocks[0].start_line
             end_line = group_blocks[-1].end_line
-            text = "\n".join(f"{n}: {t}" for blk in group_blocks for n, t in blk.lines)
+            text = "\n".join(f"{n}: {lines[n - 1]}" for n in range(start_line, end_line + 1))
             before = "\n".join(
                 f"{n}: {lines[n - 1]}"
                 for n in range(max(1, start_line - before_lines), start_line)
-                if 1 <= n <= len(lines)
+                if 1 <= n <= len(lines) and n not in skipped_line_numbers
             )
             after = "\n".join(
                 f"{n}: {lines[n - 1]}"
                 for n in range(end_line + 1, min(len(lines), end_line + after_lines) + 1)
-                if 1 <= n <= len(lines)
+                if 1 <= n <= len(lines) and n not in skipped_line_numbers
             )
             chunks.append(
                 DocumentChunk(
@@ -1391,11 +1894,61 @@ class Extractor:
                     block_count=len(group_blocks),
                     block_types=tuple(blk.kind for blk in group_blocks),
                     teaching_block_ids=tuple(blk.teaching_block_id for blk in group_blocks),
-                    break_reason=reason,
+                    teaching_blocks=tuple(
+                        {
+                            "teaching_block_id": blk.teaching_block_id,
+                            "discourse_role": blk.kind,
+                            "start_line": blk.start_line,
+                            "end_line": blk.end_line,
+                        }
+                        for blk in group_blocks
+                    ),
+                    break_reason=group.grouping_reason,
+                    teaching_unit_kind=group.unit_kind,
+                    anchor_block_ids=group.anchor_block_ids,
                 )
             )
 
         diagnostics = dict(state.get("diagnostics", {}))
+        diagnostics["chunk_strategy"] = (
+            "experimental_manual_spans" if experimental_spans else chunk_strategy
+        )
+        diagnostics["experimental_chunk_spans"] = [
+            {"start_line": start, "end_line": end}
+            for start, end in experimental_spans
+        ]
+        diagnostics["experimental_skip_pure_example_chunks"] = skip_pure_examples
+        diagnostics["experimental_skipped_chunks"] = [
+            {
+                "start_line": group.blocks[0].start_line,
+                "end_line": group.blocks[-1].end_line,
+                "block_types": [blk.kind for blk in group.blocks],
+                "teaching_block_ids": [blk.teaching_block_id for blk in group.blocks],
+            }
+            for group in skipped_experimental_groups
+        ]
+        diagnostics["skipped_teaching_units"] = [
+            {
+                "start_line": group.blocks[0].start_line,
+                "end_line": group.blocks[-1].end_line,
+                "unit_kind": group.unit_kind,
+                "grouping_reason": group.grouping_reason,
+                "block_types": [block.kind for block in group.blocks],
+                "teaching_block_ids": [block.teaching_block_id for block in group.blocks],
+                "anchor_block_ids": list(group.anchor_block_ids),
+            }
+            for group in skipped_groups
+            if group not in skipped_experimental_groups
+        ]
+        if chunk_strategy == "teaching-units" and not experimental_spans:
+            processed_block_count = sum(len(group.blocks) for group in processed_groups)
+            skipped_block_count = sum(len(group.blocks) for group in skipped_groups)
+            diagnostics["teaching_unit_coverage"] = {
+                "source_block_count": len(blocks),
+                "processed_block_count": processed_block_count,
+                "skipped_block_count": skipped_block_count,
+                "covered_exactly_once": processed_block_count + skipped_block_count == len(blocks),
+            }
         diagnostics["chunk_count"] = len(chunks)
         diagnostics["chunk_spans"] = [
             {
@@ -1406,7 +1959,10 @@ class Extractor:
                 "block_types": list(c.block_types),
                 "heading_path": c.heading_path,
                 "teaching_block_ids": list(c.teaching_block_ids),
+                "teaching_blocks": list(c.teaching_blocks),
                 "break_reason": c.break_reason,
+                "teaching_unit_kind": c.teaching_unit_kind,
+                "anchor_block_ids": list(c.anchor_block_ids),
             }
             for c in chunks
         ]
@@ -1436,7 +1992,17 @@ class Extractor:
             cached = self._read_chunk_cache(chunk.id, cache_fingerprint, state) if state.get("resume", True) else None
             cache_hit = cached is not None
             if cache_hit:
-                response = ChunkExtractionResponse.model_validate(cached)
+                response = self._validate_chunk_response(
+                    cached,
+                    chunk,
+                    state,
+                    client,
+                    processed_chunk_ids,
+                    chunk_summaries,
+                    len(node_store),
+                    len(relation_store),
+                    len(expression_store),
+                )
                 cache_hits += 1
                 self._log(f"Extractor chunk {idx}/{len(state['chunks'])} resume: {chunk.id} L{chunk.start_line}-L{chunk.end_line}")
             else:
@@ -1456,7 +2022,17 @@ class Extractor:
                     stop.set()
                     if thread is not None:
                         thread.join(timeout=0.1)
-                response = ChunkExtractionResponse.model_validate(payload)
+                response = self._validate_chunk_response(
+                    payload,
+                    chunk,
+                    state,
+                    client,
+                    processed_chunk_ids,
+                    chunk_summaries,
+                    len(node_store),
+                    len(relation_store),
+                    len(expression_store),
+                )
             working_node_store = {node_id: node.model_copy(deep=True) for node_id, node in node_store.items()}
             working_relation_store = {key: relation.model_copy(deep=True) for key, relation in relation_store.items()}
             working_expression_store = {key: expression.model_copy(deep=True) for key, expression in expression_store.items()}
@@ -1505,6 +2081,66 @@ class Extractor:
             },
         )
         return {**state, "result": result}
+
+    def _validate_chunk_response(
+        self,
+        payload: dict[str, Any],
+        chunk: DocumentChunk,
+        state: ExtractionState,
+        client: ProviderChatClient,
+        processed_chunk_ids: list[str],
+        chunk_summaries: list[dict[str, Any]],
+        node_count: int,
+        relation_count: int,
+        expression_count: int,
+    ) -> ChunkExtractionResponse:
+        try:
+            return ChunkExtractionResponse.model_validate(payload)
+        except ValidationError as exc:
+            request_record = next(
+                (
+                    record
+                    for record in reversed(client.request_history)
+                    if record.get("label") == chunk.id and record.get("status") == "success"
+                ),
+                None,
+            )
+            if request_record is not None:
+                request_record.update(
+                    {
+                        "status": "invalid_schema",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+            metadata = {
+                "schema_version": SCHEMA_VERSION,
+                "input_path": state.get("input_path"),
+                "output_path": state.get("output_path"),
+                "chunk_id": chunk.id,
+                "chunk_span": {"start_line": chunk.start_line, "end_line": chunk.end_line},
+                "processed_chunk_ids": list(processed_chunk_ids),
+                "chunk_summaries": list(chunk_summaries),
+                "partial_counts": {
+                    "nodes": node_count,
+                    "relations": relation_count,
+                    "math_expressions": expression_count,
+                },
+                "api_summary": self._api_summary(client.request_history),
+                "api_requests": client.request_history,
+            }
+            debug_path = _write_invalid_response(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                f"{chunk.id}_schema",
+                exc,
+                metadata,
+            )
+            if request_record is not None:
+                request_record["debug_path"] = str(debug_path)
+            raise ValueError(
+                f"Chunk response failed schema validation for {chunk.id}; "
+                f"raw JSON and API telemetry were saved to {debug_path}: {exc}"
+            ) from exc
 
     def _save_result(self, state: ExtractionState) -> ExtractionState:
         if state.get("save_output", True):
@@ -1675,6 +2311,7 @@ class Extractor:
                 "end_line": chunk.end_line,
                 "heading_path": chunk.heading_path,
                 "teaching_block_ids": list(chunk.teaching_block_ids),
+                "teaching_blocks": list(chunk.teaching_blocks),
                 "context_before_text": chunk.context_before_text,
                 "text": chunk.text,
                 "context_after_text": chunk.context_after_text,
@@ -2120,8 +2757,16 @@ class Extractor:
             "temperature_sent": state.get("temperature") if temperature_sent else None,
             "max_tokens": state.get("max_tokens"),
             "max_chunk_chars": state.get("max_chunk_chars"),
+            "chunk_strategy": state.get("chunk_strategy"),
             "chunk_context_before_lines": state.get("chunk_context_before_lines"),
             "chunk_context_after_lines": state.get("chunk_context_after_lines"),
+            "experimental_chunk_spans": [
+                {"start_line": start, "end_line": end}
+                for start, end in state.get("experimental_chunk_spans", ())
+            ],
+            "experimental_skip_pure_example_chunks": state.get(
+                "experimental_skip_pure_example_chunks", False
+            ),
             "max_retries": state.get("max_retries"),
             "request_timeout": state.get("request_timeout"),
             "request_delay": state.get("request_delay"),
@@ -2335,7 +2980,7 @@ class Extractor:
         return self.input_path.stem
 
     def _cache_dir(self) -> Path:
-        path = ROOT / "node_cache" / "semantic_layer_v1_3"
+        path = ROOT / "node_cache" / "semantic_layer_v1_5_9"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -2348,6 +2993,7 @@ class Extractor:
     ) -> str:
         payload = {
             "schema_version": SCHEMA_VERSION,
+            "chunk_strategy": state.get("chunk_strategy", "budget"),
             "system_prompt_sha256": hashlib.sha256(self.system_prompt.encode("utf-8")).hexdigest(),
             "output_contract": OUTPUT_CONTRACT,
             "chunk": {
@@ -2356,6 +3002,7 @@ class Extractor:
                 "end_line": chunk.end_line,
                 "heading_path": chunk.heading_path,
                 "teaching_block_ids": list(chunk.teaching_block_ids),
+                "teaching_blocks": list(chunk.teaching_blocks),
                 "context_before_text": chunk.context_before_text,
                 "text": chunk.text,
                 "context_after_text": chunk.context_after_text,
@@ -2402,7 +3049,7 @@ OUTPUT_CONTRACT = {
             "ref_id": "Local reference used by relations.",
             "action": "reuse or create",
             "existing_id": "Required only for reuse; must come from node_memory.",
-            "mention": "Exact current-chunk mention.",
+            "mention": "Required exact current-chunk wording for reuse; optional for create.",
             "type": "Required only for create; omit for reuse and never emit an empty string.",
             "name": "Required only for create.",
             "aliases": ["Optional aliases."],
@@ -2474,6 +3121,7 @@ def check_config(
                     else None
                 ),
                 "response_format_supported": adapter_class.supports_response_format,
+                "chunk_strategies": CHUNK_STRATEGIES,
                 "chunk_context_before_lines": 6,
                 "chunk_context_after_lines": 4,
                 "schema_version": SCHEMA_VERSION,
@@ -2500,8 +3148,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key-env", default=None, help="Name of an environment variable containing the provider API key.")
     parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--max-chunk-chars", type=int, default=3200)
+    parser.add_argument(
+        "--chunk-strategy",
+        default="budget",
+        choices=CHUNK_STRATEGIES,
+        help=(
+            "Chunk construction strategy. 'teaching-units' skips explicit example sequences "
+            "and groups headings, theorem lead-ins, theorem variants, and corollaries."
+        ),
+    )
     parser.add_argument("--chunk-context-before-lines", type=int, default=6)
     parser.add_argument("--chunk-context-after-lines", type=int, default=4)
+    parser.add_argument(
+        "--experimental-chunk-spans",
+        type=_parse_experimental_chunk_spans,
+        default=(),
+        help=(
+            "Strict experiment-only START-END spans separated by commas. "
+            "Every nonblank source line and teaching block must be covered exactly once."
+        ),
+    )
+    parser.add_argument(
+        "--experimental-skip-pure-example-chunks",
+        action="store_true",
+        help=(
+            "Experiment-only: audit but do not send chunks composed solely of example blocks. "
+            "Requires --experimental-chunk-spans."
+        ),
+    )
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--request-timeout", type=float, default=180)
     parser.add_argument("--max-tokens", type=int, default=12000)
@@ -2524,6 +3198,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
     args = build_arg_parser().parse_args()
     if args.check_config:
         raise SystemExit(
@@ -2545,8 +3223,11 @@ def main() -> None:
         api_key_env=args.api_key_env,
         temperature=args.temperature,
         max_chunk_chars=args.max_chunk_chars,
+        chunk_strategy=args.chunk_strategy,
         chunk_context_before_lines=args.chunk_context_before_lines,
         chunk_context_after_lines=args.chunk_context_after_lines,
+        experimental_chunk_spans=args.experimental_chunk_spans,
+        experimental_skip_pure_example_chunks=args.experimental_skip_pure_example_chunks,
         max_retries=args.max_retries,
         request_timeout=args.request_timeout,
         max_tokens=args.max_tokens,

@@ -1,0 +1,361 @@
+{
+  "schema_version": "maf-kg.semantic-gold.v1",
+  "scope": "First-layer semantic nodes in the first three textbook sections",
+  "requirements": {
+    "M": "Required node. A missing match is a false negative.",
+    "O": "Optional node. A match is accepted; absence is not a false negative.",
+    "X": "Forbidden standalone node. A prediction is a false positive.",
+    "Merge": "Represented as one required aggregate node plus forbidden standalone fragments."
+  },
+  "graphs": [
+    {
+      "source_file": "第一章第一节_映射与函数.md",
+      "annotation_status": "reviewed",
+      "relation_annotation_status": "pending",
+      "node_groups": [
+        {
+          "requirement": "M",
+          "type": "Concept",
+          "items": [
+            {"gold_id": "s1_concept_mapping", "name": "映射"},
+            {"gold_id": "s1_concept_domain", "name": "定义域"},
+            {"gold_id": "s1_concept_range", "name": "值域"},
+            {"gold_id": "s1_concept_image", "name": "像"},
+            {"gold_id": "s1_concept_preimage", "name": "原像"},
+            {"gold_id": "s1_concept_injection", "name": "单射"},
+            {"gold_id": "s1_concept_surjection", "name": "满射", "accepted_names": ["到上的映射"]},
+            {"gold_id": "s1_concept_bijection", "name": "一一映射", "accepted_names": ["双射", "一一对应"]},
+            {"gold_id": "s1_concept_inverse_mapping", "name": "逆映射"},
+            {"gold_id": "s1_concept_mapping_composition", "name": "复合映射", "accepted_names": ["映射的复合"]},
+            {"gold_id": "s1_concept_function", "name": "函数"},
+            {"gold_id": "s1_concept_function_graph", "name": "函数图形", "accepted_names": ["函数的图形"]},
+            {"gold_id": "s1_concept_natural_domain", "name": "自然定义域", "accepted_names": ["函数的自然定义域"]},
+            {"gold_id": "s1_concept_function_boundedness", "name": "函数有界性", "accepted_names": ["函数的有界性", "有界函数"]},
+            {"gold_id": "s1_concept_monotonic_function", "name": "单调函数"},
+            {"gold_id": "s1_concept_odd_function", "name": "奇函数"},
+            {"gold_id": "s1_concept_even_function", "name": "偶函数"},
+            {"gold_id": "s1_concept_periodic_function", "name": "周期函数"},
+            {"gold_id": "s1_concept_inverse_function", "name": "反函数"},
+            {"gold_id": "s1_concept_composite_function", "name": "复合函数"},
+            {"gold_id": "s1_concept_function_arithmetic", "name": "函数的四则运算", "accepted_names": ["函数四则运算", "函数的运算", "函数运算"]},
+            {"gold_id": "s1_concept_basic_elementary_function", "name": "基本初等函数"},
+            {"gold_id": "s1_concept_elementary_function", "name": "初等函数"},
+            {"gold_id": "s1_concept_power_function", "name": "幂函数"},
+            {"gold_id": "s1_concept_exponential_function", "name": "指数函数"},
+            {"gold_id": "s1_concept_logarithmic_function", "name": "对数函数"},
+            {"gold_id": "s1_concept_trigonometric_function", "name": "三角函数"},
+            {"gold_id": "s1_concept_inverse_trigonometric_function", "name": "反三角函数"},
+            {"gold_id": "s1_concept_hyperbolic_function", "name": "双曲函数"},
+            {"gold_id": "s1_concept_hyperbolic_sine", "name": "双曲正弦"},
+            {"gold_id": "s1_concept_hyperbolic_cosine", "name": "双曲余弦"},
+            {"gold_id": "s1_concept_hyperbolic_tangent", "name": "双曲正切"},
+            {"gold_id": "s1_concept_inverse_hyperbolic_sine", "name": "反双曲正弦"},
+            {"gold_id": "s1_concept_inverse_hyperbolic_cosine", "name": "反双曲余弦"},
+            {"gold_id": "s1_concept_inverse_hyperbolic_tangent", "name": "反双曲正切"}
+          ]
+        },
+        {
+          "requirement": "M",
+          "type": "Claim",
+          "claim_kind": "criterion",
+          "items": [
+            {"gold_id": "s1_criterion_function_equality", "name": "函数相等判定准则", "accepted_names": ["函数相等的判定准则"]},
+            {"gold_id": "s1_criterion_inverse_mapping_existence", "name": "逆映射存在条件"},
+            {"gold_id": "s1_criterion_mapping_composition_existence", "name": "复合映射构成条件", "accepted_names": ["复合映射存在条件"]},
+            {"gold_id": "s1_criterion_function_boundedness", "name": "函数有界的充要条件", "accepted_names": ["函数有界的充分必要条件"]}
+          ]
+        },
+        {
+          "requirement": "M",
+          "type": "Claim",
+          "claim_kind": "identity",
+          "items": [
+            {"gold_id": "s1_identity_sign_absolute", "name": "符号函数与绝对值恒等式", "accepted_names": ["符号函数与绝对值的恒等关系"]},
+            {"gold_id": "s1_identity_sinh_sum", "name": "双曲正弦和公式"},
+            {"gold_id": "s1_identity_sinh_difference", "name": "双曲正弦差公式"},
+            {"gold_id": "s1_identity_cosh_sum", "name": "双曲余弦和公式"},
+            {"gold_id": "s1_identity_cosh_difference", "name": "双曲余弦差公式"},
+            {"gold_id": "s1_identity_cosh2_minus_sinh2", "name": "双曲函数基本恒等式", "accepted_names": ["双曲函数恒等式一", "双曲平方差恒等式"]},
+            {"gold_id": "s1_identity_sinh_double_angle", "name": "双曲正弦倍角公式"},
+            {"gold_id": "s1_identity_cosh_double_angle", "name": "双曲余弦倍角公式"}
+          ]
+        },
+        {
+          "requirement": "M",
+          "type": "Claim",
+          "claim_kind": "property",
+          "items": [
+            {"gold_id": "s1_property_mapping_composition_noncommutative", "name": "复合映射非交换性", "accepted_names": ["映射复合的非交换性"]},
+            {"gold_id": "s1_property_odd_graph_symmetry", "name": "奇函数图形关于原点对称", "accepted_names": ["奇函数的图形关于原点对称"]},
+            {"gold_id": "s1_property_even_graph_symmetry", "name": "偶函数图形关于y轴对称", "accepted_names": ["偶函数的图形关于y轴对称", "偶函数的图形关于 y 轴对称"]},
+            {"gold_id": "s1_property_parity_decomposition", "name": "函数奇偶分解结论", "accepted_names": ["函数可分解为奇偶函数之和"]},
+            {"gold_id": "s1_property_no_minimal_positive_period", "name": "并非每个周期函数都有最小正周期"},
+            {"gold_id": "s1_property_inverse_monotonicity", "name": "单调函数的反函数存在且保持单调", "accepted_names": ["单调函数的反函数的单调性"]},
+            {"gold_id": "s1_property_inverse_graph_symmetry", "name": "直接函数与反函数图形关于y=x对称", "accepted_names": ["反函数图形对称性"]},
+            {"gold_id": "s1_property_sinh_odd", "name": "双曲正弦是奇函数"},
+            {"gold_id": "s1_property_sinh_increasing", "name": "双曲正弦单调增加"},
+            {"gold_id": "s1_property_cosh_even", "name": "双曲余弦是偶函数"},
+            {"gold_id": "s1_property_cosh_monotonicity", "name": "双曲余弦单调性"},
+            {"gold_id": "s1_property_cosh_minimum", "name": "双曲余弦最小值"},
+            {"gold_id": "s1_property_tanh_odd", "name": "双曲正切是奇函数"},
+            {"gold_id": "s1_property_tanh_increasing", "name": "双曲正切单调增加"},
+            {"gold_id": "s1_property_tanh_bounded", "name": "双曲正切有界"},
+            {"gold_id": "s1_property_asinh_odd", "name": "反双曲正弦是奇函数"},
+            {"gold_id": "s1_property_asinh_increasing", "name": "反双曲正弦单调增加"},
+            {"gold_id": "s1_property_acosh_increasing", "name": "反双曲余弦单调增加"},
+            {"gold_id": "s1_property_atanh_odd", "name": "反双曲正切是奇函数"},
+            {"gold_id": "s1_property_atanh_increasing", "name": "反双曲正切单调增加"}
+          ]
+        },
+        {
+          "requirement": "O",
+          "type": "Concept",
+          "items": [
+            {"gold_id": "s1_optional_transformation", "name": "变换"},
+            {"gold_id": "s1_optional_functional", "name": "泛函"},
+            {"gold_id": "s1_optional_upper_bound", "name": "上界"},
+            {"gold_id": "s1_optional_lower_bound", "name": "下界"},
+            {"gold_id": "s1_optional_period", "name": "周期"},
+            {"gold_id": "s1_optional_minimal_positive_period", "name": "最小正周期"},
+            {"gold_id": "s1_optional_absolute_value_function", "name": "绝对值函数"},
+            {"gold_id": "s1_optional_sign_function", "name": "符号函数"},
+            {"gold_id": "s1_optional_floor_function", "name": "取整函数", "accepted_names": ["整数部分函数"]},
+            {"gold_id": "s1_optional_piecewise_function", "name": "分段函数"}
+          ]
+        },
+        {
+          "requirement": "O",
+          "type": "Claim",
+          "claim_kind": "property",
+          "items": [
+            {"gold_id": "s1_optional_sinh_asymptotic", "name": "双曲正弦渐近行为"},
+            {"gold_id": "s1_optional_cosh_asymptotic", "name": "双曲余弦渐近行为"},
+            {"gold_id": "s1_optional_tanh_asymptotic", "name": "双曲正切渐近行为"}
+          ]
+        },
+        {
+          "requirement": "X",
+          "type": "Concept",
+          "items": [
+            {"gold_id": "s1_forbidden_monotone_increasing", "name": "单调增加"},
+            {"gold_id": "s1_forbidden_monotone_decreasing", "name": "单调减少"},
+            {"gold_id": "s1_forbidden_bounded_function_fragment", "name": "函数有界"},
+            {"gold_id": "s1_forbidden_unbounded_function_fragment", "name": "无界函数"},
+            {"gold_id": "s1_forbidden_function_sum", "name": "函数和"},
+            {"gold_id": "s1_forbidden_function_difference", "name": "函数差"},
+            {"gold_id": "s1_forbidden_function_product", "name": "函数积"},
+            {"gold_id": "s1_forbidden_function_quotient", "name": "函数商"}
+          ]
+        },
+        {
+          "requirement": "X",
+          "type": "Claim",
+          "claim_kind": "criterion",
+          "items": [
+            {"gold_id": "s1_forbidden_explanatory_equivalence", "name": "解释性等价式"}
+          ]
+        }
+      ]
+    },
+    {
+      "source_file": "第一章第二节.md",
+      "annotation_status": "reviewed",
+      "relation_annotation_status": "pending",
+      "node_groups": [
+        {
+          "requirement": "M",
+          "type": "Concept",
+          "items": [
+            {"gold_id": "s2_concept_sequence", "name": "数列"},
+            {"gold_id": "s2_concept_sequence_limit", "name": "数列的极限", "accepted_names": ["数列极限"]},
+            {"gold_id": "s2_concept_sequence_boundedness", "name": "数列有界性", "accepted_names": ["数列的有界性", "有界数列"]},
+            {"gold_id": "s2_concept_subsequence", "name": "子数列", "accepted_names": ["子列"]}
+          ]
+        },
+        {
+          "requirement": "M",
+          "type": "Method",
+          "items": [
+            {"gold_id": "s2_method_epsilon_n", "name": "ε-N论证法", "accepted_names": ["ε-N定义证明法", "数列极限定义证明法", "放缩法证明数列极限"]}
+          ]
+        },
+        {
+          "requirement": "M",
+          "type": "Claim",
+          "claim_kind": "property",
+          "items": [
+            {"gold_id": "s2_property_limit_uniqueness", "name": "收敛数列极限唯一", "accepted_names": ["收敛数列极限的唯一性", "极限的唯一性"]},
+            {"gold_id": "s2_property_convergent_sequence_bounded", "name": "收敛数列必有界", "accepted_names": ["收敛数列的有界性"]},
+            {"gold_id": "s2_property_sign_preservation", "name": "收敛数列保号性", "accepted_names": ["收敛数列的保号性"]},
+            {"gold_id": "s2_property_limit_sign_corollary", "name": "项最终非负或非正时极限保号的推论", "accepted_names": ["极限的保号性（项非负则极限非负）", "极限的保号性"]},
+            {"gold_id": "s2_property_subsequence_limit", "name": "收敛数列的任一子数列收敛于同一极限", "accepted_names": ["收敛数列子列收敛定理", "收敛数列与其子数列间的关系"]}
+          ]
+        },
+        {
+          "requirement": "M",
+          "type": "Claim",
+          "claim_kind": "criterion",
+          "items": [
+            {"gold_id": "s2_criterion_boundedness_necessary_not_sufficient", "name": "数列有界是收敛的必要非充分条件", "accepted_names": ["有界是收敛的必要不充分条件"]},
+            {"gold_id": "s2_criterion_distinct_subsequence_limits", "name": "两个子数列收敛到不同极限则原数列发散", "accepted_names": ["发散判别法：子数列极限不同", "子数列极限不同的发散判别法"]}
+          ]
+        },
+        {
+          "requirement": "O",
+          "type": "Concept",
+          "items": [
+            {"gold_id": "s2_optional_epsilon_neighborhood", "name": "ε邻域", "accepted_names": ["ε 邻域"]},
+            {"gold_id": "s2_optional_universal_quantifier", "name": "全称量词"},
+            {"gold_id": "s2_optional_existential_quantifier", "name": "存在量词"},
+            {"gold_id": "s2_optional_sequence_term", "name": "数列的项", "accepted_names": ["数列项", "一般项", "通项"]}
+          ]
+        },
+        {
+          "requirement": "X",
+          "type": "Concept",
+          "items": [
+            {"gold_id": "s2_forbidden_sequence_convergence", "name": "数列收敛", "accepted_names": ["收敛数列"]},
+            {"gold_id": "s2_forbidden_sequence_divergence", "name": "数列发散", "accepted_names": ["发散数列"]},
+            {"gold_id": "s2_forbidden_unbounded_sequence", "name": "无界数列"}
+          ]
+        },
+        {
+          "requirement": "X",
+          "type": "Claim",
+          "claim_kind": "criterion",
+          "items": [
+            {"gold_id": "s2_forbidden_absolute_difference_measure", "name": "两个数的接近程度可用差的绝对值度量"},
+            {"gold_id": "s2_forbidden_absolute_inequality_equivalence", "name": "绝对值不等式等价性"}
+          ]
+        },
+        {
+          "requirement": "X",
+          "type": "Claim",
+          "claim_kind": "property",
+          "items": [
+            {"gold_id": "s2_forbidden_geometric_interpretation", "name": "数列极限的几何解释"}
+          ]
+        },
+        {
+          "requirement": "X",
+          "type": "Claim",
+          "claim_kind": "result",
+          "items": [
+            {"gold_id": "s2_forbidden_example_geometric_limit", "name": "等比数列极限为0", "accepted_names": ["|q|<1时等比数列极限为0"]}
+          ]
+        }
+      ]
+    },
+    {
+      "source_file": "第一章第三节.md",
+      "annotation_status": "reviewed_pre_extraction",
+      "surface_name_alignment_status": "reviewed_after_r1_without_boundary_changes",
+      "relation_annotation_status": "pending",
+      "node_groups": [
+        {
+          "requirement": "M",
+          "type": "Concept",
+          "items": [
+            {"gold_id": "s3_concept_function_limit", "name": "函数的极限", "accepted_names": ["函数极限"]},
+            {"gold_id": "s3_concept_finite_point_function_limit", "name": "自变量趋于有限值时的函数极限", "accepted_names": ["函数在有限点的极限", "函数在一点处的极限", "x趋于x0时的函数极限"]},
+            {"gold_id": "s3_concept_infinite_function_limit", "name": "自变量趋于无穷大时的函数极限", "accepted_names": ["自变量趋于无穷大时函数的极限", "函数在无穷远处的极限", "函数当 x→∞ 时的极限", "当x→∞时函数的极限", "x趋于无穷大时的函数极限"]},
+            {"gold_id": "s3_concept_punctured_neighborhood", "name": "去心邻域", "accepted_names": ["去心δ邻域", "空心邻域"]},
+            {"gold_id": "s3_concept_one_sided_limit", "name": "单侧极限"},
+            {"gold_id": "s3_concept_horizontal_asymptote", "name": "水平渐近线"}
+          ]
+        },
+        {
+          "requirement": "M",
+          "type": "Method",
+          "items": [
+            {"gold_id": "s3_method_epsilon_delta", "name": "ε-δ论证法", "accepted_names": ["ε-δ定义证明法", "函数有限点极限的定义证明法"]},
+            {"gold_id": "s3_method_epsilon_x", "name": "ε-X论证法", "accepted_names": ["ε-X定义证明法", "函数无穷远极限的定义证明法"]}
+          ]
+        },
+        {
+          "requirement": "M",
+          "type": "Claim",
+          "claim_kind": "property",
+          "items": [
+            {"gold_id": "s3_property_limit_independent_of_point_value", "name": "函数极限与趋近点处的函数值无关", "accepted_names": ["函数极限与函数值无关", "函数极限与函数定义点无关", "函数在趋近点是否有定义不影响极限"]},
+            {"gold_id": "s3_property_function_limit_uniqueness", "name": "函数极限的唯一性", "accepted_names": ["函数极限唯一"]},
+            {"gold_id": "s3_property_local_boundedness", "name": "函数极限的局部有界性"},
+            {"gold_id": "s3_property_local_sign_preservation", "name": "函数极限的局部保号性"},
+            {"gold_id": "s3_property_nonzero_limit_lower_bound", "name": "非零函数极限的局部绝对值下界", "accepted_names": ["函数极限局部保号性的加强结论", "函数极限的局部保号性（强形式）", "函数极限的局部保号性（绝对值形式）", "函数极限的局部保号性（加强形式）", "非零极限的局部下界"]},
+            {"gold_id": "s3_property_limit_sign_corollary", "name": "函数在去心邻域内保号时极限保号", "accepted_names": ["函数极限保号性的推论", "函数极限的保号性推论", "函数极限的局部保号性推论", "局部非负或非正时极限同号"]}
+          ]
+        },
+        {
+          "requirement": "M",
+          "type": "Claim",
+          "claim_kind": "criterion",
+          "items": [
+            {"gold_id": "s3_criterion_two_sided_limit", "name": "函数极限存在的单侧极限判据", "accepted_names": ["函数极限存在的充分必要条件", "函数极限存在的充要条件（左、右极限存在且相等）", "函数在一点处极限存在的充要条件", "极限存在的充要条件", "左右极限存在且相等的判据"]}
+          ]
+        },
+        {
+          "requirement": "M",
+          "type": "Claim",
+          "claim_kind": "result",
+          "items": [
+            {"gold_id": "s3_result_function_sequence_limit_relation", "name": "函数极限与数列极限的关系", "accepted_names": ["函数极限的数列刻画", "函数极限的归结原则"]}
+          ]
+        },
+        {
+          "requirement": "O",
+          "type": "Concept",
+          "items": [
+            {"gold_id": "s3_optional_function", "name": "函数"},
+            {"gold_id": "s3_optional_sequence", "name": "数列"},
+            {"gold_id": "s3_optional_sequence_limit", "name": "数列的极限", "accepted_names": ["数列极限"]},
+            {"gold_id": "s3_optional_neighborhood", "name": "邻域", "accepted_names": ["δ邻域"]},
+            {"gold_id": "s3_optional_universal_quantifier", "name": "全称量词"},
+            {"gold_id": "s3_optional_existential_quantifier", "name": "存在量词"},
+            {"gold_id": "s3_optional_function_graph", "name": "函数图形", "accepted_names": ["函数的图形"]}
+          ]
+        },
+        {
+          "requirement": "X",
+          "type": "Concept",
+          "items": [
+            {"gold_id": "s3_forbidden_left_limit", "name": "左极限"},
+            {"gold_id": "s3_forbidden_right_limit", "name": "右极限"},
+            {"gold_id": "s3_forbidden_positive_infinity_limit", "name": "自变量趋于正无穷时的函数极限", "accepted_names": ["自变量趋于正无穷大时函数的极限", "函数当 x→+∞ 时的极限", "当x→+∞时函数的极限", "x趋于正无穷时的函数极限"]},
+            {"gold_id": "s3_forbidden_negative_infinity_limit", "name": "自变量趋于负无穷时的函数极限", "accepted_names": ["自变量趋于负无穷大时函数的极限", "函数当 x→-∞ 时的极限", "当x→-∞时函数的极限", "x趋于负无穷时的函数极限"]}
+          ]
+        },
+        {
+          "requirement": "X",
+          "type": "Claim",
+          "claim_kind": "criterion",
+          "items": [
+            {"gold_id": "s3_forbidden_definition_as_criterion", "name": "函数极限的ε-δ判定准则", "accepted_names": ["函数极限定义的等价表述"]}
+          ]
+        },
+        {
+          "requirement": "X",
+          "type": "Claim",
+          "claim_kind": "property",
+          "items": [
+            {"gold_id": "s3_forbidden_finite_limit_geometry", "name": "有限点函数极限的几何解释"},
+            {"gold_id": "s3_forbidden_infinite_limit_geometry", "name": "无穷远函数极限的几何解释"}
+          ]
+        },
+        {
+          "requirement": "X",
+          "type": "Claim",
+          "claim_kind": "result",
+          "items": [
+            {"gold_id": "s3_forbidden_example_constant_limit", "name": "常数函数的极限等于常数"},
+            {"gold_id": "s3_forbidden_example_identity_limit", "name": "恒等函数在x0处的极限为x0"},
+            {"gold_id": "s3_forbidden_example_linear_limit", "name": "2x-1在x趋于1时的极限为1"},
+            {"gold_id": "s3_forbidden_example_rational_limit", "name": "可约分式在x趋于1时的极限为2"},
+            {"gold_id": "s3_forbidden_example_square_root_limit", "name": "平方根函数在正点处的极限"},
+            {"gold_id": "s3_forbidden_example_piecewise_limit", "name": "例6分段函数在0处极限不存在"},
+            {"gold_id": "s3_forbidden_example_reciprocal_limit", "name": "1/x在无穷远处的极限为0"}
+          ]
+        }
+      ]
+    }
+  ]
+}

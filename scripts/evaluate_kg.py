@@ -32,12 +32,35 @@ SEMANTIC_RELATION_TYPES = {
     "illustrated_by",
 }
 
+SEMANTIC_NODE_TYPES = {"Concept", "Claim", "Method"}
+SEMANTIC_CLAIM_KINDS = {"property", "criterion", "identity", "result"}
+SEMANTIC_RELATION_SIGNATURES: dict[str, set[tuple[str, str]]] = {
+    "involves": {("Claim", "Concept")},
+    "uses": {("Method", "Concept"), ("Method", "Claim"), ("Method", "Method")},
+    "establishes": {("Method", "Claim")},
+    "derived_from": {("Claim", "Claim")},
+    "equivalent_to": {("Claim", "Claim")},
+    "special_case_of": {("Concept", "Concept")},
+    "defined_in_terms_of": {("Concept", "Concept")},
+}
+SEMANTIC_EXPRESSION_ROLES = {
+    "definition_representation": "Concept",
+    "claim_representation": "Claim",
+    "method_template": "Method",
+}
+
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     args = parse_args()
     path = resolve_input(args.input, args.kg_dir)
     data = load_json(path)
     report = evaluate(data, path)
+    if args.gold:
+        gold_path = Path(args.gold)
+        gold_data = load_json(gold_path)
+        report["gold_evaluation"] = evaluate_nodes_against_gold(data, gold_data, gold_path)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
@@ -48,14 +71,18 @@ def main() -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate a MaF-KG agent v3 JSON output.")
+    parser = argparse.ArgumentParser(description="Evaluate a MaF-KG legacy or semantic KG JSON output.")
     parser.add_argument(
         "input",
         nargs="?",
-        help="KG JSON file. If omitted, the latest *_concept_formula_kg_agent_v3.json under --kg-dir is used.",
+        help="KG JSON file. If omitted, the latest supported JSON file under --kg-dir is used.",
     )
     parser.add_argument("--kg-dir", default="KG", help="Directory used when input is omitted.")
     parser.add_argument("--json", action="store_true", help="Print full machine-readable JSON report.")
+    parser.add_argument(
+        "--gold",
+        help="Optional reviewed semantic Gold JSON used to calculate node precision, recall, and F1.",
+    )
     parser.add_argument("--samples", type=int, default=12, help="Number of sample issues to print per category.")
     parser.add_argument(
         "--fail-on-severe",
@@ -71,13 +98,18 @@ def resolve_input(input_arg: str | None, kg_dir: str) -> Path:
         if not path.exists():
             raise SystemExit(f"Input file not found: {path}")
         return path
+    root = Path(kg_dir)
     candidates = sorted(
-        Path(kg_dir).glob("*_concept_formula_kg_agent_v3.json"),
+        {
+            *root.glob("*_concept_formula_kg_agent_v3.json"),
+            *root.glob("*_语义图_*.json"),
+            *root.glob("*_semantic_*.json"),
+        },
         key=lambda item: item.stat().st_mtime,
         reverse=True,
     )
     if not candidates:
-        raise SystemExit(f"No *_concept_formula_kg_agent_v3.json files found under {kg_dir}")
+        raise SystemExit(f"No supported KG JSON files found under {kg_dir}")
     return candidates[0]
 
 
@@ -91,6 +123,9 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def evaluate(data: dict[str, Any], path: Path) -> dict[str, Any]:
+    if str(data.get("schema_version", "")).startswith("maf-kg.semantic."):
+        return evaluate_semantic_graph(data, path)
+
     nodes = data.get("nodes", [])
     relationships = data.get("relationships", [])
     node_by_id = {node.get("id"): node for node in nodes if node.get("id")}
@@ -250,6 +285,462 @@ def evaluate(data: dict[str, Any], path: Path) -> dict[str, Any]:
             "is_structurally_clean": severe_issue_count == 0,
         },
     }
+
+
+def evaluate_semantic_graph(data: dict[str, Any], path: Path) -> dict[str, Any]:
+    nodes = data.get("nodes", []) if isinstance(data.get("nodes"), list) else []
+    relations = data.get("relations", []) if isinstance(data.get("relations"), list) else []
+    expressions = data.get("math_expressions", []) if isinstance(data.get("math_expressions"), list) else []
+    node_by_id = {node.get("id"): node for node in nodes if node.get("id")}
+    node_type_by_id = {node_id: node.get("type") for node_id, node in node_by_id.items()}
+
+    invalid_node_types = [node for node in nodes if node.get("type") not in SEMANTIC_NODE_TYPES]
+    missing_descriptions = [node for node in nodes if not str(node.get("description", "")).strip()]
+    claim_kind_errors = [
+        node
+        for node in nodes
+        if node.get("type") == "Claim" and node.get("claim_kind") not in SEMANTIC_CLAIM_KINDS
+    ]
+    unexpected_claim_kinds = [
+        node
+        for node in nodes
+        if node.get("type") != "Claim" and node.get("claim_kind") is not None
+    ]
+    duplicate_node_ids = duplicate_values([node.get("id") for node in nodes if node.get("id")])
+    duplicate_expression_ids = duplicate_values(
+        [expression.get("id") for expression in expressions if expression.get("id")]
+    )
+    canonical_counts = Counter(
+        (node.get("type"), canonical_node_name(str(node.get("name", ""))))
+        for node in nodes
+        if str(node.get("name", "")).strip()
+    )
+    duplicate_canonical_nodes = [
+        {"type": node_type, "name_key": name_key, "count": count}
+        for (node_type, name_key), count in sorted(canonical_counts.items())
+        if count > 1
+    ]
+
+    invalid_refs = [
+        relation
+        for relation in relations
+        if relation.get("source_id") not in node_by_id or relation.get("target_id") not in node_by_id
+    ]
+    self_loops = [
+        relation for relation in relations if relation.get("source_id") == relation.get("target_id")
+    ]
+    invalid_relation_types = [
+        relation for relation in relations if relation.get("type") not in SEMANTIC_RELATION_SIGNATURES
+    ]
+    invalid_relation_signatures = []
+    for relation in relations:
+        relation_type = relation.get("type")
+        source_type = node_type_by_id.get(relation.get("source_id"))
+        target_type = node_type_by_id.get(relation.get("target_id"))
+        if relation_type not in SEMANTIC_RELATION_SIGNATURES or source_type is None or target_type is None:
+            continue
+        if (source_type, target_type) not in SEMANTIC_RELATION_SIGNATURES[relation_type]:
+            invalid_relation_signatures.append(relation)
+    edge_counts = Counter(
+        (relation.get("source_id"), relation.get("type"), relation.get("target_id"))
+        for relation in relations
+    )
+    duplicate_edges = [
+        {"source_id": source, "type": relation_type, "target_id": target, "count": count}
+        for (source, relation_type, target), count in sorted(edge_counts.items())
+        if count > 1
+    ]
+
+    expression_owner_errors = [
+        expression for expression in expressions if expression.get("owner_id") not in node_by_id
+    ]
+    expression_role_errors = []
+    for expression in expressions:
+        expected_type = SEMANTIC_EXPRESSION_ROLES.get(expression.get("role"))
+        owner_type = node_type_by_id.get(expression.get("owner_id"))
+        if expected_type is None or (owner_type is not None and owner_type != expected_type):
+            expression_role_errors.append(expression)
+    expression_without_latex = [
+        expression for expression in expressions if not str(expression.get("latex", "")).strip()
+    ]
+
+    evidence_errors: list[dict[str, Any]] = []
+    missing_evidence: list[dict[str, Any]] = []
+    for kind, records in (("node", nodes), ("relation", relations), ("expression", expressions)):
+        for record in records:
+            owner_id = record.get("id") or semantic_record_label(kind, record)
+            evidence = record.get("evidence")
+            if not isinstance(evidence, list) or not evidence:
+                missing_evidence.append({"kind": kind, "record": owner_id})
+                continue
+            for index, item in enumerate(evidence):
+                error = validate_semantic_evidence(item)
+                if error:
+                    evidence_errors.append(
+                        {"kind": kind, "record": owner_id, "evidence_index": index, "error": error}
+                    )
+
+    ids_with_edges = {
+        endpoint
+        for relation in relations
+        for endpoint in (relation.get("source_id"), relation.get("target_id"))
+        if endpoint in node_by_id
+    }
+    isolated_nodes = [node for node in nodes if node.get("id") not in ids_with_edges]
+    wide_evidence_nodes = []
+    for node in nodes:
+        spans = [
+            item.get("end_line") - item.get("start_line") + 1
+            for item in node.get("evidence", [])
+            if isinstance(item, dict)
+            and isinstance(item.get("start_line"), int)
+            and isinstance(item.get("end_line"), int)
+        ]
+        if spans and max(spans) > 20:
+            wide_evidence_nodes.append({"id": node.get("id"), "name": node.get("name"), "max_span": max(spans)})
+
+    component_sizes = semantic_component_sizes(node_by_id, relations)
+    issues = {
+        "invalid_node_type": issue_block(invalid_node_types, node_label, nodes),
+        "missing_description_node": issue_block(missing_descriptions, node_label, nodes),
+        "invalid_claim_kind": issue_block(claim_kind_errors, node_label, nodes),
+        "unexpected_claim_kind": issue_block(unexpected_claim_kinds, node_label, nodes),
+        "duplicate_node_id": value_issue_block(duplicate_node_ids, "id"),
+        "duplicate_canonical_node": direct_issue_block(duplicate_canonical_nodes),
+        "invalid_relation_ref": issue_block(invalid_refs, semantic_relation_label, relations),
+        "self_loop": issue_block(self_loops, semantic_relation_label, relations),
+        "invalid_relation_type": issue_block(invalid_relation_types, semantic_relation_label, relations),
+        "invalid_relation_signature": issue_block(
+            invalid_relation_signatures, semantic_relation_label, relations
+        ),
+        "duplicate_edge": direct_issue_block(duplicate_edges),
+        "invalid_expression_owner": issue_block(
+            expression_owner_errors, semantic_expression_label, expressions
+        ),
+        "invalid_expression_role": issue_block(
+            expression_role_errors, semantic_expression_label, expressions
+        ),
+        "expression_without_latex": issue_block(
+            expression_without_latex, semantic_expression_label, expressions
+        ),
+        "missing_evidence": direct_issue_block(missing_evidence),
+        "invalid_evidence": direct_issue_block(evidence_errors),
+        "isolated_node": issue_block(isolated_nodes, node_label, nodes),
+        "wide_evidence_node": direct_issue_block(wide_evidence_nodes),
+    }
+    severe_issue_keys = {
+        "invalid_node_type",
+        "missing_description_node",
+        "invalid_claim_kind",
+        "unexpected_claim_kind",
+        "duplicate_node_id",
+        "duplicate_canonical_node",
+        "invalid_relation_ref",
+        "self_loop",
+        "invalid_relation_type",
+        "invalid_relation_signature",
+        "duplicate_edge",
+        "invalid_expression_owner",
+        "invalid_expression_role",
+        "expression_without_latex",
+        "missing_evidence",
+        "invalid_evidence",
+    }
+    severe_issue_count = sum(issues[key]["count"] for key in severe_issue_keys)
+    return {
+        "file": str(path),
+        "schema_version": data.get("schema_version"),
+        "source_path": data.get("source_path"),
+        "title": data.get("title"),
+        "model": data.get("model"),
+        "counts": {
+            "node_count": len(nodes),
+            "relationship_count": len(relations),
+            "math_expression_count": len(expressions),
+            "node_count_by_type": dict(Counter(node.get("type") for node in nodes)),
+            "claim_count_by_kind": dict(
+                Counter(node.get("claim_kind") for node in nodes if node.get("type") == "Claim")
+            ),
+            "relationship_count_by_type": dict(Counter(rel.get("type") for rel in relations)),
+            "expression_count_by_role": dict(Counter(item.get("role") for item in expressions)),
+            "connected_component_count": len(component_sizes),
+            "connected_component_sizes": component_sizes,
+        },
+        "diagnostics": data.get("diagnostics", {}),
+        "issues": issues,
+        "summary": {
+            "severe_issue_count": severe_issue_count,
+            "warning_issue_count": sum(block["count"] for block in issues.values()) - severe_issue_count,
+            "is_structurally_clean": severe_issue_count == 0,
+        },
+    }
+
+
+def canonical_node_name(value: str) -> str:
+    return re.sub(r"[\s_·,，。.;；:：'\"“”‘’()（）\[\]【】{}]+", "", value).casefold()
+
+
+def semantic_record_label(kind: str, record: dict[str, Any]) -> str:
+    if kind == "relation":
+        return f"{record.get('source_id')} -[{record.get('type')}]-> {record.get('target_id')}"
+    if kind == "expression":
+        return f"{record.get('owner_id')}:{record.get('role')}:{record.get('id')}"
+    return str(record.get("id"))
+
+
+def validate_semantic_evidence(item: Any) -> str | None:
+    if not isinstance(item, dict):
+        return "evidence must be an object"
+    start = item.get("start_line")
+    end = item.get("end_line")
+    if not isinstance(start, int) or not isinstance(end, int) or start < 1 or end < start:
+        return "invalid line range"
+    for key in ("source_path", "text", "chunk_id", "teaching_block_id", "discourse_role"):
+        if not str(item.get(key, "")).strip():
+            return f"missing {key}"
+    if not isinstance(item.get("heading_path"), list):
+        return "heading_path must be a list"
+    return None
+
+
+def semantic_component_sizes(
+    node_by_id: dict[str, dict[str, Any]], relations: list[dict[str, Any]]
+) -> list[int]:
+    adjacency: dict[str, set[str]] = defaultdict(set)
+    for relation in relations:
+        source = relation.get("source_id")
+        target = relation.get("target_id")
+        if source in node_by_id and target in node_by_id:
+            adjacency[source].add(target)
+            adjacency[target].add(source)
+    unseen = set(node_by_id)
+    sizes = []
+    while unseen:
+        stack = [unseen.pop()]
+        size = 0
+        while stack:
+            current = stack.pop()
+            size += 1
+            for neighbor in adjacency[current] & unseen:
+                unseen.remove(neighbor)
+                stack.append(neighbor)
+        sizes.append(size)
+    return sorted(sizes, reverse=True)
+
+
+def semantic_relation_label(relation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": relation.get("id"),
+        "type": relation.get("type"),
+        "source_id": relation.get("source_id"),
+        "target_id": relation.get("target_id"),
+    }
+
+
+def semantic_expression_label(expression: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": expression.get("id"),
+        "owner_id": expression.get("owner_id"),
+        "role": expression.get("role"),
+        "latex": str(expression.get("latex", ""))[:120],
+    }
+
+
+def direct_issue_block(items: list[dict[str, Any]], sample_size: int = 20) -> dict[str, Any]:
+    return {"count": len(items), "samples": items[:sample_size]}
+
+
+def value_issue_block(items: list[tuple[str, int]], key_name: str) -> dict[str, Any]:
+    return {
+        "count": len(items),
+        "samples": [{key_name: value, "count": count} for value, count in items[:20]],
+    }
+
+
+def evaluate_nodes_against_gold(
+    data: dict[str, Any], gold_data: dict[str, Any], gold_path: Path
+) -> dict[str, Any]:
+    source_file = Path(str(data.get("source_path", ""))).name
+    graphs = gold_data.get("graphs", [])
+    selected = next(
+        (graph for graph in graphs if str(graph.get("source_file", "")) == source_file),
+        None,
+    )
+    if selected is None:
+        raise SystemExit(f"Gold file {gold_path} has no graph annotation for source {source_file!r}")
+
+    gold_nodes = flatten_gold_node_groups(selected.get("node_groups", []))
+    must_nodes = [item for item in gold_nodes if item["requirement"] == "M"]
+    optional_nodes = [item for item in gold_nodes if item["requirement"] == "O"]
+    forbidden_nodes = [item for item in gold_nodes if item["requirement"] == "X"]
+    predicted_nodes = data.get("nodes", []) if isinstance(data.get("nodes"), list) else []
+
+    matched_must: dict[str, dict[str, Any]] = {}
+    matched_optional: dict[str, dict[str, Any]] = {}
+    false_positives: list[dict[str, Any]] = []
+
+    for predicted in predicted_nodes:
+        candidates = [
+            item
+            for item in [*must_nodes, *optional_nodes]
+            if gold_node_matches(predicted, item)
+        ]
+        candidates.sort(key=lambda item: (item["requirement"] != "M", item["gold_id"]))
+        if candidates:
+            chosen = candidates[0]
+            matched = matched_must if chosen["requirement"] == "M" else matched_optional
+            if chosen["gold_id"] in matched:
+                false_positives.append(
+                    {
+                        "predicted": node_label(predicted),
+                        "reason": "duplicate prediction for one gold node",
+                        "gold_id": chosen["gold_id"],
+                    }
+                )
+            else:
+                matched[chosen["gold_id"]] = predicted
+            continue
+
+        forbidden = next(
+            (item for item in forbidden_nodes if gold_node_matches(predicted, item)),
+            None,
+        )
+        false_positives.append(
+            {
+                "predicted": node_label(predicted),
+                "reason": "explicitly forbidden" if forbidden else "not present in reviewed gold",
+                "gold_id": forbidden["gold_id"] if forbidden else None,
+            }
+        )
+
+    false_negatives = [
+        gold_node_summary(item)
+        for item in must_nodes
+        if item["gold_id"] not in matched_must
+    ]
+    true_positive_count = len(matched_must)
+    false_positive_count = len(false_positives)
+    false_negative_count = len(false_negatives)
+    precision = safe_ratio(true_positive_count, true_positive_count + false_positive_count)
+    recall = safe_ratio(true_positive_count, true_positive_count + false_negative_count)
+    f1 = safe_ratio(2 * precision * recall, precision + recall)
+
+    per_type = {}
+    for node_type in sorted(SEMANTIC_NODE_TYPES):
+        type_must = [item for item in must_nodes if item["type"] == node_type]
+        type_tp = sum(item["gold_id"] in matched_must for item in type_must)
+        type_fn = len(type_must) - type_tp
+        type_fp = sum(
+            item["predicted"].get("type") == node_type for item in false_positives
+        )
+        type_precision = safe_ratio(type_tp, type_tp + type_fp)
+        type_recall = safe_ratio(type_tp, type_tp + type_fn)
+        per_type[node_type] = {
+            "true_positive": type_tp,
+            "false_positive": type_fp,
+            "false_negative": type_fn,
+            "precision": type_precision,
+            "recall": type_recall,
+            "f1": safe_ratio(2 * type_precision * type_recall, type_precision + type_recall),
+        }
+
+    return {
+        "gold_file": str(gold_path),
+        "gold_schema_version": gold_data.get("schema_version"),
+        "source_file": source_file,
+        "annotation_status": selected.get("annotation_status"),
+        "node_metrics": {
+            "must_gold_count": len(must_nodes),
+            "optional_gold_count": len(optional_nodes),
+            "forbidden_gold_count": len(forbidden_nodes),
+            "predicted_count": len(predicted_nodes),
+            "true_positive": true_positive_count,
+            "false_positive": false_positive_count,
+            "false_negative": false_negative_count,
+            "optional_matched": len(matched_optional),
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "per_type": per_type,
+        },
+        "false_positives": false_positives,
+        "false_negatives": false_negatives,
+        "true_positive_matches": [
+            {
+                "gold_id": gold_id,
+                "predicted": node_label(predicted),
+            }
+            for gold_id, predicted in sorted(matched_must.items())
+        ],
+        "optional_matches": [
+            {
+                "gold_id": gold_id,
+                "predicted": node_label(predicted),
+            }
+            for gold_id, predicted in sorted(matched_optional.items())
+        ],
+        "relation_metrics": None,
+        "relation_annotation_status": selected.get("relation_annotation_status", "pending"),
+    }
+
+
+def flatten_gold_node_groups(groups: Any) -> list[dict[str, Any]]:
+    flattened = []
+    if not isinstance(groups, list):
+        return flattened
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        requirement = group.get("requirement")
+        node_type = group.get("type")
+        claim_kind = group.get("claim_kind")
+        for item in group.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            flattened.append(
+                {
+                    **item,
+                    "requirement": requirement,
+                    "type": node_type,
+                    "claim_kind": claim_kind,
+                }
+            )
+    return flattened
+
+
+def gold_node_matches(predicted: dict[str, Any], gold: dict[str, Any]) -> bool:
+    if predicted.get("type") != gold.get("type"):
+        return False
+    if gold.get("type") == "Claim" and predicted.get("claim_kind") != gold.get("claim_kind"):
+        return False
+    predicted_names = [predicted.get("name", "")]
+    if isinstance(predicted.get("aliases"), list):
+        predicted_names.extend(predicted["aliases"])
+    accepted_names = [gold.get("name", "")]
+    if isinstance(gold.get("accepted_names"), list):
+        accepted_names.extend(gold["accepted_names"])
+    predicted_keys = {
+        canonical_node_name(str(name)) for name in predicted_names if str(name).strip()
+    }
+    accepted_keys = {
+        canonical_node_name(str(name)) for name in accepted_names if str(name).strip()
+    }
+    return bool(predicted_keys & accepted_keys)
+
+
+def gold_node_summary(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "gold_id": item.get("gold_id"),
+        "type": item.get("type"),
+        "claim_kind": item.get("claim_kind"),
+        "name": item.get("name"),
+    }
+
+
+def safe_ratio(numerator: float, denominator: float) -> float:
+    if denominator == 0:
+        return 0.0
+    return round(numerator / denominator, 6)
 
 
 def contains_is_adjacent_hierarchy(rel: dict[str, Any], node_type_by_id: dict[str, str]) -> bool:
@@ -510,6 +1001,7 @@ def node_label(node: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": node.get("id"),
         "type": node.get("type"),
+        "claim_kind": node.get("claim_kind"),
         "name": node.get("name"),
         "description": str(node.get("description", ""))[:120],
     }
@@ -534,9 +1026,25 @@ def print_text_report(report: dict[str, Any], sample_size: int) -> None:
     print(f"Source: {report.get('source_path')}")
     print(f"Nodes: {counts['node_count']}")
     print(f"Relationships: {counts['relationship_count']}")
+    if "math_expression_count" in counts:
+        print(f"Math expressions: {counts['math_expression_count']}")
+        print(
+            "Connected components: "
+            f"{counts['connected_component_count']} {counts['connected_component_sizes']}"
+        )
     print(f"Severe issues: {summary['severe_issue_count']}")
     print(f"Warning issues: {summary['warning_issue_count']}")
     print(f"Structurally clean: {summary['is_structurally_clean']}")
+    gold = report.get("gold_evaluation")
+    if gold:
+        metrics = gold["node_metrics"]
+        print(
+            "Gold node P/R/F1: "
+            f"{metrics['precision']:.4f} / {metrics['recall']:.4f} / {metrics['f1']:.4f} "
+            f"(TP={metrics['true_positive']}, FP={metrics['false_positive']}, "
+            f"FN={metrics['false_negative']}, optional={metrics['optional_matched']})"
+        )
+        print(f"Gold relation status: {gold['relation_annotation_status']}")
     print()
     print("Node types:")
     for key, value in sorted(counts["node_count_by_type"].items()):
