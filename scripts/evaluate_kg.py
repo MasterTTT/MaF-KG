@@ -60,7 +60,9 @@ def main() -> int:
     if args.gold:
         gold_path = Path(args.gold)
         gold_data = load_json(gold_path)
-        report["gold_evaluation"] = evaluate_nodes_against_gold(data, gold_data, gold_path)
+        report["gold_evaluation"] = evaluate_nodes_against_gold(
+            data, gold_data, gold_path, semantic_match=args.semantic_match
+        )
     if args.additional_inputs:
         if not args.gold:
             raise SystemExit("Relation stability evaluation requires --gold for endpoint alignment")
@@ -99,6 +101,13 @@ def parse_args() -> argparse.Namespace:
         "--fail-on-severe",
         action="store_true",
         help="Exit with code 1 when severe structural/schema issues are found.",
+    )
+    parser.add_argument(
+        "--semantic-match",
+        action="store_true",
+        help="Fall back to embedding retrieval + LLM judge for gold name matching "
+        "when canonical rule matching fails (requires local ollama qwen3-embedding "
+        "and the DEEPSEEK_API_KEY environment variable).",
     )
     return parser.parse_args()
 
@@ -522,7 +531,15 @@ def evaluate_semantic_graph(data: dict[str, Any], path: Path) -> dict[str, Any]:
 
 
 def canonical_node_name(value: str) -> str:
-    return re.sub(r"[\s_·,，。.;；:：'\"“”‘’()（）\[\]【】{}]+", "", value).casefold()
+    normalized = re.sub(r"[fg]\(x\)", "", value)
+    normalized = (
+        normalized.replace("\\to", "→")
+        .replace("\\infty", "∞")
+        .replace("$", "")
+        .replace("{", "")
+        .replace("}", "")
+    )
+    return re.sub(r"[\s_·,，。.;；:：'\"“”‘’()（）\[\]【】{}]+", "", normalized).casefold()
 
 
 def semantic_record_label(kind: str, record: dict[str, Any]) -> str:
@@ -602,8 +619,118 @@ def value_issue_block(items: list[tuple[str, int]], key_name: str) -> dict[str, 
     }
 
 
+class SemanticNameMatcher:
+    """Fallback gold matching: embedding retrieval selects candidates, an LLM
+    judge decides same/different. Used only when canonical rule matching fails,
+    so it never overrides deterministic matches; it rescues surface variants
+    (word order, inserted f(x), synonym phrasing) that rules cannot handle."""
+
+    EMBED_MODEL = "qwen3-embedding:0.6b"
+    JUDGE_MODEL = "deepseek-v4-flash"
+    OLLAMA_URL = "http://localhost:11434/api/embed"
+    JUDGE_URL = "https://api.deepseek.com/chat/completions"
+    SIM_THRESHOLD = 0.80
+
+    def __init__(self) -> None:
+        self._mem_embed: dict[str, list[float]] = {}
+        self._judge_cache: dict[tuple[str, str], bool] = {}
+        self._call_count = 0
+
+    def _embed(self, texts: list[str]) -> list[list[float]]:
+        import urllib.request
+
+        req = urllib.request.Request(
+            self.OLLAMA_URL,
+            data=json.dumps({"model": self.EMBED_MODEL, "input": texts}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read())["embeddings"]
+
+    def _judge(self, name_a: str, name_b: str, context: str) -> bool:
+        key = (name_a, name_b)
+        if key in self._judge_cache:
+            return self._judge_cache[key]
+        import os
+        import urllib.request
+
+        api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("DS_API_KEY")
+        if not api_key:
+            raise SystemExit("--semantic-match requires DEEPSEEK_API_KEY for the judge model")
+        sys_prompt = (
+            "你是数学知识图谱的命名判定器。给定两个数学概念名，判断它们是否指代"
+            "同一个数学对象。同一对象的不同写法（同义改写、措辞顺序不同、含 f(x) "
+            "与否、“x→+∞”与“x趋于正无穷”等写法差异）应判定为同一；名称相近但指代"
+            "不同对象（如左极限与右极限、概念与其性质、“自变量趋于无穷大”这一趋近"
+            "方式与“自变量趋于无穷大时的函数极限”这一极限概念）应判定为不同。"
+            '只输出 JSON：{"same": true/false, "reason": "一句话理由"}'
+        )
+        user_prompt = (
+            f'概念A: "{name_a}"；概念B: "{name_b}"。\n'
+            f"概念A 的上下文描述：{context}\n判断二者是否同一对象。"
+        )
+        payload = {
+            "model": self.JUDGE_MODEL,
+            "messages": [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+        }
+        req = urllib.request.Request(
+            self.JUDGE_URL,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            content = json.loads(resp.read())["choices"][0]["message"]["content"]
+        self._call_count += 1
+        try:
+            verdict = json.loads(content).get("same", False)
+        except json.JSONDecodeError:
+            verdict = False
+        self._judge_cache[key] = verdict
+        return verdict
+
+    def cosine(self, a: list[float], b: list[float]) -> float:
+        return sum(x * y for x, y in zip(a, b)) / (
+            (sum(x * x for x in a) ** 0.5) * (sum(y * y for y in b) ** 0.5)
+        )
+
+    def judge_same(self, predicted: dict[str, Any], gold_item: dict[str, Any]) -> bool:
+        """Ask the flash judge whether predicted and gold names denote the same object."""
+        name_a = str(predicted.get("name", ""))
+        name_b = str(gold_item.get("name", ""))
+        context = str(predicted.get("description", ""))[:400]
+        return self._judge(name_a, name_b, context)
+
+    def best_candidates(self, predicted: dict[str, Any], gold_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Rank same-type gold items by embedding similarity to the predicted name."""
+        if predicted.get("type") != "Concept":
+            return []
+        query = str(predicted.get("name", ""))
+        if not query.strip():
+            return []
+        unembedded = [item for item in gold_items if item["gold_id"] not in self._mem_embed]
+        if unembedded:
+            embs = self._embed([item.get("name", "") for item in unembedded])
+            for item, emb in zip(unembedded, embs):
+                self._mem_embed[item["gold_id"]] = emb
+        (q_emb,) = self._embed([query])
+        scored = []
+        for item in gold_items:
+            sim = self.cosine(q_emb, self._mem_embed[item["gold_id"]])
+            scored.append((sim, item))
+        scored.sort(reverse=True)
+        return [item for sim, item in scored if sim >= self.SIM_THRESHOLD]
+
+
 def evaluate_nodes_against_gold(
-    data: dict[str, Any], gold_data: dict[str, Any], gold_path: Path
+    data: dict[str, Any],
+    gold_data: dict[str, Any],
+    gold_path: Path,
+    semantic_match: bool = False,
 ) -> dict[str, Any]:
     source_file = Path(str(data.get("source_path", ""))).name
     graphs = gold_data.get("graphs", [])
@@ -624,6 +751,10 @@ def evaluate_nodes_against_gold(
     matched_optional: dict[str, dict[str, Any]] = {}
     false_positives: list[dict[str, Any]] = []
 
+    semantic_matcher: SemanticNameMatcher | None = None
+    if semantic_match:
+        semantic_matcher = SemanticNameMatcher()
+
     for predicted in predicted_nodes:
         candidates = [
             item
@@ -631,8 +762,20 @@ def evaluate_nodes_against_gold(
             if gold_node_matches(predicted, item)
         ]
         candidates.sort(key=lambda item: (item["requirement"] != "M", item["gold_id"]))
+        chosen: dict[str, Any] | None = None
         if candidates:
             chosen = candidates[0]
+        elif semantic_matcher is not None:
+            concept_gold = [
+                item
+                for item in [*must_nodes, *optional_nodes]
+                if item.get("type") == "Concept"
+            ]
+            for candidate in semantic_matcher.best_candidates(predicted, concept_gold):
+                if semantic_matcher.judge_same(predicted, candidate):
+                    chosen = candidate
+                    break
+        if chosen is not None:
             matched = matched_must if chosen["requirement"] == "M" else matched_optional
             if chosen["gold_id"] in matched:
                 false_positives.append(
@@ -650,6 +793,16 @@ def evaluate_nodes_against_gold(
             (item for item in forbidden_nodes if gold_node_matches(predicted, item)),
             None,
         )
+        if forbidden is None and semantic_matcher is not None:
+            forbidden = next(
+                (
+                    item
+                    for item in forbidden_nodes
+                    if item.get("type") == "Concept"
+                    and semantic_matcher.judge_same(predicted, item)
+                ),
+                None,
+            )
         false_positives.append(
             {
                 "predicted": node_label(predicted),

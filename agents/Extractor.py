@@ -33,6 +33,55 @@ except Exception:
 
 from langgraph.graph import END, StateGraph
 
+DEFINED_TERM_PATTERNS = [
+    re.compile(r"(?:那么|则)?\s*称\s*(.{0,40}?)\s*为\s*(.{2,60}?)(?:[，。,．；;.:：]|$)"),
+    re.compile(r"(?:那么|则)?\s*(.{0,80}?)\s*(?:就)?(?:叫做|称为)\s*(.{2,60}?)(?:[，。,．；;.:：]|$)"),
+    re.compile(r"记作\s*(\$.+?\$)"),
+    re.compile(r"统称为\s*(.{2,60}?)(?:[，。,．；;.:：]|$)"),
+]
+
+SEGMENT_META_PATTERN = re.compile(
+    r"我们(?:指出|强调)|(?:需要)?注意(?:到)?(?:的是)?|这里(?:我们)?(?:指出|强调)|特别(?:指出|强调)"
+)
+SEGMENT_RESTATE_PATTERN = re.compile(
+    r"可(?:以)?(?:简单地)?表述为|简单地说(?:就是)?|也就是说|等价(?:地|于)|换言之|"
+    r"也可以(?:写|记)为|也可(?:写|记)为|记作|记为"
+)
+SEGMENT_GEOMETRIC_PATTERN = re.compile(
+    r"从几何上来说|从图形上看|几何意义|直观(?:上|地)|图形上看|图\s*\d"
+)
+MATH_LINE_PATTERN = re.compile(r"\$\$|\$")
+
+
+def classify_definition_segments(
+    lines: list[tuple[int, str]],
+) -> tuple[tuple[str, int, int], ...]:
+    """Label the discourse segments of a definition unit:
+    definition -> meta_annotation -> symbolic_restatement -> geometric_interpretation.
+    Roles are navigation hints only, derived from template signal words."""
+    roles: list[tuple[str, int]] = []
+    for line_no, text in lines:
+        stripped = text.strip()
+        role = "exposition"
+        # The definitional statement itself ("定义1 设...") stays exposition even
+        # though it contains math; only later restatements are symbolic.
+        if stripped.startswith("定义"):
+            role = "exposition"
+        elif stripped.startswith("![") or SEGMENT_GEOMETRIC_PATTERN.search(stripped):
+            role = "geometric_interpretation"
+        elif SEGMENT_META_PATTERN.search(stripped):
+            role = "meta_annotation"
+        elif MATH_LINE_PATTERN.search(stripped) or SEGMENT_RESTATE_PATTERN.search(stripped):
+            role = "symbolic_restatement"
+        roles.append((role, line_no))
+    segments: list[tuple[str, int, int]] = []
+    for role, line_no in roles:
+        if segments and segments[-1][0] == role and segments[-1][2] == line_no - 1:
+            segments[-1] = (role, segments[-1][1], line_no)
+        else:
+            segments.append((role, line_no, line_no))
+    return tuple(segments)
+
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT_DIR = ROOT / "prompts"
 DEFAULT_INPUT = ROOT / "data" / "raw" / "第一章第一节_映射与函数.md"
@@ -196,6 +245,17 @@ class MathExpressionRecord(BaseModel):
     latex: str
     evidences: list[Evidence] = Field(default_factory=list)
 
+class VerificationVerdict(BaseModel):
+    ref_id: str
+    kind: Literal["node", "relation"]
+    verdict: Literal[0, 1]
+    reason: str = ""
+    correction: str = ""
+
+class VerifyResponse(BaseModel):
+    verdicts: list[VerificationVerdict] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
 @dataclass
 class DocumentBlock:
     start_line: int
@@ -204,6 +264,7 @@ class DocumentBlock:
     lines: list[tuple[int, str]]
     kind: str
     teaching_block_id: str = ""
+    segments: tuple[tuple[str, int, int], ...] = ()
     @property
     def char_count(self) -> int:
         return sum(len(f"{n}: {t}") + 1 for n, t in self.lines)
@@ -220,7 +281,7 @@ class DocumentChunk:
     block_count: int = 0
     block_types: tuple[str, ...] = ()
     teaching_block_ids: tuple[str, ...] = ()
-    teaching_blocks: tuple[dict[str, int | str], ...] = ()
+    teaching_blocks: tuple[dict[str, int | str | list], ...] = ()
     break_reason: str = ""
     teaching_unit_kind: str = ""
     anchor_block_ids: tuple[str, ...] = ()
@@ -347,6 +408,13 @@ def _teaching_unit_kind(blocks: list[DocumentBlock], reason: str) -> str:
     if not substantive:
         return "heading_only"
     theorem_blocks = [block for block in substantive if block.kind == "theorem"]
+    definition_blocks = [block for block in substantive if block.kind == "definition"]
+    if definition_blocks:
+        if theorem_blocks:
+            return "definition_theorem_family"
+        if len(definition_blocks) > 1:
+            return "definition_group"
+        return "definition"
     if theorem_blocks:
         labels = [_theorem_label(block) for block in theorem_blocks]
         root_count = sum(label is None or not label[1] for label in labels)
@@ -370,13 +438,18 @@ def _teaching_unit_kind(blocks: list[DocumentBlock], reason: str) -> str:
 
 def _teaching_unit_anchor_ids(blocks: list[DocumentBlock], unit_kind: str) -> tuple[str, ...]:
     substantive = [block for block in blocks if block.kind != "heading"]
-    if unit_kind.startswith("theorem"):
-        anchors = [block for block in substantive if block.kind in {"theorem", "corollary"}]
-    elif unit_kind in {"property", "corollary", "core_statement"}:
+    if unit_kind.startswith("theorem") or unit_kind == "definition_theorem_family":
         anchors = [
             block
             for block in substantive
-            if block.kind in {"property", "corollary"} or _is_standalone_core_statement(block)
+            if block.kind in {"theorem", "corollary", "definition"}
+        ]
+    elif unit_kind in {"property", "corollary", "core_statement", "definition", "definition_group"}:
+        anchors = [
+            block
+            for block in substantive
+            if block.kind in {"property", "corollary", "definition"}
+            or _is_standalone_core_statement(block)
         ]
     elif unit_kind == "example_sequence":
         anchors = [block for block in substantive if block.kind == "example"]
@@ -558,6 +631,33 @@ def _build_teaching_unit_groups(
             current.append(block)
             flush("property_unit")
             i += 1
+            continue
+
+        if block.kind == "definition":
+            seed_pending_headings()
+            def_count = 1
+            while i + def_count < len(blocks) and blocks[i + def_count].kind == "definition":
+                def_count += 1
+            family_end = i + def_count
+            if family_end < len(blocks) and blocks[family_end].kind == "theorem":
+                family_end += 1
+                while family_end < len(blocks) and blocks[family_end].kind in {"corollary", "proof"}:
+                    family_end += 1
+                family = blocks[i:family_end]
+                if _group_char_count(current) + sum(b.char_count for b in family) <= max_chars:
+                    if current_substantive():
+                        flush("definition_family_boundary")
+                        seed_pending_headings()
+                    current.extend(family)
+                    theorem_root_count = 1
+                    theorem_has_dependents = any(b.kind == "corollary" for b in family)
+                    i = family_end
+                    continue
+            if current_substantive():
+                flush("definition_boundary")
+                seed_pending_headings()
+            current.extend(blocks[i : i + def_count])
+            i += def_count
             continue
 
         if block.kind == "proof" and current_has_theorem():
@@ -1370,6 +1470,11 @@ class Extractor:
         resume: bool = True,
         include_exercises: bool = False,
         verbose: bool = True,
+        verify: bool = False,
+        verify_model: str | None = None,
+        semantic_dedupe: bool = False,
+        embedding_memory: bool = False,
+        seed_graph_path: str | Path | None = None,
     ) -> None:
         self.input_path = Path(input_path)
         self.output_path = Path(output_path)
@@ -1408,6 +1513,15 @@ class Extractor:
         self.include_exercises = include_exercises
         self.verbose = verbose
         self.system_prompt = _load_prompt("extraction_system.txt")
+        self.verify = verify
+        self.verify_model = verify_model or "deepseek-v4-flash"
+        self.verify_prompt = _load_prompt("extraction_verify.txt") if verify else ""
+        self.semantic_dedupe = semantic_dedupe
+        self.embedding_memory = embedding_memory
+        self.seed_graph_path = Path(seed_graph_path) if seed_graph_path else None
+        self._sem_embed_cache: dict[str, list[float]] = {}
+        self._sem_judge_cache: dict[tuple[str, str], bool] = {}
+        self._chunk_embed_cache: dict[str, list[float]] = {}
         self.client: ProviderChatClient | None = None
         self.source_latex_map: dict[int, list[str]] = {}
         self.source_latex_candidates: dict[str, tuple[int, str]] = {}
@@ -1579,6 +1693,9 @@ class Extractor:
         def is_proof(text: str) -> bool:
             return bool(re.match(r"^\s*(证|证明)\s*[:：]?", without_markdown_list_marker(text)))
 
+        def is_definition(text: str) -> bool:
+            return bool(re.match(r"^\s*定义\s*\d*\s+设", without_markdown_list_marker(text)))
+
         def is_conclusion_transition(text: str) -> bool:
             return bool(
                 re.search(
@@ -1603,6 +1720,7 @@ class Extractor:
                 or is_property(text)
                 or is_corollary(text)
                 or is_proof(text)
+                or is_definition(text)
                 or is_image(text)
                 or is_math(text)
             )
@@ -1657,6 +1775,8 @@ class Extractor:
                 kind_fn = "corollary"
             elif is_proof(stripped):
                 kind_fn = "proof"
+            elif is_definition(stripped):
+                kind_fn = "definition"
 
             if kind_fn:
                 start = i
@@ -1669,6 +1789,7 @@ class Extractor:
                         or is_example(nxt)
                         or is_theorem(nxt)
                         or is_corollary(nxt)
+                        or is_definition(nxt)
                         or (kind_fn in {"property", "corollary", "proof"} and is_property(nxt))
                     ):
                         break
@@ -1677,7 +1798,10 @@ class Extractor:
                     if is_conclusion_transition(nxt):
                         saw_conclusion = True
                     i += 1
-                blocks.append(block(line_items[start:i], kind_fn))
+                parsed_block = block(line_items[start:i], kind_fn)
+                if kind_fn == "definition":
+                    parsed_block.segments = classify_definition_segments(parsed_block.lines)
+                blocks.append(parsed_block)
                 continue
 
             start = i
@@ -1922,6 +2046,12 @@ class Extractor:
                             "discourse_role": blk.kind,
                             "start_line": blk.start_line,
                             "end_line": blk.end_line,
+                            "segments": [
+                                {"role": role, "start_line": s, "end_line": e}
+                                for role, s, e in blk.segments
+                            ]
+                            if blk.segments
+                            else [],
                         }
                         for blk in group_blocks
                     ),
@@ -1991,12 +2121,64 @@ class Extractor:
         self._log("Prepared " + str(len(chunks)) + " chunks: " + ", ".join(f"{c.id}[L{c.start_line}-L{c.end_line}]" for c in chunks))
         return {**state, "chunks": chunks, "diagnostics": diagnostics}
 
+    def _load_seed_graph(
+        self, path: Path
+    ) -> tuple[
+        dict[str, NodeRecord],
+        dict[tuple[str, str, str], RelationRecord],
+        dict[tuple[str, str, str], MathExpressionRecord],
+    ]:
+        """Load a previously extracted graph JSON as the starting store for incremental update.
+
+        Seed nodes/relations participate in memory retrieval and dedupe like
+        chunk-produced ones; relations added by later chunks dedupe by exact
+        (source, type, target) key against seed relations.
+        """
+        data = json.loads(path.read_text(encoding="utf-8"))
+        node_store: dict[str, NodeRecord] = {}
+        relation_store: dict[tuple[str, str, str], RelationRecord] = {}
+        expression_store: dict[tuple[str, str, str], MathExpressionRecord] = {}
+        for node in data.get("nodes", []):
+            node_store[node["id"]] = NodeRecord(
+                id=node["id"],
+                type=node["type"],
+                name=node["name"],
+                aliases=list(node.get("aliases", [])),
+                description=node.get("description", ""),
+                claim_kind=node.get("claim_kind"),
+                evidence=[Evidence(**entry) for entry in node.get("evidence", [])],
+            )
+        for rel in data.get("relations", []):
+            key = _relation_key(rel["source_id"], rel["type"], rel["target_id"])
+            relation_store[key] = RelationRecord(
+                source_id=key[0],
+                relation_type=key[1],
+                target_id=key[2],
+                evidences=[Evidence(**entry) for entry in rel.get("evidence", [])],
+            )
+        for expr in data.get("math_expressions", []):
+            key = (expr["owner_id"], expr["role"], expr["latex"])
+            expression_store[key] = MathExpressionRecord(
+                id=expr["id"],
+                owner_id=expr["owner_id"],
+                role=expr["role"],
+                latex=expr["latex"],
+                evidences=[Evidence(**entry) for entry in expr.get("evidence", [])],
+            )
+        self._log(
+            f"Seeded {len(node_store)} nodes / {len(relation_store)} relations / "
+            f"{len(expression_store)} expressions from {path}"
+        )
+        return node_store, relation_store, expression_store
+
     def _extract_sequentially(self, state: ExtractionState) -> ExtractionState:
         client = self._client(state)
         lines = state["raw_lines"]
         node_store: dict[str, NodeRecord] = {}
         relation_store: dict[tuple[str, str, str], RelationRecord] = {}
         expression_store: dict[tuple[str, str, str], MathExpressionRecord] = {}
+        if self.seed_graph_path is not None:
+            node_store, relation_store, expression_store = self._load_seed_graph(self.seed_graph_path)
         chunk_summaries: list[dict[str, Any]] = []
         decision_ledger: list[dict[str, Any]] = []
         processed_chunk_ids: list[str] = []
@@ -2140,6 +2322,21 @@ class Extractor:
                 "api_requests": client.request_history,
             },
         )
+        if self.verify:
+            try:
+                result = self._verify_result(result, state)
+                verdicts = result.diagnostics.get("verify", {}).get("verdicts", [])
+                if any(verdict.get("verdict") == 0 for verdict in verdicts):
+                    flagged_chunks = self._collect_flagged_chunks(result, state["chunks"])
+                    if flagged_chunks:
+                        self._log(
+                            f"Verifier flagged {len(flagged_chunks)} chunk(s) for correction: "
+                            f"{[chunk.id for chunk in flagged_chunks]}"
+                        )
+                        result = self._correct_result(result, flagged_chunks, lines, state)
+            except Exception as exc:
+                self._log(f"Verify pass failed (fail-safe): {exc}")
+                result.diagnostics["verify"] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
         return {**state, "result": result}
 
     def _validate_chunk_response(
@@ -2224,6 +2421,10 @@ class Extractor:
         if not node_store:
             return [], [], []
 
+        embed_sims: dict[str, float] = {}
+        if self.embedding_memory:
+            embed_sims = self._chunk_node_similarities(chunk, node_store)
+
         expressions_by_owner: dict[str, list[MathExpressionRecord]] = {}
         for expression in expression_store.values():
             expressions_by_owner.setdefault(expression.owner_id, []).append(expression)
@@ -2235,6 +2436,7 @@ class Extractor:
                 node,
                 expressions_by_owner.get(node.id, []),
                 recent_chunk_ids,
+                embed_sims.get(node.id),
             )
             if score > 0:
                 ranked.append((score, reasons, node))
@@ -2348,6 +2550,7 @@ class Extractor:
         node: NodeRecord,
         expressions: list[MathExpressionRecord],
         recent_chunk_ids: set[str],
+        embed_sim: float | None = None,
     ) -> tuple[float, list[str]]:
         haystack = "\n".join(
             [chunk.text, chunk.context_before_text, chunk.context_after_text, " ".join(chunk.heading_path)]
@@ -2363,6 +2566,10 @@ class Extractor:
                 score += 8.0 if token == node.name else 6.0
                 reasons.append("exact_name" if token == node.name else "exact_alias")
                 break
+
+        if embed_sim is not None and embed_sim >= 0.15:
+            score += embed_sim * 3.0
+            reasons.append(f"embedding:{embed_sim:.2f}")
 
         node_text = " ".join([node.name, *node.aliases, node.description[:500]])
         node_grams = _char_ngrams(node_text)
@@ -2414,12 +2621,30 @@ class Extractor:
             target_id=relation.target_id,
         )
 
+    def _extract_defined_terms(self, chunk_text: str) -> list[dict[str, str]]:
+        results: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for pattern in DEFINED_TERM_PATTERNS:
+            for match in pattern.finditer(chunk_text):
+                groups = match.groups()
+                if not groups:
+                    continue
+                label = groups[-1].strip().replace("$", "")
+                if len(label) < 2 or label in seen:
+                    continue
+                seen.add(label)
+                results.append({"term": label, "context": match.group(0).strip()[:120]})
+                if len(results) >= 20:
+                    return results
+        return results
+
     def _chunk_extraction_prompt(
         self,
         chunk: DocumentChunk,
         source_path: str,
         node_memory: list[NodeMemoryItem],
         relation_memory: list[RelationMemoryItem],
+        verifier_guidance: list[dict[str, Any]] | None = None,
     ) -> str:
         evidence_line_numbers = [int(match.group(1)) for line in chunk.text.splitlines() if (match := re.match(r"^([0-9]+):", line))]
         source_latex_candidates = self._source_latex_candidates_for_chunk(chunk)
@@ -2437,11 +2662,304 @@ class Extractor:
                 "context_after_text": chunk.context_after_text,
                 "evidence_line_numbers": evidence_line_numbers,
             },
+            "defined_term_hints": self._extract_defined_terms(chunk.text),
             "source_latex_candidates": source_latex_candidates,
             "node_memory": [item.model_dump(mode="json") for item in node_memory],
             "relation_memory": [item.model_dump(mode="json") for item in relation_memory],
         }
+        if verifier_guidance:
+            payload["verifier_guidance"] = verifier_guidance
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    def _build_verify_prompt(self, result: ExtractionResult) -> str:
+        def evidence_blocks(evidence_list: list[Evidence]) -> list[dict[str, Any]]:
+            return [
+                {
+                    "chunk_id": item.chunk_id,
+                    "lines": f"L{item.start_line}-L{item.end_line}",
+                    "text": item.text[:500],
+                }
+                for item in evidence_list
+            ]
+
+        node_by_id = {node.id: node for node in result.nodes}
+        nodes = [
+            {
+                "node_id": node.id,
+                "type": node.type,
+                "name": node.name,
+                "description": node.description,
+                "claim_kind": node.claim_kind,
+                "evidence": evidence_blocks(node.evidence),
+            }
+            for node in sorted(result.nodes, key=lambda item: (item.type, item.name, item.id))
+        ]
+        relations = []
+        for relation in sorted(result.relations, key=lambda item: (item.type, item.source_id, item.target_id)):
+            source = node_by_id.get(relation.source_id)
+            target = node_by_id.get(relation.target_id)
+            relations.append(
+                {
+                    "relation_id": relation.id,
+                    "type": relation.type,
+                    "source_id": relation.source_id,
+                    "source_name": source.name if source else "",
+                    "source_type": source.type if source else "",
+                    "target_id": relation.target_id,
+                    "target_name": target.name if target else "",
+                    "target_type": target.type if target else "",
+                    "evidence": evidence_blocks(relation.evidence),
+                }
+            )
+        expressions = []
+        for expression in sorted(result.math_expressions, key=lambda item: (item.role, item.owner_id, item.id)):
+            owner = node_by_id.get(expression.owner_id)
+            expressions.append(
+                {
+                    "expression_id": expression.id,
+                    "role": expression.role,
+                    "latex": expression.latex,
+                    "owner_name": owner.name if owner else "",
+                    "owner_type": owner.type if owner else "",
+                    "evidence": evidence_blocks(expression.evidence),
+                }
+            )
+        payload = {
+            "source_path": result.source_path,
+            "node_count": len(nodes),
+            "relation_count": len(relations),
+            "expression_count": len(expressions),
+            "nodes": nodes,
+            "relations": relations,
+            "expressions": expressions,
+        }
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    def _verify_client(self, state: ExtractionState) -> ProviderChatClient:
+        return ProviderChatClient(
+            provider=str(state["provider"]),
+            model=self.verify_model,
+            base_url=str(state["base_url"]),
+            api_key_env=state.get("api_key_env"),
+            temperature=0.1,
+            timeout=float(state["request_timeout"]),
+            max_retries=int(state["max_retries"]),
+            max_tokens=4000,
+            use_response_format=False,
+            trust_env=not bool(state.get("no_proxy", False)),
+            thinking="disabled",
+        )
+
+    def _verify_result(self, result: ExtractionResult, state: ExtractionState) -> ExtractionResult:
+        started = time.perf_counter()
+        verify_diag: dict[str, Any] = {
+            "status": "running",
+            "model": self.verify_model,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        result.diagnostics["verify"] = verify_diag
+        try:
+            verify_client = self._verify_client(state)
+            payload = verify_client.complete_json(
+                self.verify_prompt,
+                self._build_verify_prompt(result),
+                label="verify",
+            )
+            parsed = VerifyResponse.model_validate(payload)
+            verdicts = [verdict.model_dump(mode="json") for verdict in parsed.verdicts]
+            verify_diag.update(
+                {
+                    "status": "completed",
+                    "total_nodes_checked": len(result.nodes),
+                    "total_relations_checked": len(result.relations),
+                    "flagged_node_count": sum(
+                        1 for verdict in verdicts if verdict["kind"] == "node" and verdict["verdict"] == 0
+                    ),
+                    "flagged_relation_count": sum(
+                        1
+                        for verdict in verdicts
+                        if verdict["kind"] == "relation" and verdict["verdict"] == 0
+                    ),
+                    "verdicts": verdicts,
+                    "notes": parsed.notes,
+                    "latency_seconds": round(time.perf_counter() - started, 4),
+                    "api_summary": self._api_summary(verify_client.request_history),
+                    "api_requests": verify_client.request_history,
+                }
+            )
+            self._log(
+                f"Verifier completed: {verify_diag['flagged_node_count']} nodes, "
+                f"{verify_diag['flagged_relation_count']} relations flagged"
+            )
+        except Exception as exc:
+            verify_diag.update(
+                {
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "latency_seconds": round(time.perf_counter() - started, 4),
+                }
+            )
+            self._log(f"Verify pass failed (fail-safe): {exc}")
+        return result
+
+    def _collect_flagged_chunks(
+        self,
+        result: ExtractionResult,
+        chunks: list[DocumentChunk],
+    ) -> list[DocumentChunk]:
+        verdicts = result.diagnostics.get("verify", {}).get("verdicts", [])
+        flagged_ids = {verdict["ref_id"] for verdict in verdicts if verdict.get("verdict") == 0}
+        node_by_id = {node.id: node for node in result.nodes}
+        relation_by_id = {relation.id: relation for relation in result.relations}
+        chunk_ids: set[str] = set()
+        for ref_id in flagged_ids:
+            item = node_by_id.get(ref_id) or relation_by_id.get(ref_id)
+            if item is None:
+                continue
+            chunk_ids.update(evidence.chunk_id for evidence in item.evidence)
+        return [chunk for chunk in chunks if chunk.id in chunk_ids]
+
+    def _verifier_guidance_by_chunk(
+        self,
+        result: ExtractionResult,
+        chunks: list[DocumentChunk],
+    ) -> dict[str, list[dict[str, Any]]]:
+        verdicts = result.diagnostics.get("verify", {}).get("verdicts", [])
+        node_by_id = {node.id: node for node in result.nodes}
+        relation_by_id = {relation.id: relation for relation in result.relations}
+        guidance: dict[str, list[dict[str, Any]]] = {chunk.id: [] for chunk in chunks}
+        for verdict in verdicts:
+            if verdict.get("verdict") != 0:
+                continue
+            item = node_by_id.get(verdict["ref_id"]) or relation_by_id.get(verdict["ref_id"])
+            if item is None:
+                continue
+            entry = {
+                "ref_id": verdict["ref_id"],
+                "kind": verdict.get("kind"),
+                "name": item.name if hasattr(item, "name") else "",
+                "reason": verdict.get("reason", ""),
+                "correction": verdict.get("correction", ""),
+            }
+            for evidence in item.evidence:
+                if evidence.chunk_id in guidance:
+                    guidance[evidence.chunk_id].append(entry)
+        return {chunk_id: items for chunk_id, items in guidance.items() if items}
+
+    def _correct_result(
+        self,
+        result: ExtractionResult,
+        flagged_chunks: list[DocumentChunk],
+        lines: list[str],
+        state: ExtractionState,
+    ) -> ExtractionResult:
+        client = self._client(state)
+        node_store = {
+            node.id: NodeRecord(
+                id=node.id,
+                type=node.type,
+                name=node.name,
+                aliases=list(node.aliases),
+                description=node.description,
+                claim_kind=node.claim_kind,
+                evidence=list(node.evidence),
+            )
+            for node in result.nodes
+        }
+        relation_store = {
+            (relation.source_id, relation.type, relation.target_id): RelationRecord(
+                source_id=relation.source_id,
+                relation_type=relation.type,
+                target_id=relation.target_id,
+                evidences=list(relation.evidence),
+            )
+            for relation in result.relations
+        }
+        expression_store = {
+            (expression.owner_id, expression.role, expression.id): MathExpressionRecord(
+                id=expression.id,
+                owner_id=expression.owner_id,
+                role=expression.role,
+                latex=expression.latex,
+                evidences=list(expression.evidence),
+            )
+            for expression in result.math_expressions
+        }
+        guidance = self._verifier_guidance_by_chunk(result, flagged_chunks)
+        corrected_chunk_ids: list[str] = []
+        correction_summaries: list[dict[str, Any]] = []
+        for idx, chunk in enumerate(flagged_chunks, start=1):
+            node_memory, relation_memory, _ = self._build_memory_for_chunk(
+                chunk,
+                node_store,
+                relation_store,
+                expression_store,
+                recent_chunk_ids=set(),
+                node_char_budget=state.get("memory_node_bytes", 12000),
+                relation_char_budget=state.get("memory_relation_bytes", 6000),
+            )
+            working_node_store = {node_id: node.model_copy(deep=True) for node_id, node in node_store.items()}
+            working_relation_store = {key: relation.model_copy(deep=True) for key, relation in relation_store.items()}
+            working_expression_store = {key: expression.model_copy(deep=True) for key, expression in expression_store.items()}
+            self._log(
+                f"Verifier correcting chunk {idx}/{len(flagged_chunks)}: {chunk.id} "
+                f"L{chunk.start_line}-L{chunk.end_line}"
+            )
+            try:
+                payload = client.complete_json(
+                    self.system_prompt,
+                    self._chunk_extraction_prompt(
+                        chunk,
+                        state["input_path"],
+                        node_memory,
+                        relation_memory,
+                        verifier_guidance=guidance.get(chunk.id),
+                    ),
+                    label=f"{chunk.id}_correct",
+                )
+                response = self._validate_chunk_response(
+                    payload,
+                    chunk,
+                    state,
+                    client,
+                    corrected_chunk_ids,
+                    correction_summaries,
+                    len(node_store),
+                    len(relation_store),
+                    len(expression_store),
+                )
+                summary = self._merge_chunk_response(
+                    response,
+                    chunk,
+                    state["input_path"],
+                    lines,
+                    working_node_store,
+                    working_relation_store,
+                    working_expression_store,
+                    allowed_existing_ids={item.id for item in node_memory},
+                )
+            except ChunkMergeError:
+                raise
+            node_store = working_node_store
+            relation_store = working_relation_store
+            expression_store = working_expression_store
+            corrected_chunk_ids.append(chunk.id)
+            correction_summaries.append(summary)
+        return self._finalize_result(
+            state["input_path"],
+            lines,
+            node_store,
+            relation_store,
+            expression_store,
+            {
+                **dict(result.diagnostics),
+                "verify_corrections": {
+                    "corrected_chunk_ids": corrected_chunk_ids,
+                    "guidance_count": sum(len(items) for items in guidance.values()),
+                    "chunk_summaries": correction_summaries,
+                },
+            },
+        )
 
     def _source_latex_candidates_for_chunk(self, chunk: DocumentChunk) -> list[dict[str, Any]]:
         visible_lines = {
@@ -2454,6 +2972,128 @@ class Extractor:
             for candidate_id, (line_no, latex) in self.source_latex_candidates.items()
             if line_no in visible_lines
         ]
+
+    def _judge_same_concept(self, name_a: str, desc_a: str, name_b: str, desc_b: str) -> bool:
+        import os
+        import urllib.request
+
+        api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("DS_API_KEY")
+        if not api_key:
+            raise RuntimeError("semantic dedupe requires DEEPSEEK_API_KEY")
+        sys_prompt = (
+            "你是数学知识图谱的命名判定器。给定两个数学概念名及其上下文描述，判断它们"
+            "是否指代同一个数学对象。同一对象的不同写法（同义改写、措辞顺序不同、含 "
+            "f(x) 与否、“x→+∞”与“x趋于正无穷”等写法差异）应判定为同一；名称相近但指代"
+            "不同对象（如左极限与右极限、概念与其性质、“自变量趋于无穷大”这一趋近方式"
+            "与“自变量趋于无穷大时的函数极限”这一极限概念）应判定为不同。"
+            '只输出 JSON：{"same": true/false, "reason": "一句话理由"}'
+        )
+        user_prompt = (
+            f'概念A: "{name_a}"；描述：{desc_a}\n'
+            f'概念B: "{name_b}"；描述：{desc_b}\n'
+            "判断二者是否同一对象。"
+        )
+        payload = {
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+        }
+        req = urllib.request.Request(
+            "https://api.deepseek.com/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            content = json.loads(resp.read())["choices"][0]["message"]["content"]
+        try:
+            return bool(json.loads(content).get("same", False))
+        except json.JSONDecodeError:
+            return False
+
+    def _embed_texts(self, texts: list[str]) -> list[list[float]]:
+        """Batch embed texts via local ollama qwen3-embedding. Raises on failure;
+        callers decide how to degrade."""
+        import urllib.request
+
+        req = urllib.request.Request(
+            "http://localhost:11434/api/embed",
+            data=json.dumps({"model": "qwen3-embedding:0.6b", "input": texts}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read())["embeddings"]
+
+    @staticmethod
+    def _cosine(a: list[float], b: list[float]) -> float:
+        return sum(x * y for x, y in zip(a, b)) / (
+            (sum(x * x for x in a) ** 0.5) * (sum(y * y for y in b) ** 0.5)
+        )
+
+    def _semantic_duplicate_id(
+        self,
+        name: str,
+        description: str,
+        node_store: dict[str, NodeRecord],
+    ) -> str | None:
+        """Return the id of an existing Concept that the proposed name denotes,
+        per embedding retrieval + flash judge, else None. Any network failure
+        falls back to None so the dedupe machinery never breaks extraction."""
+        candidates = [record for record in node_store.values() if record.type == "Concept"]
+        if not candidates or not name.strip():
+            return None
+        try:
+            unembedded = [cand.id for cand in candidates if cand.id not in self._sem_embed_cache]
+            if unembedded:
+                embs = self._embed_texts([node_store[cid].name for cid in unembedded])
+                for cid, emb in zip(unembedded, embs):
+                    self._sem_embed_cache[cid] = emb
+            (query_emb,) = self._embed_texts([name])
+            best = max(
+                candidates, key=lambda cand: self._cosine(query_emb, self._sem_embed_cache[cand.id])
+            )
+            if self._cosine(query_emb, self._sem_embed_cache[best.id]) < 0.80:
+                return None
+            pair = (name, best.name)
+            if pair not in self._sem_judge_cache:
+                self._sem_judge_cache[pair] = self._judge_same_concept(
+                    name, description, best.name, best.description
+                )
+            return best.id if self._sem_judge_cache[pair] else None
+        except Exception:
+            return None
+
+    def _chunk_node_similarities(
+        self, chunk: DocumentChunk, node_store: dict[str, NodeRecord]
+    ) -> dict[str, float]:
+        """Batch-embed the chunk haystack and every node text; return node.id ->
+        cosine similarity. Empty dict on failure (caller falls back to rules)."""
+        haystack = "\n".join(
+            [chunk.text, chunk.context_before_text, chunk.context_after_text, " ".join(chunk.heading_path)]
+        )
+        try:
+            if chunk.id not in self._chunk_embed_cache:
+                (query_emb,) = self._embed_texts([haystack])
+                self._chunk_embed_cache[chunk.id] = query_emb
+            query_emb = self._chunk_embed_cache[chunk.id]
+            unembedded = [node for node in node_store.values() if node.id not in self._sem_embed_cache]
+            if unembedded:
+                texts = [
+                    " ".join([node.name, *node.aliases, node.description[:100]])
+                    for node in unembedded
+                ]
+                embs = self._embed_texts(texts)
+                for node, emb in zip(unembedded, embs):
+                    self._sem_embed_cache[node.id] = emb
+            return {
+                node.id: self._cosine(query_emb, self._sem_embed_cache[node.id])
+                for node in node_store.values()
+            }
+        except Exception:
+            return {}
 
     def _merge_chunk_response(
         self,
@@ -2549,24 +3189,37 @@ class Extractor:
                         if final_id in allowed_existing_ids
                         else "memory_retrieval_miss"
                     )
-                    fail(
-                        "node_action",
-                        ref_id,
-                        f"{conflict_kind}: canonical {node_type} name already exists as {final_id}: "
-                        f"{sanitized.name}",
+                    if not self.semantic_dedupe:
+                        fail(
+                            "node_action",
+                            ref_id,
+                            f"{conflict_kind}: canonical {node_type} name already exists as {final_id}: "
+                            f"{sanitized.name}",
+                            {
+                                "conflict_kind": conflict_kind,
+                                "proposed_type": node_type,
+                                "proposed_name": sanitized.name,
+                                "existing_id": final_id,
+                                "existing_type": node_store[final_id].type,
+                                "existing_name": node_store[final_id].name,
+                                "existing_was_in_node_memory": final_id in allowed_existing_ids,
+                                "start_line": evidence.start_line,
+                                "end_line": evidence.end_line,
+                                "reason": action.reason.strip(),
+                            },
+                        )
+                    planned_nodes.append(
                         {
-                            "conflict_kind": conflict_kind,
-                            "proposed_type": node_type,
-                            "proposed_name": sanitized.name,
+                            "action": action,
+                            "kind": "reuse",
                             "existing_id": final_id,
-                            "existing_type": node_store[final_id].type,
-                            "existing_name": node_store[final_id].name,
-                            "existing_was_in_node_memory": final_id in allowed_existing_ids,
-                            "start_line": evidence.start_line,
-                            "end_line": evidence.end_line,
-                            "reason": action.reason.strip(),
-                        },
+                            "evidence": evidence,
+                            "extra_aliases": [sanitized.name],
+                            "semantic_merged": True,
+                        }
                     )
+                    ref_to_final[ref_id] = final_id
+                    continue
                 if final_id in planned_node_type:
                     fail(
                         "node_action",
@@ -2585,6 +3238,23 @@ class Extractor:
                             "reason": action.reason.strip(),
                         },
                     )
+                if self.semantic_dedupe and node_type == "Concept":
+                    duplicate_id = self._semantic_duplicate_id(
+                        sanitized.name, sanitized.description, node_store
+                    )
+                    if duplicate_id is not None:
+                        planned_nodes.append(
+                            {
+                                "action": action,
+                                "kind": "reuse",
+                                "existing_id": duplicate_id,
+                                "evidence": evidence,
+                                "extra_aliases": [sanitized.name],
+                                "semantic_merged": True,
+                            }
+                        )
+                        ref_to_final[ref_id] = duplicate_id
+                        continue
                 planned_node_type[final_id] = node_type
                 planned_node_name[final_id] = sanitized.name
                 planned_nodes.append(
@@ -2692,6 +3362,15 @@ class Extractor:
             if plan["kind"] == "reuse":
                 existing = node_store[plan["existing_id"]]
                 merge_outcome = self._merge_reuse_action(existing, action, evidence)
+                extra_aliases = plan.get("extra_aliases") or []
+                if extra_aliases:
+                    previous_aliases = list(existing.aliases)
+                    existing.aliases = _canonical_aliases(
+                        existing.name, [*existing.aliases, *extra_aliases]
+                    )
+                    merge_outcome["aliases_added"] = [
+                        alias for alias in existing.aliases if alias not in previous_aliases
+                    ]
                 final_id = existing.id
                 reused_node_count += 1
             else:
@@ -2713,20 +3392,22 @@ class Extractor:
                     "aliases_added": [],
                     "description_action": "created",
                 }
-            decisions.append(
-                {
-                    "chunk_id": chunk.id,
-                    "ref_id": ref_id,
-                    "mention": action.mention.strip(),
-                    "action": action.action,
-                    "node_id": final_id,
-                    "start_line": evidence.start_line,
-                    "end_line": evidence.end_line,
-                    "reason": action.reason.strip(),
-                    "status": "accepted",
-                    **merge_outcome,
-                }
-            )
+            decision = {
+                "chunk_id": chunk.id,
+                "ref_id": ref_id,
+                "mention": action.mention.strip(),
+                "action": action.action,
+                "node_id": final_id,
+                "start_line": evidence.start_line,
+                "end_line": evidence.end_line,
+                "reason": action.reason.strip(),
+                "status": "accepted",
+                **merge_outcome,
+            }
+            if plan.get("semantic_merged"):
+                decision["action"] = "semantic_reuse"
+                decision["semantic_merged_to"] = final_id
+            decisions.append(decision)
 
         new_relation_count = 0
         for plan in planned_relations:
@@ -3347,6 +4028,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quiet", action="store_true", help="Suppress progress logs.")
     parser.add_argument("--no-response-format", action="store_true", help="Disable JSON response_format for providers that support it.")
     parser.add_argument("--no-proxy", action="store_true", help="Ignore HTTP(S)_PROXY environment variables for model API calls.")
+    parser.add_argument("--verify", action="store_true", help="Run a post-extraction verifier pass over the result graph.")
+    parser.add_argument("--verify-model", default=None, help="Model used by the verifier (default: deepseek-v4-flash).")
+    parser.add_argument(
+        "--semantic-dedupe",
+        action="store_true",
+        help="Merge creates that denote an already-known Concept (embedding retrieval + flash judge).",
+    )
+    parser.add_argument(
+        "--embedding-memory",
+        action="store_true",
+        help="Add an embedding similarity component to node_memory selection (qwen3-embedding via ollama).",
+    )
+    parser.add_argument(
+        "--seed-graph",
+        default=None,
+        help="Path to a previously extracted KG JSON to seed the node/relation store "
+        "(incremental update). Seed nodes participate in memory and dedupe; relations "
+        "dedupe by exact (source, type, target) key against seed relations.",
+    )
     parser.add_argument("--check-config", action="store_true", help="Check the selected provider configuration without calling the model.")
     return parser
 
@@ -3396,6 +4096,11 @@ def main() -> None:
         resume=not args.no_resume,
         include_exercises=args.include_exercises,
         verbose=not args.quiet,
+        verify=args.verify,
+        verify_model=args.verify_model,
+        semantic_dedupe=args.semantic_dedupe,
+        embedding_memory=args.embedding_memory,
+        seed_graph_path=args.seed_graph,
     )
     try:
         result = extractor.run()

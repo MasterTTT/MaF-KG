@@ -3,3 +3,6 @@ node_cache/
 __pycache__/
 *.py[cod]
 .venv/
+.claude/
+tmp/
+.tmp_*.txt

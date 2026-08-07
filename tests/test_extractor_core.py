@@ -16,15 +16,20 @@ from agents.Extractor import (
     DocumentChunk,
     Evidence,
     EvidenceRef,
+    ExtractionResult,
     Extractor,
+    KGNode,
+    KGRelation,
     NodeAction,
     NodeMemoryItem,
     NodeRecord,
     ProviderChatClient,
     RelationMemoryItem,
     RelationRecord,
+    VerifyResponse,
     _node_id,
     _normalize_name,
+    classify_definition_segments,
 )
 
 
@@ -184,6 +189,209 @@ class MemoryMergeTests(unittest.TestCase):
                 self.assertEqual(cm.exception.details["conflict_kind"], expected)
                 self.assertIn(existing.id, store)
                 self.assertEqual(store[existing.id].description, "已有定义")
+
+
+class SemanticDedupeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.extractor = Extractor(save_output=False, verbose=False, semantic_dedupe=True)
+
+    def existing(self, name: str, aliases: list[str] | None = None) -> NodeRecord:
+        return NodeRecord(
+            id=_node_id("Concept", name),
+            type="Concept",
+            name=name,
+            aliases=aliases or [],
+            description=f"{name}的已有定义",
+            evidence=[],
+        )
+
+    def merge(self, store: dict[str, NodeRecord], name: str, mention: str = "") -> dict:
+        chunk = DocumentChunk(
+            id="chunk_1",
+            start_line=1,
+            end_line=1,
+            heading_path=["第一节"],
+            text="1: " + name,
+        )
+        self.extractor.source_context_by_line = {1: (["第一节"], "teaching_1", "paragraph")}
+        response = ChunkExtractionResponse(
+            node_actions=[
+                NodeAction(
+                    ref_id="c1",
+                    action="create",
+                    mention=mention or name,
+                    type="Concept",
+                    name=name,
+                    description=f"{name}的新定义",
+                    evidence=EvidenceRef(start_line=1, end_line=1),
+                )
+            ]
+        )
+        return self.extractor._merge_chunk_response(
+            response, chunk, "source.md", [name], store, {}, {}, allowed_existing_ids=set()
+        )
+
+    def test_identity_collision_is_rescued_as_reuse_under_semantic_dedupe(self) -> None:
+        existing = self.existing("复合函数")
+        store = {existing.id: existing}
+        summary = self.merge(store, "复合函数")
+        self.assertEqual(summary["reused_node_count"], 1)
+        self.assertEqual(summary["created_node_count"], 0)
+        self.assertEqual(len(store), 1)
+        self.assertEqual(store[existing.id].description, "复合函数的新定义")
+        decision = summary["decisions"][0]
+        self.assertEqual(decision["action"], "semantic_reuse")
+        self.assertEqual(decision["semantic_merged_to"], existing.id)
+
+    def test_drift_variant_merges_to_known_concept_with_alias(self) -> None:
+        existing = self.existing("自变量趋于正无穷时的函数极限")
+        store = {existing.id: existing}
+        drift_name = "函数 f(x) 当 x → +∞ 时的极限"
+        self.extractor._semantic_duplicate_id = lambda name, desc, node_store: existing.id
+        summary = self.merge(store, drift_name)
+        self.assertEqual(summary["reused_node_count"], 1)
+        self.assertEqual(summary["created_node_count"], 0)
+        self.assertEqual(len(store), 1)
+        self.assertIn(drift_name, store[existing.id].aliases)
+        self.assertEqual(summary["decisions"][0]["action"], "semantic_reuse")
+        self.assertEqual(summary["decisions"][0]["semantic_merged_to"], existing.id)
+
+    def test_judge_different_keeps_create(self) -> None:
+        existing = self.existing("左极限")
+        store = {existing.id: existing}
+        self.extractor._semantic_duplicate_id = lambda name, desc, node_store: None
+        summary = self.merge(store, "右极限")
+        self.assertEqual(summary["created_node_count"], 1)
+        self.assertEqual(summary["reused_node_count"], 0)
+        self.assertEqual(len(store), 2)
+        self.assertIn(_node_id("Concept", "右极限"), store)
+
+    def test_flag_off_keeps_plain_create_even_if_duplicate_found(self) -> None:
+        plain = Extractor(save_output=False, verbose=False, semantic_dedupe=False)
+        existing = self.existing("自变量趋于正无穷时的函数极限")
+        store = {existing.id: existing}
+        plain._semantic_duplicate_id = lambda name, desc, node_store: existing.id
+        chunk = DocumentChunk(
+            id="chunk_1",
+            start_line=1,
+            end_line=1,
+            heading_path=["第一节"],
+            text="1: 函数当 x → +∞ 时的极限",
+        )
+        plain.source_context_by_line = {1: (["第一节"], "teaching_1", "paragraph")}
+        response = ChunkExtractionResponse(
+            node_actions=[
+                NodeAction(
+                    ref_id="c1",
+                    action="create",
+                    mention="函数当 x → +∞ 时的极限",
+                    type="Concept",
+                    name="函数当 x → +∞ 时的极限",
+                    description="定义",
+                    evidence=EvidenceRef(start_line=1, end_line=1),
+                )
+            ]
+        )
+        summary = plain._merge_chunk_response(
+            response,
+            chunk,
+            "source.md",
+            ["函数当 x → +∞ 时的极限"],
+            store,
+            {},
+            {},
+            allowed_existing_ids=set(),
+        )
+        self.assertEqual(summary["created_node_count"], 1)
+        self.assertEqual(len(store), 2)
+
+
+class EmbeddingMemoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.extractor = Extractor(save_output=False, verbose=False, embedding_memory=True)
+
+    def test_embedding_component_raises_rule_score_when_similar(self) -> None:
+        chunk = DocumentChunk(
+            id="chunk_1",
+            start_line=1,
+            end_line=1,
+            heading_path=["第三节"],
+            text="1: 函数当 x → +∞ 时的极限",
+        )
+        node = NodeRecord(
+            id=_node_id("Concept", "自变量趋于正无穷时的函数极限"),
+            type="Concept",
+            name="自变量趋于正无穷时的函数极限",
+            aliases=[],
+            description="当 x 趋于正无穷时函数 f(x) 的极限",
+            evidence=[],
+        )
+        self.extractor._embed_texts = lambda texts: [
+            [1.0, 0.0, 0.0] if "函数当" in texts[0] else [0.9, 0.1, 0.0] for text in texts
+        ]
+        score, reasons = self.extractor._node_memory_relevance(
+            chunk, node, [], set(), embed_sim=0.9
+        )
+        self.assertGreater(score, 2.0)
+        self.assertTrue(any(reason.startswith("embedding:") for reason in reasons))
+
+    def test_embedding_below_floor_is_ignored(self) -> None:
+        chunk = DocumentChunk(id="c", start_line=1, end_line=1, heading_path=[], text="1: x")
+        node = NodeRecord(
+            id=_node_id("Concept", "极限"), type="Concept", name="极限", aliases=[], evidence=[]
+        )
+        score, reasons = self.extractor._node_memory_relevance(chunk, node, [], set(), embed_sim=0.10)
+        self.assertFalse(any(reason.startswith("embedding:") for reason in reasons))
+
+    def test_flag_off_makes_no_embedding_calls(self) -> None:
+        plain = Extractor(save_output=False, verbose=False)
+        chunk = DocumentChunk(
+            id="chunk_1",
+            start_line=1,
+            end_line=1,
+            heading_path=["第三节"],
+            text="1: 函数极限",
+        )
+        node = NodeRecord(
+            id=_node_id("Concept", "函数极限"),
+            type="Concept",
+            name="函数极限",
+            aliases=[],
+            description="定义",
+            evidence=[],
+        )
+        plain._embed_texts = lambda texts: (_ for _ in ()).throw(AssertionError("no embed calls"))
+        plain._chunk_node_similarities = (
+            lambda chunk, store: (_ for _ in ()).throw(AssertionError("no similarity calls"))
+        )
+        store = {node.id: node}
+        memory, _, _ = plain._build_memory_for_chunk(
+            chunk, store, {}, {}, set(), node_char_budget=12000, relation_char_budget=6000
+        )
+        self.assertEqual([item.id for item in memory], [node.id])
+
+    def test_embedding_failure_falls_back_to_rules(self) -> None:
+        chunk = DocumentChunk(
+            id="chunk_1",
+            start_line=1,
+            end_line=1,
+            heading_path=["第三节"],
+            text="1: 函数极限",
+        )
+        node = NodeRecord(
+            id=_node_id("Concept", "函数极限"),
+            type="Concept",
+            name="函数极限",
+            aliases=[],
+            description="定义",
+            evidence=[],
+        )
+        self.extractor._chunk_node_similarities = lambda chunk, store: {}
+        store = {node.id: node}
+        memory, _, _ = self.extractor._build_memory_for_chunk(
+            chunk, store, {}, {}, set(), node_char_budget=12000, relation_char_budget=6000
+        )
+        self.assertEqual([item.id for item in memory], [node.id])
 
 
 class ClaimKindTests(unittest.TestCase):
@@ -661,6 +869,237 @@ class StructureAwareChunkTests(unittest.TestCase):
                     "diagnostics": {},
                 }
             )
+
+    def test_definition_block_kind_detected(self) -> None:
+        extractor = Extractor(save_output=False, verbose=False)
+        lines = [
+            "# 第一节 函数",
+            "定义1 设函数 $f(x)$ 在点 $x_0$ 的某一去心邻域内有定义。",
+            "如果存在常数 $A$，那么常数 $A$ 就叫做函数 $f(x)$ 当 $x \\to x_0$ 时的极限。",
+            "定义 设数集 $D$ 为非空集合。",
+        ]
+        extractor._chunk_document(
+            {
+                "raw_lines": lines,
+                "max_chunk_chars": 3200,
+                "chunk_context_before_lines": 0,
+                "chunk_context_after_lines": 0,
+                "diagnostics": {},
+            }
+        )
+        self.assertEqual(extractor.source_context_by_line[2][2], "definition")
+        self.assertEqual(extractor.source_context_by_line[3][2], "definition")
+        self.assertEqual(extractor.source_context_by_line[4][2], "definition")
+
+    def test_definition_mention_without_设_is_not_a_block(self) -> None:
+        extractor = Extractor(save_output=False, verbose=False)
+        lines = [
+            "# 第一节 函数",
+            "定义函数。",
+            "根据定义可得该结论。",
+        ]
+        extractor._chunk_document(
+            {
+                "raw_lines": lines,
+                "max_chunk_chars": 3200,
+                "chunk_context_before_lines": 0,
+                "chunk_context_after_lines": 0,
+                "diagnostics": {},
+            }
+        )
+        self.assertEqual(extractor.source_context_by_line[2][2], "paragraph")
+        self.assertEqual(extractor.source_context_by_line[3][2], "paragraph")
+
+    def test_teaching_unit_kind_definition_group(self) -> None:
+        extractor = Extractor(save_output=False, verbose=False)
+        state = extractor._chunk_document(
+            {
+                "raw_lines": [
+                    "# 第一节 函数",
+                    "定义1 设函数 $f(x)$ 在点 $x_0$ 的去心邻域内有定义。",
+                    "那么常数 $A$ 就叫做函数 $f(x)$ 当 $x \\to x_0$ 时的极限。",
+                    "定义2 设函数 $f(x)$ 当 $|x|$ 大于某一正数时有定义。",
+                    "那么常数 $A$ 叫做函数 $f(x)$ 当 $x \\to \\infty$ 时的极限。",
+                ],
+                "max_chunk_chars": 3200,
+                "chunk_strategy": "teaching-units",
+                "chunk_context_before_lines": 0,
+                "chunk_context_after_lines": 0,
+                "diagnostics": {},
+            }
+        )
+        self.assertEqual(
+            [chunk.teaching_unit_kind for chunk in state["chunks"]],
+            ["definition_group"],
+        )
+        self.assertEqual(len(state["chunks"][0].anchor_block_ids), 2)
+
+    def test_definition_theorem_family_bundled_into_one_chunk(self) -> None:
+        extractor = Extractor(save_output=False, verbose=False)
+        state = extractor._chunk_document(
+            {
+                "raw_lines": [
+                    "# 第一节 函数",
+                    "定义1 设函数 $f(x)$ 在点 $x_0$ 的去心邻域内有定义。",
+                    "那么常数 $A$ 就叫做函数 $f(x)$ 当 $x \\to x_0$ 时的极限。",
+                    "定理1 函数 $f(x)$ 当 $x \\to x_0$ 时极限唯一。",
+                    "证 由定义直接可得。",
+                    "性质1 极限与去心邻域无关。",
+                ],
+                "max_chunk_chars": 3200,
+                "chunk_strategy": "teaching-units",
+                "chunk_context_before_lines": 0,
+                "chunk_context_after_lines": 0,
+                "diagnostics": {},
+            }
+        )
+        self.assertEqual(
+            [chunk.teaching_unit_kind for chunk in state["chunks"]],
+            ["definition_theorem_family"],
+        )
+        family = state["chunks"][0]
+        self.assertIn("定理1", family.text)
+        self.assertIn("证", family.text)
+        self.assertIn("定义1", family.text)
+
+    def test_definition_theorem_family_splits_when_definition_followed_by_heading(self) -> None:
+        extractor = Extractor(save_output=False, verbose=False)
+        state = extractor._chunk_document(
+            {
+                "raw_lines": [
+                    "# 第一节 函数",
+                    "定义1 设函数 $f(x)$ 在点 $x_0$ 的去心邻域内有定义。",
+                    "那么常数 $A$ 就叫做函数 $f(x)$ 当 $x \\to x_0$ 时的极限。",
+                    "# 二、函数极限的性质",
+                    "性质1 极限与去心邻域无关。",
+                ],
+                "max_chunk_chars": 3200,
+                "chunk_strategy": "teaching-units",
+                "chunk_context_before_lines": 0,
+                "chunk_context_after_lines": 0,
+                "diagnostics": {},
+            }
+        )
+        self.assertEqual(
+            [chunk.teaching_unit_kind for chunk in state["chunks"]],
+            ["definition", "property"],
+        )
+
+    def test_defined_term_hints_extract_template_definitions(self) -> None:
+        extractor = Extractor(save_output=False, verbose=False)
+        hints = extractor._extract_defined_terms(
+            "那么常数 $A$ 就叫做函数 $f(x)$ 当 $x \\to x_0$ 时的极限，记作\n"
+            "左极限与右极限统称为单侧极限。\n"
+            "那么称函数 $f(x)$ 为当 $x \\to x_0$ 时的无穷小。"
+        )
+        terms = [hint["term"] for hint in hints]
+        self.assertIn("函数 f(x) 当 x \\to x_0 时的极限", terms)
+        self.assertIn("单侧极限", terms)
+        self.assertIn("当 x \\to x_0 时的无穷小", terms)
+        for hint in hints:
+            self.assertNotIn("$", hint["term"])
+        for hint in hints:
+            self.assertIn("term", hint)
+            self.assertIn("context", hint)
+
+    def test_chunk_prompt_includes_defined_term_hints(self) -> None:
+        extractor = Extractor(save_output=False, verbose=False)
+        state = extractor._chunk_document(
+            {
+                "raw_lines": [
+                    "# 第一节 函数",
+                    "定义1 设函数 $f(x)$ 在点 $x_0$ 的去心邻域内有定义。",
+                    "那么常数 $A$ 就叫做函数 $f(x)$ 当 $x \\to x_0$ 时的极限，记作",
+                    "$$",
+                    "\\lim_{x\\to x_0}f(x)=A",
+                    "$$",
+                ],
+                "max_chunk_chars": 3200,
+                "chunk_context_before_lines": 0,
+                "chunk_context_after_lines": 0,
+                "diagnostics": {},
+            }
+        )
+        prompt = extractor._chunk_extraction_prompt(
+            state["chunks"][0],
+            "test.md",
+            [],
+            [],
+        )
+        payload = json.loads(prompt)
+        self.assertTrue(payload["defined_term_hints"])
+        self.assertIn(
+            "函数 f(x) 当 x \\to x_0 时的极限",
+            [hint["term"] for hint in payload["defined_term_hints"]],
+        )
+
+    def test_definition_segment_roles_labeled_from_signal_words(self) -> None:
+        segments = classify_definition_segments(
+            [
+                (10, "定义1 设函数 $f(x)$ 在点 $x_0$ 的去心邻域内有定义。"),
+                (11, "这里我们指出，极限值与函数在该点的值无关。"),
+                (12, "也就是说，$\lim_{x\\to x_0}f(x)=A$。"),
+                (13, "从几何上来说，当 $x$ 趋于 $x_0$ 时曲线无限接近直线 $y=A$。"),
+                (14, "我们需要注意，上述结论只在邻域内成立。"),
+            ]
+        )
+        roles = [role for role, _, _ in segments]
+        self.assertEqual(roles[0], "exposition")
+        self.assertEqual(roles[1], "meta_annotation")
+        self.assertEqual(roles[2], "symbolic_restatement")
+        self.assertEqual(roles[3], "geometric_interpretation")
+        self.assertEqual(roles[4], "meta_annotation")
+
+    def test_definition_segments_merge_contiguous_same_role_lines(self) -> None:
+        segments = classify_definition_segments(
+            [
+                (10, "定义 设数集 $D$ 为非空集合。"),
+                (11, "从几何上来说，这是实数轴上的一个区间。"),
+                (12, "从图形上看，数集对应数轴上的点集。"),
+                (13, "也就是说是数轴上的一段。"),
+            ]
+        )
+        self.assertEqual(len(segments), 3)
+        self.assertEqual(segments[0], ("exposition", 10, 10))
+        self.assertEqual(segments[1], ("geometric_interpretation", 11, 12))
+        self.assertEqual(segments[2], ("symbolic_restatement", 13, 13))
+
+    def test_definition_segments_serialized_in_chunk_payload(self) -> None:
+        extractor = Extractor(save_output=False, verbose=False)
+        state = extractor._chunk_document(
+            {
+                "raw_lines": [
+                    "# 第一节 函数",
+                    "定义1 设函数 $f(x)$ 在点 $x_0$ 的去心邻域内有定义。",
+                    "这里我们指出，极限值与函数在该点的值无关。",
+                    "从几何上来说，曲线无限接近直线 $y=A$。",
+                ],
+                "max_chunk_chars": 3200,
+                "chunk_context_before_lines": 0,
+                "chunk_context_after_lines": 0,
+                "diagnostics": {},
+            }
+        )
+        prompt = extractor._chunk_extraction_prompt(
+            state["chunks"][0],
+            "test.md",
+            [],
+            [],
+        )
+        payload = json.loads(prompt)
+        definition_block = next(
+            blk
+            for blk in payload["chunk"]["teaching_blocks"]
+            if blk["discourse_role"] == "definition"
+        )
+        roles = [seg["role"] for seg in definition_block["segments"]]
+        self.assertEqual(roles, ["exposition", "meta_annotation", "geometric_interpretation"])
+        self.assertEqual(
+            definition_block["segments"][0],
+            {"role": "exposition", "start_line": 2, "end_line": 2},
+        )
+        self.assertIn("start_line", definition_block["segments"][1])
+        self.assertIn("end_line", definition_block["segments"][1])
 
 
 class StrictMergeTests(unittest.TestCase):
@@ -1417,6 +1856,342 @@ class ApiCompletionTests(unittest.TestCase):
             client.request_history[0]["usage"]["completion_tokens_details"]["reasoning_tokens"],
             12000,
         )
+
+
+class VerifierTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.extractor = Extractor(save_output=False, verbose=False, verify=True)
+        self.evidence1 = Evidence(
+            source_path="source.md",
+            start_line=1,
+            end_line=1,
+            text="函数定义",
+            chunk_id="chunk_1",
+            teaching_block_id="t1",
+            discourse_role="paragraph",
+        )
+        self.evidence2 = Evidence(
+            source_path="source.md",
+            start_line=2,
+            end_line=2,
+            text="极限定义",
+            chunk_id="chunk_2",
+            teaching_block_id="t2",
+            discourse_role="paragraph",
+        )
+        self.node1 = KGNode(
+            id="concept_函数_test1",
+            type="Concept",
+            name="函数",
+            aliases=[],
+            description="映射",
+            claim_kind=None,
+            evidence=[self.evidence1],
+        )
+        self.node2 = KGNode(
+            id="concept_极限_test2",
+            type="Concept",
+            name="极限",
+            aliases=[],
+            description="趋近值",
+            claim_kind=None,
+            evidence=[self.evidence2],
+        )
+        self.result = ExtractionResult(
+            schema_version="maf-kg.semantic.v1.5.9",
+            source_path="source.md",
+            title="第一章",
+            provider="deepseek",
+            model="deepseek-v4-pro",
+            nodes=[self.node1, self.node2],
+            relations=[
+                KGRelation(
+                    id="relation_x",
+                    type="defined_in_terms_of",
+                    source_id=self.node1.id,
+                    target_id=self.node2.id,
+                    evidence=[self.evidence2],
+                )
+            ],
+            math_expressions=[],
+            diagnostics={},
+        )
+        self.chunk1 = DocumentChunk(
+            id="chunk_1", start_line=1, end_line=1, heading_path=[], text="1: 函数"
+        )
+        self.chunk2 = DocumentChunk(
+            id="chunk_2", start_line=2, end_line=2, heading_path=[], text="2: 极限"
+        )
+        self.extractor.source_context_by_line = {
+            1: (["第一节"], "t1", "paragraph"),
+            2: (["第一节"], "t2", "paragraph"),
+        }
+        self.extractor.source_latex_candidates = {}
+
+    def test_verify_prompt_contains_all_nodes_and_evidence(self) -> None:
+        prompt = self.extractor._build_verify_prompt(self.result)
+        self.assertIn("concept_函数_test1", prompt)
+        self.assertIn("concept_极限_test2", prompt)
+        self.assertIn("函数定义", prompt)
+        self.assertIn("defined_in_terms_of", prompt)
+        parsed = json.loads(prompt)
+        self.assertEqual(parsed["node_count"], 2)
+        self.assertEqual(parsed["relation_count"], 1)
+        self.assertEqual(parsed["relations"][0]["source_name"], "函数")
+        self.assertEqual(parsed["relations"][0]["target_name"], "极限")
+
+    def test_verify_prompt_evidence_truncation(self) -> None:
+        long_text = "定义" * 400
+        node = KGNode(
+            id="concept_长定义_test",
+            type="Concept",
+            name="长定义",
+            aliases=[],
+            description="",
+            claim_kind=None,
+            evidence=[
+                Evidence(
+                    source_path="source.md",
+                    start_line=1,
+                    end_line=1,
+                    text=long_text,
+                    chunk_id="chunk_1",
+                    teaching_block_id="t1",
+                    discourse_role="paragraph",
+                )
+            ],
+        )
+        result = self.result.model_copy(deep=True)
+        result.nodes = [node]
+        prompt = self.extractor._build_verify_prompt(result)
+        parsed = json.loads(prompt)
+        self.assertLessEqual(len(parsed["nodes"][0]["evidence"][0]["text"]), 500)
+
+    def test_verify_response_parses_valid_verdicts(self) -> None:
+        payload = {
+            "verdicts": [
+                {
+                    "ref_id": "n1",
+                    "kind": "node",
+                    "verdict": 0,
+                    "reason": "unsupported",
+                    "correction": "fix it",
+                },
+                {"ref_id": "r1", "kind": "relation", "verdict": 1},
+            ],
+            "notes": ["pattern observed"],
+        }
+        parsed = VerifyResponse.model_validate(payload)
+        self.assertEqual(len(parsed.verdicts), 2)
+        self.assertEqual(parsed.verdicts[0].verdict, 0)
+        self.assertEqual(parsed.verdicts[0].correction, "fix it")
+        self.assertEqual(parsed.verdicts[1].verdict, 1)
+        self.assertEqual(parsed.notes, ["pattern observed"])
+
+    def test_verify_result_preserves_original_on_api_failure(self) -> None:
+        fake_client = SimpleNamespace(
+            complete_json=lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("api down")
+            ),
+            request_history=[],
+        )
+        state = {
+            "provider": "deepseek",
+            "base_url": "https://api.deepseek.com",
+            "request_timeout": 1,
+            "max_retries": 0,
+            "no_proxy": True,
+        }
+        with patch.object(self.extractor, "_verify_client", return_value=fake_client):
+            out = self.extractor._verify_result(self.result, state)
+        self.assertIs(out, self.result)
+        self.assertEqual(out.diagnostics["verify"]["status"], "failed")
+        self.assertIn("RuntimeError", out.diagnostics["verify"]["error"])
+        self.assertEqual(len(out.nodes), 2)
+        self.assertEqual(len(out.relations), 1)
+
+    def test_verify_result_preserves_original_on_parse_failure(self) -> None:
+        fake_client = SimpleNamespace(
+            complete_json=lambda *args, **kwargs: {
+                "verdicts": [
+                    {"ref_id": "n1", "kind": "node", "verdict": 5},
+                ]
+            },
+            request_history=[],
+        )
+        state = {
+            "provider": "deepseek",
+            "base_url": "https://api.deepseek.com",
+            "request_timeout": 1,
+            "max_retries": 0,
+            "no_proxy": True,
+        }
+        with patch.object(self.extractor, "_verify_client", return_value=fake_client):
+            out = self.extractor._verify_result(self.result, state)
+        self.assertIs(out, self.result)
+        self.assertEqual(out.diagnostics["verify"]["status"], "failed")
+        self.assertEqual(len(out.nodes), 2)
+
+    def test_verify_result_records_verdicts_on_success(self) -> None:
+        verdict_payload = {
+            "verdicts": [
+                {"ref_id": self.node1.id, "kind": "node", "verdict": 1},
+                {"ref_id": "relation_x", "kind": "relation", "verdict": 0, "reason": "bad"},
+            ],
+            "notes": [],
+        }
+        fake_client = SimpleNamespace(
+            complete_json=lambda *args, **kwargs: verdict_payload,
+            request_history=[],
+        )
+        state = {
+            "provider": "deepseek",
+            "base_url": "https://api.deepseek.com",
+            "request_timeout": 1,
+            "max_retries": 0,
+            "no_proxy": True,
+        }
+        with patch.object(self.extractor, "_verify_client", return_value=fake_client):
+            out = self.extractor._verify_result(self.result, state)
+        self.assertEqual(out.diagnostics["verify"]["status"], "completed")
+        self.assertEqual(out.diagnostics["verify"]["flagged_node_count"], 0)
+        self.assertEqual(out.diagnostics["verify"]["flagged_relation_count"], 1)
+
+    def test_collect_flagged_chunks_identifies_correct_chunks(self) -> None:
+        self.result.diagnostics["verify"] = {
+            "verdicts": [
+                {"ref_id": self.node1.id, "kind": "node", "verdict": 0},
+                {"ref_id": "relation_x", "kind": "relation", "verdict": 1},
+            ]
+        }
+        flagged = self.extractor._collect_flagged_chunks(
+            self.result, [self.chunk1, self.chunk2]
+        )
+        self.assertEqual([chunk.id for chunk in flagged], ["chunk_1"])
+
+    def test_correction_applies_only_to_flagged_chunks(self) -> None:
+        self.result.diagnostics["verify"] = {
+            "verdicts": [
+                {
+                    "ref_id": self.node1.id,
+                    "kind": "node",
+                    "verdict": 0,
+                    "reason": "evidence does not define 函数",
+                    "correction": "re-extract",
+                }
+            ]
+        }
+        calls: list[str] = []
+        client = SimpleNamespace(
+            complete_json=lambda system, user, label: calls.append(label) or {
+                "node_actions": [],
+                "relations": [],
+                "expressions": [],
+                "notes": [],
+            },
+            request_history=[],
+        )
+        state = {
+            "input_path": "source.md",
+            "output_path": "result.json",
+            "provider": "deepseek",
+            "model": "deepseek-v4-pro",
+            "base_url": "https://api.deepseek.com",
+            "temperature": 0.1,
+            "thinking": "enabled",
+            "reasoning_effort": "medium",
+            "max_tokens": 4096,
+            "request_timeout": 1,
+            "max_retries": 0,
+            "no_proxy": True,
+            "resume": False,
+            "request_delay": 0,
+            "memory_node_bytes": 12000,
+            "memory_relation_bytes": 6000,
+            "diagnostics": {},
+        }
+        with (
+            patch.object(self.extractor, "_client", return_value=client),
+            patch.object(self.extractor, "_write_chunk_cache"),
+        ):
+            out = self.extractor._correct_result(
+                self.result, [self.chunk1], ["函数", "极限"], state
+            )
+        self.assertEqual(calls, ["chunk_1_correct"])
+        self.assertEqual(
+            out.diagnostics["verify_corrections"]["corrected_chunk_ids"], ["chunk_1"]
+        )
+        self.assertEqual(out.diagnostics["verify_corrections"]["guidance_count"], 1)
+
+    def test_verify_disabled_preserves_original_flow(self) -> None:
+        extractor = Extractor(save_output=False, verbose=False, verify=False)
+        self.assertEqual(extractor.verify_prompt, "")
+        extractor.source_context_by_line = {
+            1: (["第一节"], "t1", "paragraph"),
+        }
+        extractor.source_latex_candidates = {}
+        payload = {
+            "node_actions": [
+                {
+                    "ref_id": "c1",
+                    "action": "create",
+                    "type": "Concept",
+                    "name": "函数",
+                    "description": "定义",
+                    "evidence": {"start_line": 1, "end_line": 1},
+                }
+            ],
+            "relations": [],
+            "expressions": [],
+            "notes": [],
+        }
+        chunk = DocumentChunk(
+            id="chunk_1", start_line=1, end_line=1, heading_path=[], text="1: 函数"
+        )
+        state = {
+            "input_path": "source.md",
+            "output_path": "result.json",
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash",
+            "base_url": "https://api.deepseek.com",
+            "temperature": 0.1,
+            "thinking": "enabled",
+            "reasoning_effort": "medium",
+            "max_tokens": 4096,
+            "raw_lines": ["函数"],
+            "chunks": [chunk],
+            "diagnostics": {},
+            "resume": False,
+            "request_delay": 0,
+            "save_output": False,
+            "memory_node_bytes": 12000,
+            "memory_relation_bytes": 6000,
+            "use_response_format": True,
+            "no_proxy": True,
+            "max_chunk_chars": 3200,
+            "chunk_strategy": "budget",
+            "chunk_context_before_lines": 6,
+            "chunk_context_after_lines": 4,
+            "experimental_chunk_spans": (),
+            "experimental_skip_pure_example_chunks": False,
+            "max_retries": 0,
+            "request_timeout": 1,
+            "include_exercises": False,
+            "verbose": False,
+            "run_started_at": "2026-08-07T00:00:00+00:00",
+        }
+        calls: list[str] = []
+        client = SimpleNamespace(
+            complete_json=lambda system, user, label: calls.append(label) or payload,
+            request_history=[],
+        )
+        with (
+            patch.object(extractor, "_client", return_value=client),
+            patch.object(extractor, "_write_chunk_cache"),
+        ):
+            out_state = extractor._extract_sequentially(state)
+        self.assertEqual(calls, ["chunk_1"])
+        self.assertNotIn("verify", out_state["result"].diagnostics)
 
 
 if __name__ == "__main__":

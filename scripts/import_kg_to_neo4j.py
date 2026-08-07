@@ -55,6 +55,34 @@ RELATIONSHIP_TYPES = {
     "illustrated_by",
 }
 
+SEMANTIC_SCHEMA = "maf-kg.semantic.v1.5.9"
+SEMANTIC_NODE_TYPES = {"Concept", "Claim", "Method"}
+SEMANTIC_RELATIONSHIP_TYPES = {
+    "involves",
+    "uses",
+    "establishes",
+    "derived_from",
+    "equivalent_to",
+    "special_case_of",
+    "defined_in_terms_of",
+}
+
+
+def schema_family(schema_version: str | None) -> str:
+    if schema_version == "maf-kg.agent.v3":
+        return "v3"
+    if schema_version == SEMANTIC_SCHEMA:
+        return "semantic"
+    raise SystemExit(f"Unsupported schema_version: {schema_version}")
+
+
+def node_types_for(family: str) -> set[str]:
+    return NODE_TYPES if family == "v3" else SEMANTIC_NODE_TYPES
+
+
+def relationship_types_for(family: str) -> set[str]:
+    return RELATIONSHIP_TYPES if family == "v3" else SEMANTIC_RELATIONSHIP_TYPES
+
 
 def main() -> int:
     parser = build_arg_parser()
@@ -72,9 +100,11 @@ def main() -> int:
     kg_path = resolve_kg_path(args.json)
     data = json.loads(kg_path.read_text(encoding="utf-8"))
     validate_schema(data, kg_path)
+    family = schema_family(data.get("schema_version"))
 
     nodes = [prepare_node(node, data, kg_path, args.profile) for node in data.get("nodes", [])]
-    relationships = [prepare_relationship(rel, args.profile) for rel in data.get("relationships", [])]
+    rel_key = "relations" if family == "semantic" else "relationships"
+    relationships = [prepare_relationship(rel, args.profile, family) for rel in data.get(rel_key, [])]
 
     if args.dry_run:
         print(import_summary(kg_path, args, nodes, relationships))
@@ -93,8 +123,8 @@ def main() -> int:
             if args.clear:
                 session.execute_write(clear_existing)
             session.execute_write(create_constraints)
-            session.execute_write(import_nodes, nodes, args.batch_size)
-            session.execute_write(import_relationships, relationships, args.batch_size)
+            session.execute_write(import_nodes, nodes, args.batch_size, family)
+            session.execute_write(import_relationships, relationships, args.batch_size, family)
     finally:
         driver.close()
 
@@ -167,22 +197,51 @@ def resolve_kg_path(raw_path: str | None) -> Path:
 
 
 def validate_schema(data: dict[str, Any], kg_path: Path) -> None:
-    if data.get("schema_version") != "maf-kg.agent.v3":
-        raise SystemExit(f"{kg_path} is not maf-kg.agent.v3")
+    family = schema_family(data.get("schema_version"))
+    node_types = node_types_for(family)
+    rel_types = relationship_types_for(family)
+    relations = data.get("relations") if family == "semantic" else data.get("relationships")
     node_ids = {node.get("id") for node in data.get("nodes", [])}
     for node in data.get("nodes", []):
-        if node.get("type") not in NODE_TYPES:
+        if node.get("type") not in node_types:
             raise SystemExit(f"Unsupported node type: {node.get('type')}")
-    for rel in data.get("relationships", []):
-        if rel.get("type") not in RELATIONSHIP_TYPES:
+    for rel in relations or []:
+        if rel.get("type") not in rel_types:
             raise SystemExit(f"Unsupported relationship type: {rel.get('type')}")
-        if rel.get("source") not in node_ids or rel.get("target") not in node_ids:
+        src, tgt = (
+            (rel.get("source_id"), rel.get("target_id"))
+            if family == "semantic"
+            else (rel.get("source"), rel.get("target"))
+        )
+        if src not in node_ids or tgt not in node_ids:
             raise SystemExit(f"Relationship has invalid reference: {rel.get('id')}")
 
 
 def prepare_node(node: dict[str, Any], data: dict[str, Any], kg_path: Path, profile: str) -> dict[str, Any]:
+    family = schema_family(data.get("schema_version"))
     evidence = node.get("evidence") or []
     first_ev = evidence[0] if evidence else {}
+    if family == "semantic":
+        props = {
+            "id": node["id"],
+            "type": node["type"],
+            "name": node.get("name", ""),
+            "aliases": node.get("aliases") or [],
+            "description": node.get("description", ""),
+            "claim_kind": node.get("claim_kind"),
+            "source_path": first_ev.get("source_path") or data.get("source_path", ""),
+            "start_line": first_ev.get("start_line"),
+            "end_line": first_ev.get("end_line"),
+            "chunk_id": first_ev.get("chunk_id"),
+        }
+        if profile == "full":
+            props.update(
+                {
+                    "source_json": str(kg_path),
+                    "evidence_json": stable_json(evidence),
+                }
+            )
+        return {"id": node["id"], "type": node["type"], "props": drop_empty_values(props)}
     content = node.get("content") or {}
     properties = node.get("properties") or {}
     quality = node.get("quality") or {}
@@ -218,40 +277,58 @@ def prepare_node(node: dict[str, Any], data: dict[str, Any], kg_path: Path, prof
     return {"id": node["id"], "type": node["type"], "props": drop_empty_values(props)}
 
 
-def prepare_relationship(rel: dict[str, Any], profile: str) -> dict[str, Any]:
+def prepare_relationship(rel: dict[str, Any], profile: str, family: str) -> dict[str, Any]:
     content = rel.get("content") or {}
     properties = rel.get("properties") or {}
     quality = rel.get("quality") or {}
     evidence = rel.get("evidence") or []
     first_ev = evidence[0] if evidence else {}
     rel_type = rel["type"]
-    rel_id = rel.get("id") or stable_relationship_id(rel)
+    rel_id = rel.get("id") or stable_relationship_id(rel, family)
     props = {
         "id": rel_id,
         "type": rel_type,
-        "reason": content.get("reason", ""),
-        "confidence": float(quality.get("confidence", 0.0) or 0.0),
-        "quality_stage": quality.get("stage", ""),
         "source_path": first_ev.get("source_path", ""),
         "start_line": first_ev.get("start_line"),
         "end_line": first_ev.get("end_line"),
     }
-    if profile == "full":
+    if family == "semantic":
+        props["chunk_id"] = first_ev.get("chunk_id")
+        if profile == "full":
+            props.update(
+                {
+                    "content_json": stable_json(content),
+                    "properties_json": stable_json(properties),
+                    "quality_json": stable_json(quality),
+                    "evidence_json": stable_json(evidence),
+                }
+            )
+        src, tgt = rel["source_id"], rel["target_id"]
+    else:
         props.update(
             {
-                "chunk_id": first_ev.get("chunk_id"),
-                "content_json": stable_json(content),
-                "properties_json": stable_json(properties),
-                "quality_json": stable_json(quality),
-                "evidence_json": stable_json(evidence),
+                "reason": content.get("reason", ""),
+                "confidence": float(quality.get("confidence", 0.0) or 0.0),
+                "quality_stage": quality.get("stage", ""),
             }
         )
+        if profile == "full":
+            props.update(
+                {
+                    "chunk_id": first_ev.get("chunk_id"),
+                    "content_json": stable_json(content),
+                    "properties_json": stable_json(properties),
+                    "quality_json": stable_json(quality),
+                    "evidence_json": stable_json(evidence),
+                }
+            )
+        src, tgt = rel["source"], rel["target"]
     return {
         "id": rel_id,
         "type": rel_type,
-        "neo4j_type": to_relationship_type(rel_type),
-        "source": rel["source"],
-        "target": rel["target"],
+        "neo4j_type": to_relationship_type(rel_type, family),
+        "source": src,
+        "target": tgt,
         "props": drop_empty_values(props),
     }
 
@@ -273,13 +350,17 @@ def stable_json(value: Any) -> str:
     return json.dumps(value or {}, ensure_ascii=False, sort_keys=True)
 
 
-def stable_relationship_id(rel: dict[str, Any]) -> str:
-    raw = f"{rel.get('type')}|{rel.get('source')}|{rel.get('target')}|{stable_json(rel.get('evidence'))}"
+def stable_relationship_id(rel: dict[str, Any], family: str) -> str:
+    if family == "semantic":
+        src, tgt = rel.get("source_id"), rel.get("target_id")
+    else:
+        src, tgt = rel.get("source"), rel.get("target")
+    raw = f"{rel.get('type')}|{src}|{tgt}|{stable_json(rel.get('evidence'))}"
     return "rel_" + re.sub(r"[^a-zA-Z0-9_]", "_", raw)[:80]
 
 
-def to_relationship_type(rel_type: str) -> str:
-    if rel_type not in RELATIONSHIP_TYPES:
+def to_relationship_type(rel_type: str, family: str) -> str:
+    if rel_type not in relationship_types_for(family):
         raise ValueError(f"Unsupported relationship type: {rel_type}")
     return rel_type.upper()
 
@@ -292,7 +373,7 @@ def clear_existing(tx) -> None:
     tx.run("MATCH (n:KGNode) DETACH DELETE n")
 
 
-def import_nodes(tx, nodes: list[dict[str, Any]], batch_size: int) -> None:
+def import_nodes(tx, nodes: list[dict[str, Any]], batch_size: int, family: str) -> None:
     for batch in batched(nodes, batch_size):
         tx.run(
             """
@@ -308,7 +389,7 @@ def import_nodes(tx, nodes: list[dict[str, Any]], batch_size: int) -> None:
         labels_by_type.setdefault(node["type"], []).append(node["id"])
 
     for node_type, ids in labels_by_type.items():
-        label = sanitize_label(node_type)
+        label = sanitize_label(node_type, family)
         for batch in batched(ids, batch_size):
             tx.run(
                 f"""
@@ -320,13 +401,13 @@ def import_nodes(tx, nodes: list[dict[str, Any]], batch_size: int) -> None:
             )
 
 
-def import_relationships(tx, relationships: list[dict[str, Any]], batch_size: int) -> None:
+def import_relationships(tx, relationships: list[dict[str, Any]], batch_size: int, family: str) -> None:
     rels_by_type: dict[str, list[dict[str, Any]]] = {}
     for rel in relationships:
         rels_by_type.setdefault(rel["neo4j_type"], []).append(rel)
 
     for neo4j_type, rows in rels_by_type.items():
-        rel_type = sanitize_relationship_type(neo4j_type)
+        rel_type = sanitize_relationship_type(neo4j_type, family)
         for batch in batched(rows, batch_size):
             tx.run(
                 f"""
@@ -356,14 +437,14 @@ def import_summary(kg_path: Path, args: argparse.Namespace, nodes: list[dict[str
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-def sanitize_label(label: str) -> str:
-    if label not in NODE_TYPES:
+def sanitize_label(label: str, family: str) -> str:
+    if label not in node_types_for(family):
         raise ValueError(f"Unsupported label: {label}")
     return label
 
 
-def sanitize_relationship_type(rel_type: str) -> str:
-    allowed = {to_relationship_type(item) for item in RELATIONSHIP_TYPES}
+def sanitize_relationship_type(rel_type: str, family: str) -> str:
+    allowed = {to_relationship_type(item, family) for item in relationship_types_for(family)}
     if rel_type not in allowed:
         raise ValueError(f"Unsupported relationship type: {rel_type}")
     return rel_type

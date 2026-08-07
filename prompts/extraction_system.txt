@@ -226,6 +226,12 @@ derived_from: Claim -> Claim
   a corollary/consequence of the target Claim.
 - Direction is derived result -> supporting result.
 - Adjacency, numbering, or a model-recognized implication is not enough.
+- Evidence must cover the full derivation construct, not just the attribution
+  sentence. Cite the sentence that attributes the derivation ("由...可得",
+  "易得以下推论", "从...的证明中可知") together with the derived statement it
+  introduces: the corollary text for an immediate corollary, or the proof lines
+  where the source carries out the derivation. An evidence span ending at the
+  attribution sentence is insufficient.
 
 equivalent_to: Claim <-> Claim
 - Use only for strict logical equivalence explicitly supported by the source,
@@ -325,6 +331,55 @@ For every expression:
    expression has its own evidence, so do not widen node evidence to include a
    distant formula, derivation, or property. Keep a Concept description focused
    on its defining meaning rather than copying every later property.
+
+-------------------- Defined-term hints --------------------
+
+chunk.defined_term_hints lists template-matched candidate terms found by
+simple regex patterns ("就叫做", "称为", "称...为", "记作", "统称为"). Each
+entry provides the candidate term string and a short surrounding context.
+These are low-precision mechanical hints, not authoritative labels, and the
+regex may mis-segment a term. Use them to:
+1. Confirm a defined Concept's canonical name matches the source wording;
+2. Catch naming drift before it happens (prefer the exact source phrasing
+   over a paraphrase when both denote the same defined object);
+3. Recognize definitional acts that might otherwise be mistaken for Claims.
+Never create a node purely from a hint, and never quote a hint as evidence.
+Evidence must still come from chunk.text. Ignore any hint whose context does
+not clearly define the candidate term.
+Never copy LaTeX source into a node name. When a hint carries notation such
+as $x \to x_0$ or \lim_{x\to x_0}, write the name in Unicode or natural
+language form (x -> x0, "当x趋于x0时"), never with dollar signs or backslash
+commands. LaTeX belongs only in math_expression records via
+latex_candidate_id.
+
+-------------------- Definition unit discourse pattern --------------------
+
+Textbook definitions follow a fixed discourse pattern. Each block in a
+definition unit carries a "segments" list with per-line roles:
+meta_annotation, symbolic_restatement, geometric_interpretation, or
+exposition (default). These roles are mechanical navigation hints only;
+evidence must still come from chunk.text.
+
+Treat each role as follows:
+1. meta_annotation ("我们指出", "需要注意的是", "这里强调"): explanatory
+   commentary on the definition that was just given. NEVER create a Claim
+   from it, even when it states a restriction or condition (e.g. "极限与
+   函数在该点的值无关"): such observations are interpretive notes, not
+   independently taught results. If it adds clarifying meaning, fold it
+   into the defined Concept's description field.
+2. symbolic_restatement ("也就是说", "等价地", "记为", "可表示为"): a
+   notational restatement of the definition. Do NOT create a new Concept or
+   Claim from it. Record it as a definition_representation expression on the
+   defined Concept, referencing its math_expression via latex_candidate_id.
+   Never copy LaTeX into a node name.
+3. geometric_interpretation ("从几何上来说", "从图形上看", "几何意义"):
+   an intuitive picture of the definition, often mentioning the graph.
+   NEVER create any node from it, not even for a named object the
+   interpretation mentions (e.g. an asymptote). It is interpretive, not a
+   definition.
+4. exposition: ordinary prose; follow the normal extraction rules.
+Example material ("例题", "例") is still excluded per rule 2 of the
+procedure below.
 
 -------------------- Extraction procedure --------------------
 
