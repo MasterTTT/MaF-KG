@@ -39,8 +39,6 @@ DEFAULT_INPUT = ROOT / "data" / "raw" / "第一章第一节_映射与函数.md"
 DEFAULT_OUTPUT = ROOT / "KG" / "第一章第一节_映射与函数_semantic_v1_5_9.json"
 SCHEMA_VERSION = "maf-kg.semantic.v1.5.9"
 CHUNK_STRATEGIES = ["budget", "teaching-units"]
-NODE_TYPES = ["Concept", "Claim", "Method"]
-CLAIM_KINDS = ["property", "criterion", "identity", "result"]
 RELATION_SIGNATURES: dict[str, tuple[tuple[str, str], ...]] = {
     "involves": (("Claim", "Concept"),),
     "uses": (("Method", "Concept"), ("Method", "Claim"), ("Method", "Method")),
@@ -50,8 +48,6 @@ RELATION_SIGNATURES: dict[str, tuple[tuple[str, str], ...]] = {
     "special_case_of": (("Concept", "Concept"),),
     "defined_in_terms_of": (("Concept", "Concept"),),
 }
-RELATION_TYPES = list(RELATION_SIGNATURES)
-EXPRESSION_ROLES = ["definition_representation", "claim_representation", "method_template"]
 
 NodeType = Literal["Concept", "Claim", "Method"]
 ClaimKind = Literal["property", "criterion", "identity", "result"]
@@ -114,28 +110,18 @@ class ExtractionResult(BaseModel):
     math_expressions: list[MathExpression] = Field(default_factory=list)
     diagnostics: dict[str, Any] = Field(default_factory=dict)
 
-class ExpressionMemoryItem(BaseModel):
-    id: str
-    role: ExpressionRole
-    latex: str
-
 class NodeMemoryItem(BaseModel):
     id: str
     type: NodeType
     name: str
     aliases: list[str] = Field(default_factory=list)
-    description: str = ""
     claim_kind: ClaimKind | None = None
-    math_expressions: list[ExpressionMemoryItem] = Field(default_factory=list)
-    occurrences: list[Evidence] = Field(default_factory=list)
-    retrieval_score: float = 0.0
-    retrieval_reasons: list[str] = Field(default_factory=list)
+    short_description: str = ""
 
 class RelationMemoryItem(BaseModel):
     source_id: str
     relation_type: RelationType
     target_id: str
-    evidence: Evidence
 
 class NodeAction(BaseModel):
     ref_id: str
@@ -883,6 +869,32 @@ class CompletionTruncated(RuntimeError):
         self.metadata = metadata
 
 
+class ChunkMergeError(ValueError):
+    """A model response failed strict validation for one chunk.
+
+    Raised before any store mutation; the caller keeps the stores unchanged,
+    records the failure with chunk_id/item kind/reference/reason, and preserves
+    the raw response for reproduction.
+    """
+
+    def __init__(
+        self,
+        chunk_id: str,
+        item_kind: str,
+        item_ref: str,
+        reason: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self.chunk_id = chunk_id
+        self.item_kind = item_kind
+        self.item_ref = item_ref
+        self.reason = reason
+        self.details = details or {}
+        super().__init__(
+            f"Merge failed for {item_kind} {item_ref!r} in {chunk_id}: {reason}"
+        )
+
+
 def _runtime_dir(name: str) -> Path:
     for candidate in [ROOT / "KG" / name, ROOT / "agents" / name, Path(tempfile.gettempdir()) / "maf_kg" / name]:
         try:
@@ -1347,6 +1359,8 @@ class Extractor:
         max_retries: int = 2,
         request_timeout: float = 180,
         max_tokens: int = 12000,
+        memory_node_bytes: int = 12000,
+        memory_relation_bytes: int = 6000,
         save_output: bool = True,
         use_response_format: bool = True,
         no_proxy: bool = False,
@@ -1378,6 +1392,12 @@ class Extractor:
         self.max_retries = max_retries
         self.request_timeout = request_timeout
         self.max_tokens = max_tokens
+        self.memory_node_bytes = memory_node_bytes
+        self.memory_relation_bytes = memory_relation_bytes
+        if self.memory_node_bytes < 2:
+            raise ValueError(f"memory_node_bytes must be >= 2, got {self.memory_node_bytes}")
+        if self.memory_relation_bytes < 2:
+            raise ValueError(f"memory_relation_bytes must be >= 2, got {self.memory_relation_bytes}")
         self.save_output = save_output
         self.use_response_format = use_response_format
         self.no_proxy = no_proxy
@@ -1413,6 +1433,8 @@ class Extractor:
             "max_retries": self.max_retries,
             "request_timeout": self.request_timeout,
             "max_tokens": self.max_tokens,
+            "memory_node_bytes": self.memory_node_bytes,
+            "memory_relation_bytes": self.memory_relation_bytes,
             "save_output": self.save_output,
             "use_response_format": self.use_response_format,
             "no_proxy": self.no_proxy,
@@ -1981,12 +2003,14 @@ class Extractor:
         notes: list[str] = []
         cache_hits = 0
         for idx, chunk in enumerate(state["chunks"], start=1):
-            node_memory, relation_memory = self._build_memory_for_chunk(
+            node_memory, relation_memory, memory_selection = self._build_memory_for_chunk(
                 chunk,
                 node_store,
                 relation_store,
                 expression_store,
                 recent_chunk_ids=set(processed_chunk_ids[-2:]),
+                node_char_budget=state.get("memory_node_bytes", 12000),
+                relation_char_budget=state.get("memory_relation_bytes", 6000),
             )
             cache_fingerprint = self._cache_fingerprint(chunk, state, node_memory, relation_memory)
             cached = self._read_chunk_cache(chunk.id, cache_fingerprint, state) if state.get("resume", True) else None
@@ -2036,25 +2060,61 @@ class Extractor:
             working_node_store = {node_id: node.model_copy(deep=True) for node_id, node in node_store.items()}
             working_relation_store = {key: relation.model_copy(deep=True) for key, relation in relation_store.items()}
             working_expression_store = {key: expression.model_copy(deep=True) for key, expression in expression_store.items()}
-            summary = self._merge_chunk_response(
-                response,
-                chunk,
-                state["input_path"],
-                lines,
-                working_node_store,
-                working_relation_store,
-                working_expression_store,
-                allowed_existing_ids={item.id for item in node_memory},
-            )
-            node_store = working_node_store
-            relation_store = working_relation_store
-            expression_store = working_expression_store
-            if not cache_hit:
-                self._write_chunk_cache(chunk.id, cache_fingerprint, response.model_dump(mode="json"), state)
-            decision_ledger.extend(summary.pop("decisions"))
-            notes.extend(response.notes)
+            try:
+                summary = self._merge_chunk_response(
+                    response,
+                    chunk,
+                    state["input_path"],
+                    lines,
+                    working_node_store,
+                    working_relation_store,
+                    working_expression_store,
+                    allowed_existing_ids={item.id for item in node_memory},
+                )
+            except ChunkMergeError as exc:
+                self._log(f"Extractor chunk {idx}/{len(state['chunks'])} merge failed for {chunk.id}: {exc}")
+                metadata = {
+                    "schema_version": SCHEMA_VERSION,
+                    "input_path": state.get("input_path"),
+                    "output_path": state.get("output_path"),
+                    "chunk_id": chunk.id,
+                    "chunk_span": {"start_line": chunk.start_line, "end_line": chunk.end_line},
+                    "processed_chunk_ids": list(processed_chunk_ids),
+                    "chunk_summaries": list(chunk_summaries),
+                    "partial_counts": {
+                        "nodes": len(node_store),
+                        "relations": len(relation_store),
+                        "math_expressions": len(expression_store),
+                    },
+                    "api_summary": self._api_summary(client.request_history),
+                    "api_requests": client.request_history,
+                }
+                debug_path = _write_invalid_response(
+                    json.dumps(response.model_dump(mode="json"), ensure_ascii=False, indent=2),
+                    f"{chunk.id}_merge",
+                    exc,
+                    metadata,
+                )
+                raise ChunkMergeError(
+                    exc.chunk_id,
+                    exc.item_kind,
+                    exc.item_ref,
+                    f"{exc.reason} (raw response saved to {debug_path})",
+                    exc.details,
+                ) from exc
+            else:
+                node_store = working_node_store
+                relation_store = working_relation_store
+                expression_store = working_expression_store
+                if not cache_hit:
+                    self._write_chunk_cache(chunk.id, cache_fingerprint, response.model_dump(mode="json"), state)
+                notes.extend(response.notes)
+            decision_ledger.extend(summary["decisions"])
             summary["memory_node_count"] = len(node_memory)
             summary["memory_relation_count"] = len(relation_memory)
+            summary["node_memory_serialized_bytes"] = self._memory_array_bytes(node_memory)
+            summary["relation_memory_serialized_bytes"] = self._memory_array_bytes(relation_memory)
+            summary["memory_selection"] = memory_selection
             chunk_summaries.append(summary)
             processed_chunk_ids.append(chunk.id)
             self._log(
@@ -2158,11 +2218,11 @@ class Extractor:
         relation_store: dict[tuple[str, str, str], RelationRecord],
         expression_store: dict[tuple[str, str, str], MathExpressionRecord],
         recent_chunk_ids: set[str],
-        max_nodes: int = 40,
-        max_relations: int = 60,
-    ) -> tuple[list[NodeMemoryItem], list[RelationMemoryItem]]:
+        node_char_budget: int = 12000,
+        relation_char_budget: int = 6000,
+    ) -> tuple[list[NodeMemoryItem], list[RelationMemoryItem], list[dict[str, Any]]]:
         if not node_store:
-            return [], []
+            return [], [], []
 
         expressions_by_owner: dict[str, list[MathExpressionRecord]] = {}
         for expression in expression_store.values():
@@ -2181,8 +2241,25 @@ class Extractor:
         ranked.sort(key=lambda item: (-item[0], item[2].type, item[2].name, item[2].id))
 
         selected: dict[str, tuple[NodeRecord, float, list[str]]] = {}
-        for score, reasons, node in ranked[:max_nodes]:
+        selection_diag: list[dict[str, Any]] = []
+        used_bytes = 2
+        for score, reasons, node in ranked:
+            item = self._node_memory_item(node)
+            size = self._memory_item_bytes(item)
+            tentative = used_bytes + (1 if selected else 0) + size
+            if tentative > node_char_budget:
+                continue
             selected[node.id] = (node, score, reasons)
+            selection_diag.append(
+                {
+                    "id": node.id,
+                    "type": node.type,
+                    "score": round(score, 4),
+                    "reasons": reasons,
+                    "source": "ranked",
+                }
+            )
+            used_bytes = tentative
 
         # Add one-hop neighbors after topical and recent seeds so relations have
         # enough local graph context without sending the entire historical graph.
@@ -2194,34 +2271,76 @@ class Extractor:
             if rel.target_id in seed_ids and rel.source_id not in selected and rel.source_id in node_store:
                 neighbor_candidates.append((selected[rel.target_id][1] * 0.5, rel.target_id, node_store[rel.source_id]))
         for neighbor_score, seed_id, node in sorted(neighbor_candidates, key=lambda item: (-item[0], item[2].name, item[2].id)):
-            if len(selected) >= max_nodes:
-                break
-            selected.setdefault(node.id, (node, neighbor_score, [f"one_hop:{seed_id}"]))
+            if node.id in selected:
+                continue
+            item = self._node_memory_item(node)
+            size = self._memory_item_bytes(item)
+            tentative = used_bytes + (1 if selected else 0) + size
+            if tentative > node_char_budget:
+                continue
+            selected[node.id] = (node, neighbor_score, [f"one_hop:{seed_id}"])
+            selection_diag.append(
+                {
+                    "id": node.id,
+                    "type": node.type,
+                    "score": round(neighbor_score, 4),
+                    "reasons": [f"one_hop:{seed_id}"],
+                    "source": "one_hop",
+                }
+            )
+            used_bytes = tentative
 
         selected_ids = set(selected)
-        selected_rels = [
-            relation
-            for relation in sorted(
-                relation_store.values(),
-                key=lambda rel: (
-                    -(selected[rel.source_id][1] + selected[rel.target_id][1])
-                    if rel.source_id in selected and rel.target_id in selected
-                    else 0.0,
-                    rel.relation_type,
-                    rel.source_id,
-                    rel.target_id,
-                ),
-            )
-            if relation.source_id in selected_ids and relation.target_id in selected_ids
-        ][:max_relations]
+        selected_rels: list[RelationRecord] = []
+        used_relation_bytes = 2
+        for relation in sorted(
+            relation_store.values(),
+            key=lambda rel: (
+                -(selected[rel.source_id][1] + selected[rel.target_id][1])
+                if rel.source_id in selected and rel.target_id in selected
+                else 0.0,
+                rel.relation_type,
+                rel.source_id,
+                rel.target_id,
+            ),
+        ):
+            if relation.source_id not in selected_ids or relation.target_id not in selected_ids:
+                continue
+            item = self._relation_memory_item(relation)
+            size = self._memory_item_bytes(item)
+            tentative = used_relation_bytes + (1 if selected_rels else 0) + size
+            if tentative > relation_char_budget:
+                continue
+            selected_rels.append(relation)
+            used_relation_bytes = tentative
         memory_nodes = [
-            self._node_memory_item(node, expressions_by_owner.get(node.id, []), score, reasons)
-            for node, score, reasons in sorted(
+            self._node_memory_item(node)
+            for node, _, _ in sorted(
                 selected.values(),
                 key=lambda item: (-item[1], item[0].type, item[0].name, item[0].id),
             )
         ]
-        return memory_nodes, [self._relation_memory_item(rel) for rel in selected_rels]
+        return memory_nodes, [self._relation_memory_item(rel) for rel in selected_rels], selection_diag
+
+    @staticmethod
+    def _memory_item_bytes(item: BaseModel) -> int:
+        return len(
+            json.dumps(
+                item.model_dump(mode="json"),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+
+    @staticmethod
+    def _memory_array_bytes(items: list[BaseModel]) -> int:
+        return len(
+            json.dumps(
+                [item.model_dump(mode="json") for item in items],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
 
     def _node_memory_relevance(
         self,
@@ -2262,36 +2381,37 @@ class Extractor:
             reasons.append("recent_chunk")
         return score, _unique_preserve_order(reasons)
 
-    def _node_memory_item(
-        self,
-        node: NodeRecord,
-        expressions: list[MathExpressionRecord],
-        score: float,
-        reasons: list[str],
-    ) -> NodeMemoryItem:
-        occurrences = sorted(node.evidence, key=lambda evidence: (evidence.start_line, evidence.end_line))[-3:]
+    def _node_memory_item(self, node: NodeRecord) -> NodeMemoryItem:
         return NodeMemoryItem(
             id=node.id,
             type=node.type,
             name=node.name,
             aliases=node.aliases,
-            description=node.description,
             claim_kind=node.claim_kind,
-            math_expressions=[
-                ExpressionMemoryItem(id=expression.id, role=expression.role, latex=expression.latex)
-                for expression in sorted(expressions, key=lambda item: (item.role, item.id))[:4]
-            ],
-            occurrences=occurrences,
-            retrieval_score=round(score, 4),
-            retrieval_reasons=reasons,
+            short_description=self._short_description(node.description),
         )
+
+    @staticmethod
+    def _short_description(description: str, limit: int = 100) -> str:
+        text = description.strip()
+        if not text:
+            return ""
+        if len(text) <= limit:
+            return text
+        cut = text[:limit]
+        delimiter_positions = [cut.rfind(delimiter) for delimiter in "。；，！？、.,;"]
+        boundary = max(delimiter_positions)
+        if boundary >= 1:
+            cut = cut[: boundary + 1]
+        if cut and 0xD800 <= ord(cut[-1]) <= 0xDBFF:
+            cut = cut[:-1]
+        return cut
 
     def _relation_memory_item(self, relation: RelationRecord) -> RelationMemoryItem:
         return RelationMemoryItem(
             source_id=relation.source_id,
             relation_type=relation.relation_type,
             target_id=relation.target_id,
-            evidence=self._best_relation_evidence(relation),
         )
 
     def _chunk_extraction_prompt(
@@ -2320,20 +2440,8 @@ class Extractor:
             "source_latex_candidates": source_latex_candidates,
             "node_memory": [item.model_dump(mode="json") for item in node_memory],
             "relation_memory": [item.model_dump(mode="json") for item in relation_memory],
-            "allowed_node_types": NODE_TYPES,
-            "allowed_claim_kinds": CLAIM_KINDS,
-            "allowed_relation_types": RELATION_TYPES,
-            "allowed_relation_signatures": {
-                relation_type: [
-                    {"source_type": source_type, "target_type": target_type}
-                    for source_type, target_type in signatures
-                ]
-                for relation_type, signatures in RELATION_SIGNATURES.items()
-            },
-            "allowed_expression_roles": EXPRESSION_ROLES,
-            "output_contract": OUTPUT_CONTRACT,
         }
-        return json.dumps(payload, ensure_ascii=False, indent=2)
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
     def _source_latex_candidates_for_chunk(self, chunk: DocumentChunk) -> list[dict[str, Any]]:
         visible_lines = {
@@ -2358,21 +2466,21 @@ class Extractor:
         expression_store: dict[tuple[str, str, str], MathExpressionRecord],
         allowed_existing_ids: set[str],
     ) -> dict[str, Any]:
-        created_node_count = 0
-        reused_node_count = 0
-        new_relation_count = 0
-        new_expression_count = 0
-        ref_to_final: dict[str, str] = {}
-        created_refs: set[str] = set()
-        relation_refs: set[str] = set()
-        expression_owner_refs: set[str] = set()
-        decisions: list[dict[str, Any]] = []
-        skipped_items: list[dict[str, str]] = []
-        identity_conflicts: list[dict[str, Any]] = []
+        """Strict transactional merge of one chunk response.
 
-        def skip_item(kind: str, item_ref: str, reason: str) -> None:
-            skipped_items.append({"kind": kind, "ref": item_ref, "reason": reason})
-            self._log(f"Skipping {kind} in {chunk.id} ({item_ref}): {reason}")
+        Phase 1 validates the entire response against the current stores
+        without mutating anything. Any illegal node action, illegal reuse,
+        identity conflict, illegal relation endpoint or signature, illegal
+        evidence, or illegal expression raises ChunkMergeError with the
+        chunk_id, item kind, reference, and reason. Phase 2 applies the fully
+        validated plan, so a failure can never leave partial modifications in
+        the stores.
+        """
+        planned_nodes: list[dict[str, Any]] = []
+        ref_to_final: dict[str, str] = {}
+
+        def fail(kind: str, ref: str, reason: str, details: dict[str, Any] | None = None) -> None:
+            raise ChunkMergeError(chunk.id, kind, ref, reason, details)
 
         def resolve_node_reference(reference: str) -> str | None:
             local_id = ref_to_final.get(reference)
@@ -2382,47 +2490,71 @@ class Extractor:
                 return reference
             return None
 
+        def node_type_of(node_id: str) -> str:
+            if node_id in node_store:
+                return node_store[node_id].type
+            return planned_node_type[node_id]
+
+        planned_node_type: dict[str, str] = {}
+        planned_node_name: dict[str, str] = {}
+
         for action in response.node_actions:
             ref_id = action.ref_id.strip()
+            if not ref_id:
+                fail("node_action", action.ref_id, "empty ref_id")
             if ref_id in ref_to_final:
-                skip_item("node_action", ref_id, "duplicate ref_id")
-                continue
-            merge_outcome: dict[str, Any] = {
-                "mention_matches_known_surface": None,
-                "aliases_added": [],
-                "description_action": "created" if action.action == "create" else "kept",
-            }
+                fail("node_action", ref_id, "duplicate ref_id")
             try:
                 evidence = self._sanitize_evidence(action.evidence, chunk, source_path, raw_lines)
-                if action.action == "reuse":
-                    existing_id = str(action.existing_id)
-                    if existing_id not in allowed_existing_ids:
-                        raise ValueError(f"reuse target was not supplied in node_memory: {existing_id}")
-                    if existing_id not in node_store:
-                        raise ValueError(f"reuse target does not exist in canonical memory: {existing_id}")
-                    existing = node_store[existing_id]
-                    if action.type is not None and action.type != existing.type:
-                        raise ValueError(
-                            f"reuse type mismatch: {action.type} != canonical {existing.type} for {existing_id}"
+            except ValueError as exc:
+                fail("node_action", ref_id, str(exc))
+            if action.action == "reuse":
+                existing_id = str(action.existing_id)
+                if existing_id not in allowed_existing_ids:
+                    fail("node_action", ref_id, f"reuse target was not supplied in node_memory: {existing_id}")
+                if existing_id not in node_store:
+                    fail("node_action", ref_id, f"reuse target does not exist in canonical memory: {existing_id}")
+                existing = node_store[existing_id]
+                if action.type is not None and action.type != existing.type:
+                    fail(
+                        "node_action",
+                        ref_id,
+                        f"reuse type mismatch: {action.type} != canonical {existing.type} for {existing_id}",
+                    )
+                if action.claim_kind is not None:
+                    if existing.type != "Claim":
+                        fail("node_action", ref_id, f"claim_kind supplied for non-Claim reuse: {existing.id}")
+                    if existing.claim_kind is not None and action.claim_kind != existing.claim_kind:
+                        fail(
+                            "node_action",
+                            ref_id,
+                            f"claim_kind mismatch for {existing.id}: {action.claim_kind} != {existing.claim_kind}",
                         )
-                    merge_outcome = self._merge_reuse_action(existing, action, evidence)
-                    final_id = existing_id
-                    reused_node_count += 1
-                else:
+                planned_nodes.append(
+                    {"action": action, "kind": "reuse", "existing_id": existing_id, "evidence": evidence}
+                )
+                ref_to_final[ref_id] = existing_id
+            else:
+                try:
                     sanitized = self._sanitize_create_action(action, evidence)
-                    node_type = sanitized.type
-                    if node_type is None:
-                        raise ValueError(f"create action missing node type: {ref_id}")
-                    final_id = _node_id(node_type, sanitized.name)
-                    if final_id in node_store:
-                        conflict_kind = (
-                            "model_decision_conflict"
-                            if final_id in allowed_existing_ids
-                            else "memory_retrieval_miss"
-                        )
-                        conflict = {
-                            "chunk_id": chunk.id,
-                            "ref_id": ref_id,
+                except ValueError as exc:
+                    fail("node_action", ref_id, str(exc))
+                node_type = sanitized.type
+                if node_type is None:
+                    fail("node_action", ref_id, "create action missing node type")
+                final_id = _node_id(node_type, sanitized.name)
+                if final_id in node_store:
+                    conflict_kind = (
+                        "model_decision_conflict"
+                        if final_id in allowed_existing_ids
+                        else "memory_retrieval_miss"
+                    )
+                    fail(
+                        "node_action",
+                        ref_id,
+                        f"{conflict_kind}: canonical {node_type} name already exists as {final_id}: "
+                        f"{sanitized.name}",
+                        {
                             "conflict_kind": conflict_kind,
                             "proposed_type": node_type,
                             "proposed_name": sanitized.name,
@@ -2433,27 +2565,154 @@ class Extractor:
                             "start_line": evidence.start_line,
                             "end_line": evidence.end_line,
                             "reason": action.reason.strip(),
-                        }
-                        identity_conflicts.append(conflict)
-                        raise ValueError(
-                            f"{conflict_kind}: canonical {node_type} name already exists as {final_id}: "
-                            f"{sanitized.name}"
-                        )
-                    node_store[final_id] = NodeRecord(
-                        id=final_id,
-                        type=node_type,
-                        name=sanitized.name,
-                        aliases=_canonical_aliases(sanitized.name, sanitized.aliases),
-                        description=sanitized.description,
-                        claim_kind=sanitized.claim_kind,
-                        evidence=[evidence],
+                        },
                     )
-                    created_refs.add(ref_id)
-                    created_node_count += 1
+                if final_id in planned_node_type:
+                    fail(
+                        "node_action",
+                        ref_id,
+                        f"duplicate canonical node created twice in this chunk: {final_id}",
+                        {
+                            "conflict_kind": "model_decision_conflict",
+                            "proposed_type": node_type,
+                            "proposed_name": sanitized.name,
+                            "existing_id": final_id,
+                            "existing_type": planned_node_type[final_id],
+                            "existing_name": planned_node_name[final_id],
+                            "existing_was_in_node_memory": False,
+                            "start_line": evidence.start_line,
+                            "end_line": evidence.end_line,
+                            "reason": action.reason.strip(),
+                        },
+                    )
+                planned_node_type[final_id] = node_type
+                planned_node_name[final_id] = sanitized.name
+                planned_nodes.append(
+                    {
+                        "action": action,
+                        "kind": "create",
+                        "sanitized": sanitized,
+                        "final_id": final_id,
+                        "evidence": evidence,
+                    }
+                )
+                ref_to_final[ref_id] = final_id
+
+        planned_relations: list[dict[str, Any]] = []
+        for relation in response.relations:
+            source_ref = relation.source_ref.strip()
+            target_ref = relation.target_ref.strip()
+            relation_ref = f"{source_ref} -[{relation.relation_type}]-> {target_ref}"
+            source_id = resolve_node_reference(source_ref)
+            target_id = resolve_node_reference(target_ref)
+            if source_id is None or target_id is None:
+                fail(
+                    "relation",
+                    relation_ref,
+                    "endpoint is neither a valid local ref_id nor a supplied node_memory id",
+                )
+            if source_id == target_id:
+                fail("relation", relation_ref, "self relation")
+            if not self._relation_signature_valid(
+                relation.relation_type, node_type_of(source_id), node_type_of(target_id)
+            ):
+                fail(
+                    "relation",
+                    relation_ref,
+                    f"invalid type signature: {node_type_of(source_id)} -> {node_type_of(target_id)}",
+                )
+            try:
+                evidence = self._sanitize_evidence(relation.evidence, chunk, source_path, raw_lines)
             except ValueError as exc:
-                skip_item("node_action", ref_id, str(exc))
-                continue
-            ref_to_final[ref_id] = final_id
+                fail("relation", relation_ref, str(exc))
+            planned_relations.append(
+                {
+                    "source_ref": source_ref,
+                    "target_ref": target_ref,
+                    "source_id": source_id,
+                    "relation_type": relation.relation_type,
+                    "target_id": target_id,
+                    "evidence": evidence,
+                }
+            )
+
+        expected_role_by_type: dict[str, str] = {
+            "Concept": "definition_representation",
+            "Claim": "claim_representation",
+            "Method": "method_template",
+        }
+        planned_expressions: list[dict[str, Any]] = []
+        for expression in response.expressions:
+            owner_ref = expression.owner_ref.strip()
+            expression_ref = f"{owner_ref}:{expression.role}:{expression.latex_candidate_id}"
+            owner_id = resolve_node_reference(owner_ref)
+            if owner_id is None:
+                fail(
+                    "expression",
+                    expression_ref,
+                    "owner_ref is neither a valid local ref_id nor a supplied node_memory id",
+                )
+            owner_type = node_type_of(owner_id)
+            if expression.role != expected_role_by_type[owner_type]:
+                fail("expression", expression_ref, f"invalid expression role {expression.role} for {owner_type}")
+            try:
+                evidence = self._sanitize_evidence(expression.evidence, chunk, source_path, raw_lines)
+                candidate_id = expression.latex_candidate_id.strip()
+                candidate = self.source_latex_candidates.get(candidate_id)
+                if candidate is None:
+                    raise ValueError(f"unknown latex_candidate_id: {candidate_id}")
+                line_no, latex = candidate
+                if line_no < evidence.start_line or line_no > evidence.end_line:
+                    raise ValueError(
+                        f"LaTeX candidate {candidate_id} at L{line_no} is outside evidence "
+                        f"L{evidence.start_line}-L{evidence.end_line}"
+                    )
+            except ValueError as exc:
+                fail("expression", expression_ref, str(exc))
+            planned_expressions.append(
+                {
+                    "owner_ref": owner_ref,
+                    "owner_id": owner_id,
+                    "role": expression.role,
+                    "latex": latex,
+                    "evidence": evidence,
+                }
+            )
+
+        created_node_count = 0
+        reused_node_count = 0
+        created_refs: set[str] = set()
+        relation_refs: set[str] = set()
+        expression_owner_refs: set[str] = set()
+        decisions: list[dict[str, Any]] = []
+        for plan in planned_nodes:
+            action = plan["action"]
+            ref_id = action.ref_id.strip()
+            evidence = plan["evidence"]
+            if plan["kind"] == "reuse":
+                existing = node_store[plan["existing_id"]]
+                merge_outcome = self._merge_reuse_action(existing, action, evidence)
+                final_id = existing.id
+                reused_node_count += 1
+            else:
+                sanitized = plan["sanitized"]
+                final_id = plan["final_id"]
+                node_store[final_id] = NodeRecord(
+                    id=final_id,
+                    type=sanitized.type,
+                    name=sanitized.name,
+                    aliases=_canonical_aliases(sanitized.name, sanitized.aliases),
+                    description=sanitized.description,
+                    claim_kind=sanitized.claim_kind,
+                    evidence=[evidence],
+                )
+                created_refs.add(ref_id)
+                created_node_count += 1
+                merge_outcome: dict[str, Any] = {
+                    "mention_matches_known_surface": None,
+                    "aliases_added": [],
+                    "description_action": "created",
+                }
             decisions.append(
                 {
                     "chunk_id": chunk.id,
@@ -2469,103 +2728,40 @@ class Extractor:
                 }
             )
 
-        for relation in response.relations:
-            source_ref = relation.source_ref.strip()
-            target_ref = relation.target_ref.strip()
-            relation_ref = f"{source_ref} -[{relation.relation_type}]-> {target_ref}"
-            source_id = resolve_node_reference(source_ref)
-            target_id = resolve_node_reference(target_ref)
-            if source_id is None or target_id is None:
-                skip_item(
-                    "relation",
-                    relation_ref,
-                    "endpoint is neither a valid local ref_id nor a supplied node_memory id",
-                )
-                continue
-            if source_id == target_id:
-                skip_item("relation", relation_ref, "self relation")
-                continue
-            if not self._relation_signature_valid(relation.relation_type, node_store[source_id].type, node_store[target_id].type):
-                skip_item(
-                    "relation",
-                    relation_ref,
-                    f"invalid type signature: {node_store[source_id].type} -> {node_store[target_id].type}",
-                )
-                continue
-            try:
-                evidence = self._sanitize_evidence(relation.evidence, chunk, source_path, raw_lines)
-            except ValueError as exc:
-                skip_item("relation", relation_ref, str(exc))
-                continue
+        new_relation_count = 0
+        for plan in planned_relations:
             relation_refs.update(
                 reference
-                for reference in (source_ref, target_ref)
+                for reference in (plan["source_ref"], plan["target_ref"])
                 if reference in ref_to_final
             )
-            key = _relation_key(source_id, relation.relation_type, target_id)
+            key = _relation_key(plan["source_id"], plan["relation_type"], plan["target_id"])
             if key in relation_store:
-                self._append_relation_evidence(relation_store[key], evidence)
+                self._append_relation_evidence(relation_store[key], plan["evidence"])
                 continue
             left_source, rel_type, left_target = key
             relation_store[key] = RelationRecord(
                 source_id=left_source,
                 relation_type=rel_type,
                 target_id=left_target,
-                evidences=[evidence],
+                evidences=[plan["evidence"]],
             )
             new_relation_count += 1
 
-        expected_role_by_type: dict[str, str] = {
-            "Concept": "definition_representation",
-            "Claim": "claim_representation",
-            "Method": "method_template",
-        }
-        for expression in response.expressions:
-            owner_ref = expression.owner_ref.strip()
-            expression_ref = f"{owner_ref}:{expression.role}:{expression.latex_candidate_id}"
-            owner_id = resolve_node_reference(owner_ref)
-            if owner_id is None:
-                skip_item(
-                    "expression",
-                    expression_ref,
-                    "owner_ref is neither a valid local ref_id nor a supplied node_memory id",
-                )
-                continue
-            owner_type = node_store[owner_id].type
-            if expression.role != expected_role_by_type[owner_type]:
-                skip_item(
-                    "expression",
-                    expression_ref,
-                    f"invalid expression role {expression.role} for {owner_type}",
-                )
-                continue
-            try:
-                evidence = self._sanitize_evidence(expression.evidence, chunk, source_path, raw_lines)
-                candidate_id = expression.latex_candidate_id.strip()
-                candidate = self.source_latex_candidates.get(candidate_id)
-                if candidate is None:
-                    raise ValueError(f"unknown latex_candidate_id: {candidate_id}")
-                line_no, latex = candidate
-                if line_no < evidence.start_line or line_no > evidence.end_line:
-                    raise ValueError(
-                        f"LaTeX candidate {candidate_id} at L{line_no} is outside evidence "
-                        f"L{evidence.start_line}-L{evidence.end_line}"
-                    )
-            except ValueError as exc:
-                skip_item("expression", expression_ref, str(exc))
-                continue
-            if owner_ref in ref_to_final:
-                expression_owner_refs.add(owner_ref)
-            key = (owner_id, expression.role, latex)
+        new_expression_count = 0
+        for plan in planned_expressions:
+            key = (plan["owner_id"], plan["role"], plan["latex"])
             if key in expression_store:
-                self._append_expression_evidence(expression_store[key], evidence)
+                self._append_expression_evidence(expression_store[key], plan["evidence"])
                 continue
+            if plan["owner_ref"] in ref_to_final:
+                expression_owner_refs.add(plan["owner_ref"])
             expression_store[key] = MathExpressionRecord(
-                id=_expression_id(owner_id, expression.role, latex),
-                owner_id=owner_id,
-                role=expression.role,
-                latex=latex,
-                evidences=[evidence],
+                id=_expression_id(plan["owner_id"], plan["role"], plan["latex"]),
+                owner_id=plan["owner_id"],
+                role=plan["role"],
+                latex=plan["latex"],
+                evidences=[plan["evidence"]],
             )
             new_expression_count += 1
 
@@ -2584,10 +2780,10 @@ class Extractor:
             "total_nodes": len(node_store),
             "total_relations": len(relation_store),
             "total_expressions": len(expression_store),
-            "skipped_item_count": len(skipped_items),
-            "skipped_items": skipped_items,
-            "identity_conflict_count": len(identity_conflicts),
-            "identity_conflicts": identity_conflicts,
+            "skipped_item_count": 0,
+            "skipped_items": [],
+            "identity_conflict_count": 0,
+            "identity_conflicts": [],
             "pending_node_count": len(pending_refs),
             "pending_node_refs": pending_refs,
             "decisions": decisions,
@@ -2724,14 +2920,6 @@ class Extractor:
         if sig not in existing:
             expression.evidences.append(evidence)
 
-    def _best_relation_evidence(self, relation: RelationRecord) -> Evidence:
-        if not relation.evidences:
-            raise ValueError(
-                f"Relation has no source evidence: {relation.source_id} "
-                f"-[{relation.relation_type}]-> {relation.target_id}"
-            )
-        return max(relation.evidences, key=lambda e: (len(e.text.strip()), -(e.end_line - e.start_line)))
-
     def _run_config(self, state: ExtractionState) -> dict[str, Any]:
         reasoning_effort_sent = (
             state.get("reasoning_effort")
@@ -2770,6 +2958,8 @@ class Extractor:
             "max_retries": state.get("max_retries"),
             "request_timeout": state.get("request_timeout"),
             "request_delay": state.get("request_delay"),
+            "memory_node_bytes": state.get("memory_node_bytes"),
+            "memory_relation_bytes": state.get("memory_relation_bytes"),
             "response_format_enabled": state.get("use_response_format"),
             "resume_enabled": state.get("resume"),
             "include_exercises": state.get("include_exercises"),
@@ -2995,7 +3185,6 @@ class Extractor:
             "schema_version": SCHEMA_VERSION,
             "chunk_strategy": state.get("chunk_strategy", "budget"),
             "system_prompt_sha256": hashlib.sha256(self.system_prompt.encode("utf-8")).hexdigest(),
-            "output_contract": OUTPUT_CONTRACT,
             "chunk": {
                 "id": chunk.id,
                 "start_line": chunk.start_line,
@@ -3042,53 +3231,6 @@ class Extractor:
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-
-OUTPUT_CONTRACT = {
-    "node_actions": [
-        {
-            "ref_id": "Local reference used by relations.",
-            "action": "reuse or create",
-            "existing_id": "Required only for reuse; must come from node_memory.",
-            "mention": "Required exact current-chunk wording for reuse; optional for create.",
-            "type": "Required only for create; omit for reuse and never emit an empty string.",
-            "name": "Required only for create.",
-            "aliases": ["Optional aliases."],
-            "description": "Required for create; optional enrichment for reuse.",
-            "claim_kind": (
-                "Required for create Claim: property, criterion, identity, or result. "
-                "Omit for Concept, Method, and every reuse action; never emit an empty string."
-            ),
-            "evidence": {
-                "start_line": "Inclusive supporting line from chunk.evidence_line_numbers.",
-                "end_line": "Inclusive supporting line from chunk.evidence_line_numbers.",
-            },
-            "reason": "Short identity decision reason.",
-        }
-    ],
-    "relations": [
-        {
-            "source_ref": "Local ref_id from node_actions or an id supplied in node_memory.",
-            "relation_type": "Allowed type whose source/target types exactly match allowed_relation_signatures.",
-            "target_ref": "Local ref_id from node_actions or an id supplied in node_memory.",
-            "evidence": {
-                "start_line": "Inclusive supporting line from chunk.evidence_line_numbers.",
-                "end_line": "Inclusive supporting line from chunk.evidence_line_numbers.",
-            },
-        }
-    ],
-    "expressions": [
-        {
-            "owner_ref": "Local ref_id from node_actions or an id supplied in node_memory.",
-            "role": "Role allowed for the owner's node type.",
-            "latex_candidate_id": "Exact candidate_id from source_latex_candidates.",
-            "evidence": {
-                "start_line": "Inclusive line covering the expression and its semantic role.",
-                "end_line": "Inclusive line covering the expression and its semantic role.",
-            },
-        }
-    ],
-    "notes": ["Optional diagnostic observations. Not persistent memory."],
-}
 
 def check_config(
     provider: str | None = None,
@@ -3179,6 +3321,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--request-timeout", type=float, default=180)
     parser.add_argument("--max-tokens", type=int, default=12000)
+    parser.add_argument(
+        "--memory-node-bytes",
+        type=int,
+        default=12000,
+        help="Serialized byte budget for nodes in Top-K memory (default ~40 nodes).",
+    )
+    parser.add_argument(
+        "--memory-relation-bytes",
+        type=int,
+        default=6000,
+        help="Serialized byte budget for relations in Top-K memory (default ~60 relations).",
+    )
     parser.add_argument("--request-delay", type=float, default=3.0, help="Seconds to sleep between API calls.")
     parser.add_argument("--thinking", default="disabled", choices=["enabled", "disabled"], help="Provider thinking mode when supported.")
     parser.add_argument(
@@ -3231,6 +3385,8 @@ def main() -> None:
         max_retries=args.max_retries,
         request_timeout=args.request_timeout,
         max_tokens=args.max_tokens,
+        memory_node_bytes=args.memory_node_bytes,
+        memory_relation_bytes=args.memory_relation_bytes,
         save_output=not args.no_save,
         use_response_format=not args.no_response_format,
         no_proxy=args.no_proxy,

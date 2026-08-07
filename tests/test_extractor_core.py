@@ -11,14 +11,18 @@ from pydantic import ValidationError
 
 from agents.Extractor import (
     ChunkExtractionResponse,
+    ChunkMergeError,
     CompletionTruncated,
     DocumentChunk,
     Evidence,
     EvidenceRef,
     Extractor,
     NodeAction,
+    NodeMemoryItem,
     NodeRecord,
     ProviderChatClient,
+    RelationMemoryItem,
+    RelationRecord,
     _node_id,
     _normalize_name,
 )
@@ -163,18 +167,23 @@ class MemoryMergeTests(unittest.TestCase):
         }
         for allowed, expected in [({existing.id}, "model_decision_conflict"), (set(), "memory_retrieval_miss")]:
             with self.subTest(expected=expected):
-                summary = self.extractor._merge_chunk_response(
-                    response,
-                    chunk,
-                    "source.md",
-                    ["复合函数"],
-                    {existing.id: existing.model_copy(deep=True)},
-                    {},
-                    {},
-                    allowed_existing_ids=allowed,
-                )
-                self.assertEqual(summary["identity_conflict_count"], 1)
-                self.assertEqual(summary["identity_conflicts"][0]["conflict_kind"], expected)
+                store = {existing.id: existing.model_copy(deep=True)}
+                with self.assertRaises(ChunkMergeError) as cm:
+                    self.extractor._merge_chunk_response(
+                        response,
+                        chunk,
+                        "source.md",
+                        ["复合函数"],
+                        store,
+                        {},
+                        {},
+                        allowed_existing_ids=allowed,
+                    )
+                self.assertEqual(cm.exception.item_kind, "node_action")
+                self.assertEqual(cm.exception.item_ref, "c1")
+                self.assertEqual(cm.exception.details["conflict_kind"], expected)
+                self.assertIn(existing.id, store)
+                self.assertEqual(store[existing.id].description, "已有定义")
 
 
 class ClaimKindTests(unittest.TestCase):
@@ -652,6 +661,661 @@ class StructureAwareChunkTests(unittest.TestCase):
                     "diagnostics": {},
                 }
             )
+
+
+class StrictMergeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.extractor = Extractor(save_output=False, verbose=False)
+
+    def chunk(self, chunk_id: str = "chunk_1", lines: list[str] | None = None) -> DocumentChunk:
+        lines = lines or ["函数"]
+        text = "\n".join(f"{i}: {line}" for i, line in enumerate(lines, start=1))
+        chunk = DocumentChunk(
+            id=chunk_id,
+            start_line=1,
+            end_line=len(lines),
+            heading_path=["第一节"],
+            text=text,
+        )
+        self.extractor.source_context_by_line = {
+            line: (["第一节"], "teaching_1", "paragraph")
+            for line in range(1, len(lines) + 1)
+        }
+        return chunk
+
+    def create_action(self, ref_id: str = "c1", name: str = "函数", start: int = 1, end: int = 1) -> dict[str, object]:
+        return {
+            "ref_id": ref_id,
+            "action": "create",
+            "type": "Concept",
+            "name": name,
+            "description": f"{name}的定义",
+            "evidence": {"start_line": start, "end_line": end},
+        }
+
+    def test_valid_response_commits_nodes_relations_and_expressions_atomically(self) -> None:
+        chunk = self.chunk(lines=["函数", "极限"])
+        self.extractor.source_latex_candidates = {"latex_L1_1": (1, r"\lim")}
+        response = ChunkExtractionResponse(
+            node_actions=[
+                self.create_action("c1", "函数"),
+                self.create_action("c2", "极限", start=2, end=2),
+            ],
+            relations=[
+                {
+                    "source_ref": "c1",
+                    "relation_type": "defined_in_terms_of",
+                    "target_ref": "c2",
+                    "evidence": {"start_line": 1, "end_line": 2},
+                }
+            ],
+            expressions=[
+                {
+                    "owner_ref": "c2",
+                    "role": "definition_representation",
+                    "latex_candidate_id": "latex_L1_1",
+                    "evidence": {"start_line": 1, "end_line": 2},
+                }
+            ],
+            notes=[],
+        )
+        node_store: dict[str, NodeRecord] = {}
+        summary = self.extractor._merge_chunk_response(
+            response,
+            chunk,
+            "source.md",
+            ["函数", "极限"],
+            node_store,
+            {},
+            {},
+            allowed_existing_ids=set(),
+        )
+        self.assertEqual(summary["created_node_count"], 2)
+        self.assertEqual(summary["new_relation_count"], 1)
+        self.assertEqual(summary["new_expression_count"], 1)
+        self.assertEqual(summary["skipped_item_count"], 0)
+        self.assertEqual(summary["identity_conflict_count"], 0)
+        self.assertEqual(summary["pending_node_count"], 0)
+        self.assertEqual(len(node_store), 2)
+
+    def test_invalid_relation_endpoint_leaves_no_partial_modification(self) -> None:
+        chunk = self.chunk()
+        response = ChunkExtractionResponse(
+            node_actions=[self.create_action()],
+            relations=[
+                {
+                    "source_ref": "c1",
+                    "relation_type": "involves",
+                    "target_ref": "ghost",
+                    "evidence": {"start_line": 1, "end_line": 1},
+                }
+            ],
+            expressions=[],
+            notes=[],
+        )
+        node_store: dict[str, NodeRecord] = {}
+        with self.assertRaises(ChunkMergeError) as cm:
+            self.extractor._merge_chunk_response(
+                response, chunk, "source.md", ["函数"], node_store, {}, {}, set()
+            )
+        self.assertEqual(cm.exception.item_kind, "relation")
+        self.assertIn("ghost", cm.exception.item_ref)
+        self.assertIn("endpoint is neither", cm.exception.reason)
+        self.assertEqual(node_store, {})
+
+    def test_invalid_relation_signature_and_self_loop_fail_chunk(self) -> None:
+        chunk = self.chunk()
+        self_loop = ChunkExtractionResponse(
+            node_actions=[self.create_action()],
+            relations=[
+                {
+                    "source_ref": "c1",
+                    "relation_type": "involves",
+                    "target_ref": "c1",
+                    "evidence": {"start_line": 1, "end_line": 1},
+                }
+            ],
+            expressions=[],
+            notes=[],
+        )
+        with self.assertRaisesRegex(ChunkMergeError, "self relation"):
+            self.extractor._merge_chunk_response(
+                self_loop, chunk, "source.md", ["函数"], {}, {}, {}, set()
+            )
+
+        wrong_types = ChunkExtractionResponse(
+            node_actions=[self.create_action("c1", "函数"), self.create_action("c2", "极限")],
+            relations=[
+                {
+                    "source_ref": "c1",
+                    "relation_type": "involves",
+                    "target_ref": "c2",
+                    "evidence": {"start_line": 1, "end_line": 1},
+                }
+            ],
+            expressions=[],
+            notes=[],
+        )
+        with self.assertRaises(ChunkMergeError) as cm:
+            self.extractor._merge_chunk_response(
+                wrong_types, chunk, "source.md", ["函数", "极限"], {}, {}, {}, set()
+            )
+        self.assertEqual(cm.exception.item_kind, "relation")
+        self.assertIn("invalid type signature", cm.exception.reason)
+
+    def test_expression_role_mismatch_and_unknown_latex_fail_chunk(self) -> None:
+        chunk = self.chunk()
+        self.extractor.source_latex_candidates = {}
+        role_mismatch = ChunkExtractionResponse(
+            node_actions=[self.create_action()],
+            relations=[],
+            expressions=[
+                {
+                    "owner_ref": "c1",
+                    "role": "claim_representation",
+                    "latex_candidate_id": "latex_L1_1",
+                    "evidence": {"start_line": 1, "end_line": 1},
+                }
+            ],
+            notes=[],
+        )
+        with self.assertRaises(ChunkMergeError) as cm:
+            self.extractor._merge_chunk_response(
+                role_mismatch, chunk, "source.md", ["函数"], {}, {}, {}, set()
+            )
+        self.assertEqual(cm.exception.item_kind, "expression")
+        self.assertIn("invalid expression role", cm.exception.reason)
+
+        unknown_candidate = ChunkExtractionResponse(
+            node_actions=[self.create_action()],
+            relations=[],
+            expressions=[
+                {
+                    "owner_ref": "c1",
+                    "role": "definition_representation",
+                    "latex_candidate_id": "latex_ghost",
+                    "evidence": {"start_line": 1, "end_line": 1},
+                }
+            ],
+            notes=[],
+        )
+        with self.assertRaises(ChunkMergeError) as cm:
+            self.extractor._merge_chunk_response(
+                unknown_candidate, chunk, "source.md", ["函数"], {}, {}, {}, set()
+            )
+        self.assertIn("unknown latex_candidate_id", cm.exception.reason)
+
+    def test_invalid_evidence_fails_chunk(self) -> None:
+        chunk = self.chunk()
+        response = ChunkExtractionResponse(
+            node_actions=[self.create_action(start=1, end=99)],
+            relations=[],
+            expressions=[],
+            notes=[],
+        )
+        with self.assertRaises(ChunkMergeError) as cm:
+            self.extractor._merge_chunk_response(
+                response, chunk, "source.md", ["函数"], {}, {}, {}, set()
+            )
+        self.assertEqual(cm.exception.item_kind, "node_action")
+        self.assertIn("Evidence", cm.exception.reason)
+
+    def test_duplicate_ref_id_fails_chunk(self) -> None:
+        chunk = self.chunk()
+        response = ChunkExtractionResponse(
+            node_actions=[self.create_action("c1", "函数"), self.create_action("c1", "极限")],
+            relations=[],
+            expressions=[],
+            notes=[],
+        )
+        with self.assertRaisesRegex(ChunkMergeError, "duplicate ref_id"):
+            self.extractor._merge_chunk_response(
+                response, chunk, "source.md", ["函数", "极限"], {}, {}, {}, set()
+            )
+
+    def test_duplicate_canonical_node_in_chunk_fails_chunk(self) -> None:
+        chunk = self.chunk()
+        response = ChunkExtractionResponse(
+            node_actions=[
+                self.create_action("c1", "函数"),
+                self.create_action("c2", "函数"),
+            ],
+            relations=[],
+            expressions=[],
+            notes=[],
+        )
+        node_store: dict[str, NodeRecord] = {}
+        with self.assertRaises(ChunkMergeError) as cm:
+            self.extractor._merge_chunk_response(
+                response, chunk, "source.md", ["函数"], node_store, {}, {}, set()
+            )
+        self.assertEqual(cm.exception.item_kind, "node_action")
+        self.assertIn("duplicate canonical node", cm.exception.reason)
+        self.assertEqual(node_store, {})
+
+    def test_reuse_of_unknown_memory_id_fails_chunk(self) -> None:
+        chunk = self.chunk()
+        response = ChunkExtractionResponse(
+            node_actions=[
+                {
+                    "ref_id": "c1",
+                    "action": "reuse",
+                    "existing_id": "concept_未知",
+                    "mention": "函数",
+                    "evidence": {"start_line": 1, "end_line": 1},
+                }
+            ],
+            relations=[],
+            expressions=[],
+            notes=[],
+        )
+        with self.assertRaises(ChunkMergeError) as cm:
+            self.extractor._merge_chunk_response(
+                response, chunk, "source.md", ["函数"], {}, {}, {}, set()
+            )
+        self.assertEqual(cm.exception.item_kind, "node_action")
+        self.assertIn("was not supplied in node_memory", cm.exception.reason)
+
+    def test_reuse_claim_kind_mismatch_fails_chunk(self) -> None:
+        chunk = self.chunk()
+        existing = NodeRecord(
+            id=_node_id("Claim", "极限唯一性"),
+            type="Claim",
+            name="极限唯一性",
+            aliases=[],
+            description="已有断言",
+            claim_kind="property",
+            evidence=[],
+        )
+        response = ChunkExtractionResponse(
+            node_actions=[
+                {
+                    "ref_id": "c1",
+                    "action": "reuse",
+                    "existing_id": existing.id,
+                    "mention": "极限唯一性",
+                    "type": "Claim",
+                    "claim_kind": "criterion",
+                    "evidence": {"start_line": 1, "end_line": 1},
+                }
+            ],
+            relations=[],
+            expressions=[],
+            notes=[],
+        )
+        store = {existing.id: existing.model_copy(deep=True)}
+        with self.assertRaises(ChunkMergeError) as cm:
+            self.extractor._merge_chunk_response(
+                response, chunk, "source.md", ["函数"], store, {}, {}, {existing.id}
+            )
+        self.assertIn("claim_kind mismatch", cm.exception.reason)
+        self.assertEqual(store[existing.id].claim_kind, "property")
+
+    def test_pending_unlinked_is_recorded_for_valid_response(self) -> None:
+        chunk = self.chunk()
+        response = ChunkExtractionResponse(
+            node_actions=[self.create_action()],
+            relations=[],
+            expressions=[],
+            notes=[],
+        )
+        node_store: dict[str, NodeRecord] = {}
+        summary = self.extractor._merge_chunk_response(
+            response, chunk, "source.md", ["函数"], node_store, {}, {}, set()
+        )
+        self.assertEqual(summary["pending_node_count"], 1)
+        self.assertEqual(summary["pending_node_refs"], ["c1"])
+        self.assertEqual(summary["decisions"][0]["status"], "pending_unlinked")
+
+    def test_pipeline_merge_failure_terminates_task(self) -> None:
+        extractor = Extractor(save_output=False, verbose=False)
+        chunk1 = DocumentChunk(
+            id="chunk_1", start_line=1, end_line=1, heading_path=[], text="1: 函数"
+        )
+        chunk2 = DocumentChunk(
+            id="chunk_2", start_line=2, end_line=2, heading_path=[], text="2: 极限"
+        )
+        extractor.source_context_by_line = {
+            1: (["第一节"], "t1", "paragraph"),
+            2: (["第一节"], "t2", "paragraph"),
+        }
+        extractor.source_latex_candidates = {}
+        invalid_payload = {
+            "node_actions": [
+                {
+                    "ref_id": "c1",
+                    "action": "create",
+                    "type": "Concept",
+                    "name": "函数",
+                    "description": "定义",
+                    "evidence": {"start_line": 1, "end_line": 1},
+                }
+            ],
+            "relations": [
+                {
+                    "source_ref": "c1",
+                    "relation_type": "involves",
+                    "target_ref": "ghost",
+                    "evidence": {"start_line": 1, "end_line": 1},
+                }
+            ],
+            "expressions": [],
+            "notes": [],
+        }
+        state = {
+            "input_path": "source.md",
+            "output_path": "result.json",
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash",
+            "base_url": "https://api.deepseek.com",
+            "temperature": 0.1,
+            "thinking": "enabled",
+            "reasoning_effort": "medium",
+            "max_tokens": 4096,
+            "raw_lines": ["函数", "极限"],
+            "chunks": [chunk1, chunk2],
+            "diagnostics": {},
+            "resume": False,
+            "request_delay": 0,
+            "save_output": False,
+        }
+        calls: list[str] = []
+        client = SimpleNamespace(
+            complete_json=lambda system, user, label: calls.append(label) or (
+                invalid_payload if label == "chunk_1" else {"node_actions": [], "relations": [], "expressions": [], "notes": []}
+            ),
+            request_history=[],
+        )
+        captured: dict[str, Any] = {}
+
+        def fake_finalize(
+            input_path: str,
+            lines: list[str],
+            node_store: dict[str, NodeRecord],
+            relation_store: dict,
+            expression_store: dict,
+            diagnostics: dict[str, Any],
+        ) -> None:
+            del input_path, lines, relation_store, expression_store
+            captured["diagnostics"] = diagnostics
+
+        with (
+            patch.object(extractor, "_client", return_value=client),
+            patch.object(extractor, "_write_chunk_cache") as write_cache,
+            patch.object(extractor, "_finalize_result", side_effect=fake_finalize),
+            patch.object(extractor, "_save_result"),
+            patch("agents.Extractor._write_invalid_response", return_value=Path("debug.json.txt")),
+        ):
+            with self.assertRaises(ChunkMergeError) as cm:
+                extractor._extract_sequentially(state)
+
+        exc = cm.exception
+        self.assertEqual(exc.chunk_id, "chunk_1")
+        self.assertEqual(exc.item_kind, "relation")
+        self.assertIn("ghost", exc.item_ref)
+        self.assertIn("raw response saved to", exc.reason)
+        self.assertIn("debug.json.txt", exc.reason)
+        # Only chunk_1 was called; chunk_2 was never reached
+        self.assertEqual(calls, ["chunk_1"])
+        # finalize and save were never called after failure
+        self.assertDictEqual(captured, {})
+        # No cache written for the failed chunk
+        write_cache.assert_not_called()
+
+
+
+class MemoryDtoTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.extractor = Extractor(save_output=False, verbose=False)
+
+    def evidence(self, line: int = 1) -> Evidence:
+        return Evidence(
+            source_path="data/source.md",
+            start_line=line,
+            end_line=line,
+            text="函数在点 x0 的邻域内有定义。",
+            chunk_id="chunk_1",
+            heading_path=["第一节"],
+            teaching_block_id="teaching_1",
+            discourse_role="paragraph",
+        )
+
+    def node(self, node_id: str, name: str) -> NodeRecord:
+        return NodeRecord(
+            id=node_id,
+            type="Concept",
+            name=name,
+            aliases=[f"{name}的别名"],
+            description="这是一个概念的定义，包含完整语义。" * 6,
+            claim_kind=None,
+            evidence=[self.evidence()],
+        )
+
+    def build(
+        self, node_count: int, relation_count: int
+    ) -> tuple[dict[str, NodeRecord], dict[tuple[str, str, str], RelationRecord], dict]:
+        nodes = {
+            f"concept_c{i:03d}": self.node(f"concept_c{i:03d}", f"概念{i}")
+            for i in range(node_count)
+        }
+        relations: dict[tuple[str, str, str], RelationRecord] = {}
+        ids = list(nodes)
+        for i in range(min(relation_count, node_count - 1)):
+            relations[(ids[i], "defined_in_terms_of", ids[i + 1])] = RelationRecord(
+                source_id=ids[i],
+                relation_type="defined_in_terms_of",
+                target_id=ids[i + 1],
+                evidences=[self.evidence()],
+            )
+        return nodes, relations, {}
+
+    def chunk(self, node_count: int) -> DocumentChunk:
+        text = "1: " + " ".join(f"概念{i}" for i in range(node_count))
+        return DocumentChunk(id="chunk_1", start_line=1, end_line=1, heading_path=["第一节"], text=text)
+
+    @staticmethod
+    def serialized_bytes(items: list[object]) -> int:
+        dumped = [item.model_dump(mode="json") for item in items]
+        return len(json.dumps(dumped, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+    def test_memory_dto_serializes_only_whitelist_fields(self) -> None:
+        nodes, relations, expressions = self.build(5, 4)
+        node_memory, relation_memory, _ = self.extractor._build_memory_for_chunk(
+            self.chunk(5),
+            nodes,
+            relations,
+            expressions,
+            set(),
+            node_char_budget=50000,
+            relation_char_budget=10000,
+        )
+
+        self.assertGreater(len(node_memory), 0)
+        for item in node_memory:
+            self.assertEqual(
+                set(item.model_dump(mode="json")),
+                {"id", "type", "name", "aliases", "claim_kind", "short_description"},
+            )
+        for item in relation_memory:
+            self.assertEqual(
+                set(item.model_dump(mode="json")),
+                {"source_id", "relation_type", "target_id"},
+            )
+
+    def test_memory_respects_node_char_budget(self) -> None:
+        nodes, relations, expressions = self.build(60, 0)
+        small_memory, _, _ = self.extractor._build_memory_for_chunk(
+            self.chunk(60), nodes, relations, expressions, set(), node_char_budget=1500
+        )
+        large_memory, _, _ = self.extractor._build_memory_for_chunk(
+            self.chunk(60), nodes, relations, expressions, set(), node_char_budget=12000
+        )
+
+        self.assertLessEqual(self.serialized_bytes(small_memory), 1500)
+        self.assertLessEqual(self.serialized_bytes(large_memory), 12000)
+        self.assertGreater(len(large_memory), len(small_memory))
+
+    def test_memory_respects_relation_char_budget(self) -> None:
+        nodes, relations, expressions = self.build(60, 55)
+        _, small_relations, _ = self.extractor._build_memory_for_chunk(
+            self.chunk(60),
+            nodes,
+            relations,
+            expressions,
+            set(),
+            node_char_budget=20000,
+            relation_char_budget=800,
+        )
+        _, large_relations, _ = self.extractor._build_memory_for_chunk(
+            self.chunk(60),
+            nodes,
+            relations,
+            expressions,
+            set(),
+            node_char_budget=20000,
+            relation_char_budget=6000,
+        )
+
+        self.assertLessEqual(self.serialized_bytes(small_relations), 800)
+        self.assertLessEqual(self.serialized_bytes(large_relations), 6000)
+        self.assertGreater(len(large_relations), len(small_relations))
+
+    def test_relation_endpoints_are_closed_in_node_memory(self) -> None:
+        nodes, relations, expressions = self.build(10, 9)
+        node_memory, relation_memory, _ = self.extractor._build_memory_for_chunk(
+            self.chunk(10),
+            nodes,
+            relations,
+            expressions,
+            set(),
+            node_char_budget=1200,
+            relation_char_budget=6000,
+        )
+
+        node_ids = {item.id for item in node_memory}
+        self.assertGreater(len(relation_memory), 0)
+        for relation in relation_memory:
+            self.assertIn(relation.source_id, node_ids)
+            self.assertIn(relation.target_id, node_ids)
+
+    def test_memory_selection_is_deterministic(self) -> None:
+        nodes, relations, expressions = self.build(20, 15)
+        first = self.extractor._build_memory_for_chunk(self.chunk(20), nodes, relations, expressions, set())
+        second = self.extractor._build_memory_for_chunk(self.chunk(20), nodes, relations, expressions, set())
+
+        self.assertEqual(
+            [item.model_dump(mode="json") for item in first[0]],
+            [item.model_dump(mode="json") for item in second[0]],
+        )
+        self.assertEqual(
+            [item.model_dump(mode="json") for item in first[1]],
+            [item.model_dump(mode="json") for item in second[1]],
+        )
+        self.assertEqual(first[2], second[2])
+
+    def test_selection_diag_records_scores_and_reasons(self) -> None:
+        nodes, relations, expressions = self.build(3, 0)
+        _, _, selection = self.extractor._build_memory_for_chunk(self.chunk(3), nodes, relations, expressions, set())
+
+        self.assertEqual([entry["id"] for entry in selection], [f"concept_c{i:03d}" for i in range(3)])
+        self.assertTrue(all(entry["score"] > 0 for entry in selection))
+        self.assertTrue(all("reasons" in entry and "source" in entry for entry in selection))
+
+    def test_short_description_truncates_at_sentence_boundary(self) -> None:
+        with_boundary = "这是第一句完整语义，包含逗号。" + "补充内容" * 30
+        short = self.extractor._short_description(with_boundary)
+        self.assertLessEqual(len(short), 100)
+        self.assertEqual(short, "这是第一句完整语义，包含逗号。")
+
+        no_boundary = "无标点连续内容" * 20
+        self.assertEqual(len(self.extractor._short_description(no_boundary)), 100)
+
+        plain = "短描述"
+        self.assertEqual(self.extractor._short_description(plain), "短描述")
+        self.assertEqual(self.extractor._short_description("   "), "")
+
+    def test_array_bytes_exact_budget_includes_item(self) -> None:
+        nodes, relations, expressions = self.build(3, 0)
+        item0 = self.extractor._node_memory_item(nodes["concept_c000"])
+        item1 = self.extractor._node_memory_item(nodes["concept_c001"])
+        both_bytes = self.extractor._memory_array_bytes([item0, item1])
+        memory_at_budget, _, _ = self.extractor._build_memory_for_chunk(
+            self.chunk(3), nodes, relations, expressions, set(),
+            node_char_budget=both_bytes, relation_char_budget=0,
+        )
+        self.assertEqual(len(memory_at_budget), 2)
+        memory_one_less, _, _ = self.extractor._build_memory_for_chunk(
+            self.chunk(3), nodes, relations, expressions, set(),
+            node_char_budget=both_bytes - 1, relation_char_budget=0,
+        )
+        self.assertEqual(len(memory_one_less), 1)
+
+    def test_compact_prompt_serialization_contains_arrays(self) -> None:
+        nodes, relations, expressions = self.build(5, 4)
+        node_memory, relation_memory, _ = self.extractor._build_memory_for_chunk(
+            self.chunk(5), nodes, relations, expressions, set(),
+            node_char_budget=5000, relation_char_budget=3000,
+        )
+        prompt = self.extractor._chunk_extraction_prompt(
+            self.chunk(1), "source.md", node_memory, relation_memory,
+        )
+        self.assertLessEqual(self.extractor._memory_array_bytes(node_memory), 5000)
+        self.assertLessEqual(self.extractor._memory_array_bytes(relation_memory), 3000)
+        node_json = json.dumps(
+            [item.model_dump(mode="json") for item in node_memory],
+            ensure_ascii=False, separators=(",", ":"),
+        )
+        rel_json = json.dumps(
+            [item.model_dump(mode="json") for item in relation_memory],
+            ensure_ascii=False, separators=(",", ":"),
+        )
+        self.assertIn('"node_memory":' + node_json, prompt)
+        self.assertIn('"relation_memory":' + rel_json, prompt)
+
+    def test_relation_excluded_when_budget_exceeded_despite_closed_endpoints(self) -> None:
+        nodes, relations, expressions = self.build(10, 9)
+        first_rel = self.extractor._relation_memory_item(
+            relations[("concept_c000", "defined_in_terms_of", "concept_c001")]
+        )
+        first_rel_bytes = self.extractor._memory_array_bytes([first_rel])
+        node_memory, relation_memory, _ = self.extractor._build_memory_for_chunk(
+            self.chunk(10), nodes, relations, expressions, set(),
+            node_char_budget=20000, relation_char_budget=first_rel_bytes - 1,
+        )
+        node_ids = {item.id for item in node_memory}
+        self.assertIn("concept_c000", node_ids)
+        self.assertIn("concept_c001", node_ids)
+        self.assertEqual(len(relation_memory), 0)
+
+    def test_memory_budget_counts_multibyte_utf8_bytes(self) -> None:
+        nodes: dict[str, NodeRecord] = {}
+        for i in range(3):
+            name = f"概念{i}"
+            nodes[f"node_{i}"] = NodeRecord(
+                id=f"node_{i}",
+                type="Concept",
+                name=name,
+                aliases=[],
+                description="",
+                claim_kind=None,
+                evidence=[],
+                short_description="",
+                source_chunks=[],
+                heading_paths=[],
+                chunk_heading_paths=[],
+                section_labels=[],
+                teaching_blocks=[],
+            )
+        item = self.extractor._node_memory_item(nodes["node_0"])
+        item_bytes = self.extractor._memory_item_bytes(item)
+        expected = len(json.dumps(item.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        self.assertEqual(item_bytes, expected)
+        arr_bytes = self.extractor._memory_array_bytes([self.extractor._node_memory_item(nodes[f"node_{i}"]) for i in range(2)])
+        node_memory, _, _ = self.extractor._build_memory_for_chunk(
+            self.chunk(3), nodes, {}, {}, set(),
+            node_char_budget=arr_bytes, relation_char_budget=0,
+        )
+        self.assertEqual(len(node_memory), 2)
 
 
 class ApiCompletionTests(unittest.TestCase):

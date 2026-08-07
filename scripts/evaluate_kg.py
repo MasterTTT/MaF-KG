@@ -61,6 +61,11 @@ def main() -> int:
         gold_path = Path(args.gold)
         gold_data = load_json(gold_path)
         report["gold_evaluation"] = evaluate_nodes_against_gold(data, gold_data, gold_path)
+    if args.additional_inputs:
+        if not args.gold:
+            raise SystemExit("Relation stability evaluation requires --gold for endpoint alignment")
+        graphs = [data, *(load_json(Path(p)) for p in args.additional_inputs)]
+        report["relation_stability"] = evaluate_relation_stability(graphs, gold_data, gold_path)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
@@ -76,6 +81,12 @@ def parse_args() -> argparse.Namespace:
         "input",
         nargs="?",
         help="KG JSON file. If omitted, the latest supported JSON file under --kg-dir is used.",
+    )
+    parser.add_argument(
+        "additional_inputs",
+        nargs="*",
+        help="Additional KG JSON runs of the same source section for cross-run relation "
+        "stability evaluation (requires --gold).",
     )
     parser.add_argument("--kg-dir", default="KG", help="Directory used when input is omitted.")
     parser.add_argument("--json", action="store_true", help="Print full machine-readable JSON report.")
@@ -400,6 +411,33 @@ def evaluate_semantic_graph(data: dict[str, Any], path: Path) -> dict[str, Any]:
             wide_evidence_nodes.append({"id": node.get("id"), "name": node.get("name"), "max_span": max(spans)})
 
     component_sizes = semantic_component_sizes(node_by_id, relations)
+    chunk_summaries = data.get("diagnostics", {}).get("chunk_summaries", [])
+    if not isinstance(chunk_summaries, list):
+        chunk_summaries = []
+    chunk_merge_failures = [
+        {"chunk_id": summary.get("chunk_id"), **summary.get("merge_failure", {})}
+        for summary in chunk_summaries
+        if isinstance(summary, dict) and isinstance(summary.get("merge_failure"), dict)
+    ]
+    chunk_identity_conflicts = [
+        {"chunk_id": summary.get("chunk_id"), **conflict}
+        for summary in chunk_summaries
+        if isinstance(summary, dict)
+        for conflict in summary.get("identity_conflicts", [])
+        if isinstance(conflict, dict)
+    ]
+    chunk_skipped_items = [
+        {"chunk_id": summary.get("chunk_id"), **item}
+        for summary in chunk_summaries
+        if isinstance(summary, dict)
+        for item in summary.get("skipped_items", [])
+        if isinstance(item, dict)
+    ]
+    chunk_pending_unlinked = [
+        {"chunk_id": summary.get("chunk_id"), "pending_node_refs": summary.get("pending_node_refs", [])}
+        for summary in chunk_summaries
+        if isinstance(summary, dict) and summary.get("pending_node_refs")
+    ]
     issues = {
         "invalid_node_type": issue_block(invalid_node_types, node_label, nodes),
         "missing_description_node": issue_block(missing_descriptions, node_label, nodes),
@@ -427,6 +465,10 @@ def evaluate_semantic_graph(data: dict[str, Any], path: Path) -> dict[str, Any]:
         "invalid_evidence": direct_issue_block(evidence_errors),
         "isolated_node": issue_block(isolated_nodes, node_label, nodes),
         "wide_evidence_node": direct_issue_block(wide_evidence_nodes),
+        "chunk_merge_failure": direct_issue_block(chunk_merge_failures),
+        "chunk_identity_conflict": direct_issue_block(chunk_identity_conflicts),
+        "chunk_skipped_item": direct_issue_block(chunk_skipped_items),
+        "chunk_pending_unlinked": direct_issue_block(chunk_pending_unlinked),
     }
     severe_issue_keys = {
         "invalid_node_type",
@@ -445,6 +487,9 @@ def evaluate_semantic_graph(data: dict[str, Any], path: Path) -> dict[str, Any]:
         "expression_without_latex",
         "missing_evidence",
         "invalid_evidence",
+        "chunk_merge_failure",
+        "chunk_identity_conflict",
+        "chunk_skipped_item",
     }
     severe_issue_count = sum(issues[key]["count"] for key in severe_issue_keys)
     return {
@@ -734,6 +779,219 @@ def gold_node_summary(item: dict[str, Any]) -> dict[str, Any]:
         "type": item.get("type"),
         "claim_kind": item.get("claim_kind"),
         "name": item.get("name"),
+    }
+
+
+def _gold_alignment_lookup(gold_nodes: list[dict[str, Any]]) -> dict[tuple[Any, Any, str], str]:
+    """Map reviewed (type, claim_kind, canonical name) to gold_id for endpoint alignment.
+
+    Only M and O items are indexed; X (forbidden) items have no reviewed id to
+    align to. When a canonical key collides between items, M wins over O,
+    mirroring the priority used by evaluate_nodes_against_gold.
+    Within the same requirement level, two items with the same canonical key
+    that map to different gold_ids raise a ValueError.
+    """
+    lookup: dict[tuple[Any, Any, str], str] = {}
+    set_by: dict[tuple[Any, Any, str], str] = {}
+    for item in sorted(
+        (entry for entry in gold_nodes if entry.get("requirement") != "X"),
+        key=lambda entry: (entry.get("requirement") == "M", entry.get("gold_id", "")),
+    ):
+        requirement = item.get("requirement")
+        names = [item.get("name", "")]
+        if isinstance(item.get("accepted_names"), list):
+            names.extend(item["accepted_names"])
+        for name in names:
+            canonical = canonical_node_name(str(name))
+            if not canonical:
+                continue
+            key = (item.get("type"), item.get("claim_kind"), canonical)
+            if key in lookup and set_by[key] == requirement and lookup[key] != item.get("gold_id"):
+                raise ValueError(
+                    f"Conflicting gold {requirement} items map to {key!r}: "
+                    f"gold_id {lookup[key]!r} vs {item.get('gold_id')!r}"
+                )
+            lookup[key] = item.get("gold_id")
+            set_by[key] = requirement
+    return lookup
+
+
+def gold_id_for_predicted_node(
+    predicted: dict[str, Any], lookup: dict[tuple[Any, Any, str], str]
+) -> str | None:
+    claim_kind = predicted.get("claim_kind") if predicted.get("type") == "Claim" else None
+    names = [predicted.get("name", "")]
+    if isinstance(predicted.get("aliases"), list):
+        names.extend(predicted["aliases"])
+    for name in names:
+        canonical = canonical_node_name(str(name))
+        if not canonical:
+            continue
+        gold_id = lookup.get((predicted.get("type"), claim_kind, canonical))
+        if gold_id is not None:
+            return gold_id
+    return None
+
+
+def gold_aligned_relation_report(
+    data: dict[str, Any], gold_data: dict[str, Any], gold_path: Path
+) -> dict[str, Any]:
+    """Map one graph's relation endpoints to reviewed gold ids.
+
+    raw_edges keeps the model-generated node names for the legacy raw-name
+    metric; aligned_edges requires both endpoints to resolve to a reviewed
+    gold id and drops relations that do not.
+    """
+    source_file = Path(str(data.get("source_path", ""))).name
+    graphs = gold_data.get("graphs", [])
+    selected = next(
+        (graph for graph in graphs if str(graph.get("source_file", "")) == source_file),
+        None,
+    )
+    if selected is None:
+        raise SystemExit(f"Gold file {gold_path} has no graph annotation for source {source_file!r}")
+
+    gold_nodes = flatten_gold_node_groups(selected.get("node_groups", []))
+    lookup = _gold_alignment_lookup(gold_nodes)
+    nodes = data.get("nodes", []) if isinstance(data.get("nodes"), list) else []
+    node_by_id = {node.get("id"): node for node in nodes if node.get("id")}
+    relations = data.get("relations", []) if isinstance(data.get("relations"), list) else []
+
+    raw_edges: set[tuple[str, str, str]] = set()
+    aligned_edges: set[tuple[str, str, str]] = set()
+    dropped: list[dict[str, Any]] = []
+    for rel in relations:
+        source_id = rel.get("source_id")
+        target_id = rel.get("target_id")
+        rel_type = rel.get("type")
+        if source_id not in node_by_id or target_id not in node_by_id:
+            dropped.append(
+                {
+                    "relation_id": rel.get("id"),
+                    "relation_type": rel_type,
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "reason": "endpoint missing from predicted nodes",
+                }
+            )
+            continue
+        source_node = node_by_id[source_id]
+        target_node = node_by_id[target_id]
+        raw_edges.add(
+            (
+                str(source_node.get("name", "")),
+                str(rel_type),
+                str(target_node.get("name", "")),
+            )
+        )
+        source_gold = gold_id_for_predicted_node(source_node, lookup)
+        target_gold = gold_id_for_predicted_node(target_node, lookup)
+        if source_gold is None or target_gold is None:
+            dropped.append(
+                {
+                    "relation_id": rel.get("id"),
+                    "relation_type": rel_type,
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "source_name": str(source_node.get("name", "")),
+                    "target_name": str(target_node.get("name", "")),
+                    "reason": "endpoint without a reviewed gold id",
+                }
+            )
+            continue
+        aligned_edges.add((source_gold, str(rel_type), target_gold))
+
+    return {
+        "source_file": source_file,
+        "relation_annotation_status": selected.get("relation_annotation_status", "pending"),
+        "relation_count": len(relations),
+        "raw_edge_count": len(raw_edges),
+        "aligned_edge_count": len(aligned_edges),
+        "dropped_relation_count": len(dropped),
+        "alignment_coverage": safe_ratio(len(aligned_edges), len(relations)),
+        "dropped_relations": dropped,
+        "raw_edges": sorted(raw_edges),
+        "aligned_edges": sorted(aligned_edges),
+    }
+
+
+def evaluate_relation_stability(
+    graphs: list[dict[str, Any]], gold_data: dict[str, Any], gold_path: Path
+) -> dict[str, Any]:
+    """Cross-run relation-set stability using gold-aligned endpoints.
+
+    Jaccard is computed twice per run pair: raw_name uses the model-generated
+    endpoint names and therefore counts naming drift as instability;
+    gold_aligned maps endpoints to reviewed gold ids first. relation_metrics
+    stays null because gold relations are not annotated yet: stability is not
+    precision, recall, or F1.
+    """
+    if not graphs:
+        raise SystemExit("Relation stability evaluation requires at least one KG JSON")
+    source_files = {Path(str(g.get("source_path", ""))).name for g in graphs}
+    if len(source_files) > 1:
+        raise SystemExit(
+            "Relation stability evaluation requires runs of one source section, "
+            f"got: {sorted(source_files)}"
+        )
+
+    reports = [gold_aligned_relation_report(g, gold_data, gold_path) for g in graphs]
+    raw_edge_sets = [set(r["raw_edges"]) for r in reports]
+    aligned_edge_sets = [set(r["aligned_edges"]) for r in reports]
+
+    pairwise = []
+    for i in range(len(reports)):
+        for j in range(i + 1, len(reports)):
+            raw_intersection = raw_edge_sets[i] & raw_edge_sets[j]
+            raw_union = raw_edge_sets[i] | raw_edge_sets[j]
+            aligned_intersection = aligned_edge_sets[i] & aligned_edge_sets[j]
+            aligned_union = aligned_edge_sets[i] | aligned_edge_sets[j]
+            pairwise.append(
+                {
+                    "run_a": i + 1,
+                    "run_b": j + 1,
+                    "raw_name_jaccard": safe_ratio(len(raw_intersection), len(raw_union)),
+                    "gold_aligned_jaccard": safe_ratio(
+                        len(aligned_intersection), len(aligned_union)
+                    ),
+                    "raw_intersection_count": len(raw_intersection),
+                    "raw_union_count": len(raw_union),
+                    "gold_aligned_intersection_count": len(aligned_intersection),
+                    "gold_aligned_union_count": len(aligned_union),
+                }
+            )
+
+    stable_raw = set.intersection(*raw_edge_sets) if raw_edge_sets else set()
+    stable_aligned = set.intersection(*aligned_edge_sets) if aligned_edge_sets else set()
+
+    return {
+        "gold_file": str(gold_path),
+        "gold_schema_version": gold_data.get("schema_version"),
+        "source_file": sorted(source_files)[0] if source_files else None,
+        "run_count": len(reports),
+        "relation_annotation_status": reports[0]["relation_annotation_status"],
+        "runs": [
+            {
+                "run_index": i + 1,
+                "relation_count": r["relation_count"],
+                "raw_edge_count": r["raw_edge_count"],
+                "aligned_edge_count": r["aligned_edge_count"],
+                "dropped_relation_count": r["dropped_relation_count"],
+                "alignment_coverage": r["alignment_coverage"],
+                "dropped_relations": r["dropped_relations"],
+            }
+            for i, r in enumerate(reports)
+        ],
+        "pairwise": pairwise,
+        "stable_edges": {
+            "raw_name": sorted(stable_raw),
+            "gold_aligned": sorted(stable_aligned),
+        },
+        "edge_union_counts": {
+            "raw_name": len(set().union(*raw_edge_sets)) if raw_edge_sets else 0,
+            "gold_aligned": len(set().union(*aligned_edge_sets)) if aligned_edge_sets else 0,
+        },
+        "relation_metrics": None,
     }
 
 
@@ -1045,6 +1303,26 @@ def print_text_report(report: dict[str, Any], sample_size: int) -> None:
             f"FN={metrics['false_negative']}, optional={metrics['optional_matched']})"
         )
         print(f"Gold relation status: {gold['relation_annotation_status']}")
+    stability = report.get("relation_stability")
+    if stability:
+        print(f"Relation stability: {stability['run_count']} runs of {stability['source_file']}")
+        print(f"  Gold relation status: {stability['relation_annotation_status']}")
+        for pair in stability["pairwise"]:
+            print(
+                f"  Jaccard r{pair['run_a']}-r{pair['run_b']}: "
+                f"raw_name={pair['raw_name_jaccard']:.4f} "
+                f"gold_aligned={pair['gold_aligned_jaccard']:.4f}"
+            )
+        for run in stability["runs"]:
+            print(
+                f"  Run {run['run_index']}: {run['aligned_edge_count']}/{run['relation_count']} aligned edges "
+                f"(coverage {run['alignment_coverage']:.2%}, dropped {run['dropped_relation_count']})"
+            )
+        print(
+            "  Stable gold-aligned edges: "
+            f"{len(stability['stable_edges']['gold_aligned'])} "
+            f"(union {stability['edge_union_counts']['gold_aligned']})"
+        )
     print()
     print("Node types:")
     for key, value in sorted(counts["node_count_by_type"].items()):

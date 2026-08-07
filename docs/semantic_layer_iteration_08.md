@@ -110,6 +110,65 @@ schema、默认输出和 cache namespace 升级到 v1.5.9。新增 4 项合成�
 
 第三节总计 383270 token、1596.9s API latency；第四节总计 179661 token、823.7s API latency。流程可靠性提升不等于语义质量提升，二者必须分开报告。
 
+## 关系稳定性口径修正（gold-aligned）
+
+迭代 08 初稿直接使用模型生成的节点名称比较关系，错误地把节点命名漂移计入了关系漂移。`scripts/evaluate_kg.py` 现已新增 `relation_stability` 多图评估：先利用现有 Gold 节点匹配结果（type + claim_kind + canonical name，含 accepted_names 与 aliases，排除 X 项，M 优先于 O）把预测关系端点映射到 Gold ID，再计算关系集合 Jaccard 与多轮稳定边；同时保留 `raw_name` 指标，不覆盖历史数据。
+
+两种口径：
+
+- `raw_name`：端点用模型生成的名称原样比较，命名漂移计入关系不稳定；
+- `gold_aligned`：端点先映射到 Gold ID，同一 Gold 节点在轮次间的命名差异不再计入关系漂移；端点无法映射到已审查 Gold ID 的关系（`dropped_relation_count`）不进入对齐集合。
+
+第三节对齐结果为：
+
+```text
+pairwise Jaccard:      r1-r2  r1-r3  r2-r3
+raw_name:               .0769  .0857  .3333
+gold_aligned:           .6500  .5000  .4500
+```
+
+`gold_aligned` 并集 23 条边，三轮稳定 9 条；`raw_name` 并集 47 条，稳定 3 条（与初稿一致）。三轮稳定对齐边：
+
+```text
+左极限 -[defined_in_terms_of]-> 函数在一点处的极限
+左极限 -[special_case_of]-> 单侧极限
+右极限 -[defined_in_terms_of]-> 函数在一点处的极限
+右极限 -[special_case_of]-> 单侧极限
+函数极限的唯一性 -[involves]-> 函数在一点处的极限
+函数极限的保号性推论 -[derived_from]-> 函数极限的局部保号性
+函数极限的保号性推论 -[involves]-> 函数在一点处的极限
+函数极限的局部有界性 -[involves]-> 函数在一点处的极限
+函数极限的局部保号性 -[involves]-> 函数在一点处的极限
+```
+
+第四节对齐结果为：
+
+```text
+pairwise Jaccard:      r1-r2   r1-r3  r2-r3
+raw_name:               .1000   .1250  .3333
+gold_aligned:           .1429   .4000  .3750
+```
+
+`gold_aligned` 并集 8 条边，三轮稳定 1 条：「铅直渐近线 -[defined_in_terms_of]-> 无穷大」。
+
+两点口径说明：
+
+1. `raw_name` 的 r2-r3 由初稿的 `.2903`（9/31）变为 `.3333`（10/30）。初稿是一次性脚本，边身份比纯名称集合更细：r2 与 r3 均含「函数极限的保号性推论 -[involves]-> 函数在一点处的极限」，但 evidence 分别为 290-293 与 290-292，按更细身份不匹配。新工具以纯名称集合复现 r1-r2（3/39）与 r1-r3（3/35）与初稿完全一致，r2-r3 的差异源于历史口径而非数据变化；初稿的 `.0769/.0857/.2903` 及 48 条并集作为历史数据保留在本记录上方，不再作为可比口径。
+2. 端点无法映射到 Gold ID 的关系（第三节三轮 3/6/5 条，第四节三轮 2/1/0 条）是 pending-unlinked 诊断，只说明该节点尚未在 Gold 中标注，不代表关系本身错误。Gold 关系仍未标注，`relation_metrics` 保持 `null`，对齐 Jaccard 只反映跨轮稳定性，不是关系的 Precision/Recall/F1。
+3. 每轮报告新增 `alignment_coverage = aligned_edge_count / relation_count`。`gold_aligned_jaccard` 只衡量对齐子集内部的跨轮稳定性，解读时必须同时看覆盖率：若各轮都只对齐到同一条边，Jaccard 可能为 1.0，但这只是"这一条边稳定"的弱证据。覆盖率低时高 Jaccard 不能作为关系整体稳定的结论。
+
+复现命令：
+
+```powershell
+& 'E:\MaF-KG\.venv\Scripts\python.exe' scripts\evaluate_kg.py `
+  'KG\第一章第三节_semantic_v1_5_9_teaching_units_pro_medium_r1.json' `
+  'KG\第一章第三节_semantic_v1_5_9_teaching_units_pro_medium_r2.json' `
+  'KG\第一章第三节_semantic_v1_5_9_teaching_units_pro_medium_r3.json' `
+  --gold 'evaluation\gold\semantic_first_three_sections_v2.json' --json
+```
+
+第四节把文件换成 `第一章第四节_*` 三个 r1/r2/r3 与 `--gold evaluation\gold\semantic_fourth_section_v1.json` 即可。
+
 ## 最终判断
 
 1. 自动 teaching-unit 成功复现人工边界，并将手工行号实验变成了跨章节可运行、可审计的机制；
