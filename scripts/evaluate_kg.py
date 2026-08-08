@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import re
 import sys
@@ -707,7 +708,7 @@ class SemanticNameMatcher:
 
     def best_candidates(self, predicted: dict[str, Any], gold_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Rank same-type gold items by embedding similarity to the predicted name."""
-        if predicted.get("type") != "Concept":
+        if predicted.get("type") not in ("Concept", "Claim", "Method"):
             return []
         query = str(predicted.get("name", ""))
         if not query.strip():
@@ -750,32 +751,47 @@ def evaluate_nodes_against_gold(
     matched_must: dict[str, dict[str, Any]] = {}
     matched_optional: dict[str, dict[str, Any]] = {}
     false_positives: list[dict[str, Any]] = []
+    match_layer_counts: Counter = Counter()
 
     semantic_matcher: SemanticNameMatcher | None = None
     if semantic_match:
         semantic_matcher = SemanticNameMatcher()
 
-    for predicted in predicted_nodes:
-        candidates = [
+    gold_pool = [*must_nodes, *optional_nodes]
+
+    def same_claim_kind_pool(predicted: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
             item
-            for item in [*must_nodes, *optional_nodes]
-            if gold_node_matches(predicted, item)
+            for item in gold_pool
+            if item.get("type") == predicted.get("type")
+            and (
+                predicted.get("type") != "Claim"
+                or item.get("claim_kind") == predicted.get("claim_kind")
+            )
         ]
+
+    for predicted in predicted_nodes:
+        candidates = [item for item in gold_pool if gold_node_matches(predicted, item)]
         candidates.sort(key=lambda item: (item["requirement"] != "M", item["gold_id"]))
         chosen: dict[str, Any] | None = None
+        layer = "rule"
         if candidates:
             chosen = candidates[0]
-        elif semantic_matcher is not None:
-            concept_gold = [
-                item
-                for item in [*must_nodes, *optional_nodes]
-                if item.get("type") == "Concept"
-            ]
-            for candidate in semantic_matcher.best_candidates(predicted, concept_gold):
+        if chosen is None:
+            fuzzy = fuzzy_gold_candidates(predicted, gold_pool)
+            if fuzzy:
+                chosen = fuzzy[0]
+                layer = "fuzzy"
+        if chosen is None and semantic_matcher is not None:
+            for candidate in semantic_matcher.best_candidates(
+                predicted, same_claim_kind_pool(predicted)
+            ):
                 if semantic_matcher.judge_same(predicted, candidate):
                     chosen = candidate
+                    layer = "semantic"
                     break
         if chosen is not None:
+            match_layer_counts[layer] += 1
             matched = matched_must if chosen["requirement"] == "M" else matched_optional
             if chosen["gold_id"] in matched:
                 false_positives.append(
@@ -793,12 +809,16 @@ def evaluate_nodes_against_gold(
             (item for item in forbidden_nodes if gold_node_matches(predicted, item)),
             None,
         )
+        if forbidden is None:
+            fuzzy_forbidden = fuzzy_gold_candidates(predicted, forbidden_nodes)
+            if fuzzy_forbidden:
+                forbidden = fuzzy_forbidden[0]
         if forbidden is None and semantic_matcher is not None:
             forbidden = next(
                 (
                     item
                     for item in forbidden_nodes
-                    if item.get("type") == "Concept"
+                    if item.get("type") == predicted.get("type")
                     and semantic_matcher.judge_same(predicted, item)
                 ),
                 None,
@@ -860,6 +880,7 @@ def evaluate_nodes_against_gold(
             "recall": recall,
             "f1": f1,
             "per_type": per_type,
+            "match_layers": dict(match_layer_counts),
         },
         "false_positives": false_positives,
         "false_negatives": false_negatives,
@@ -904,6 +925,93 @@ def flatten_gold_node_groups(groups: Any) -> list[dict[str, Any]]:
                 }
             )
     return flattened
+
+
+def fuzzy_similarity(name_a: str, name_b: str) -> float:
+    """Character-level name similarity on canonical forms, for all node types.
+
+    Combines difflib ratio (in-order character similarity) with bigram Jaccard
+    (tolerant of word-order shuffling). Both operate on canonical_node_name
+    form, so LaTeX/whitespace/punctuation variants cost nothing here.
+    """
+    a = canonical_node_name(str(name_a))
+    b = canonical_node_name(str(name_b))
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    bigrams_a = {a[i : i + 2] for i in range(len(a) - 1)}
+    bigrams_b = {b[i : i + 2] for i in range(len(b) - 1)}
+    if not bigrams_a or not bigrams_b:
+        return ratio
+    jaccard = len(bigrams_a & bigrams_b) / len(bigrams_a | bigrams_b)
+    return max(ratio, jaccard)
+
+
+FUZZY_MATCH_THRESHOLD = 0.85
+
+# Single-character mathematical modifiers that change the identity of an
+# object (反函数 vs 函数, 左极限 vs 右极限, 上界 vs 下界, 有界 vs 无界).
+# Fuzzy string similarity cannot be trusted across a mismatch here.
+CRITICAL_MODIFIERS = "反左右上下正负奇偶增减内外"
+
+
+def critical_modifier_mismatch(name_a: str, name_b: str) -> bool:
+    set_a = {c for c in canonical_node_name(str(name_a)) if c in CRITICAL_MODIFIERS}
+    set_b = {c for c in canonical_node_name(str(name_b)) if c in CRITICAL_MODIFIERS}
+    return bool(set_a.symmetric_difference(set_b))
+
+
+def fuzzy_gold_candidates(
+    predicted: dict[str, Any],
+    gold_items: list[dict[str, Any]],
+    threshold: float = FUZZY_MATCH_THRESHOLD,
+) -> list[dict[str, Any]]:
+    """Rescue surface-variant matches for Concept, Claim, and Method nodes.
+
+    Same type as predicted; Claim candidates additionally require the same
+    claim_kind. Scored on the best name/alias pair similarity; returns all
+    candidates above threshold, M before O, stable by gold_id.
+    """
+    pool = [
+        item
+        for item in gold_items
+        if item.get("type") == predicted.get("type")
+        and (
+            predicted.get("type") != "Claim"
+            or item.get("claim_kind") == predicted.get("claim_kind")
+        )
+    ]
+    predicted_names = [predicted.get("name", "")]
+    if isinstance(predicted.get("aliases"), list):
+        predicted_names.extend(predicted["aliases"])
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for item in pool:
+        gold_names = [item.get("name", "")]
+        if isinstance(item.get("accepted_names"), list):
+            gold_names.extend(item["accepted_names"])
+        pair_scores = [
+            fuzzy_similarity(p, g)
+            for p in predicted_names
+            if str(p).strip()
+            for g in gold_names
+            if str(g).strip()
+            and not critical_modifier_mismatch(p, g)
+        ]
+        if not pair_scores:
+            continue
+        best = max(pair_scores)
+        if best >= threshold:
+            scored.append((best, item))
+    scored.sort(
+        key=lambda pair: (
+            -pair[0],
+            pair[1].get("requirement") != "M",
+            pair[1].get("gold_id", ""),
+        )
+    )
+    return [item for _, item in scored]
 
 
 def gold_node_matches(predicted: dict[str, Any], gold: dict[str, Any]) -> bool:

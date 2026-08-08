@@ -7,9 +7,12 @@ from pathlib import Path
 from scripts.evaluate_kg import (
     _gold_alignment_lookup,
     canonical_node_name,
+    critical_modifier_mismatch,
     evaluate,
     evaluate_nodes_against_gold,
     evaluate_relation_stability,
+    fuzzy_gold_candidates,
+    fuzzy_similarity,
     resolve_input,
 )
 
@@ -308,6 +311,115 @@ class GoldNodeEvaluatorTests(unittest.TestCase):
     def test_mathematical_signs_remain_identity_significant(self) -> None:
         self.assertNotEqual(canonical_node_name("x→∞"), canonical_node_name("x→-∞"))
         self.assertNotEqual(canonical_node_name("x→+∞"), canonical_node_name("x→-∞"))
+
+    def test_fuzzy_layer_rescues_surface_variant(self) -> None:
+        predicted = self.concept("复合函数的极限运算法则")
+        report = self.evaluate_gold(
+            [predicted],
+            [
+                {
+                    "requirement": "M",
+                    "type": "Concept",
+                    "items": [{"gold_id": "compound_limit_rule", "name": "复合函数极限的运算法则"}],
+                }
+            ],
+        )
+
+        metrics = report["node_metrics"]
+        self.assertEqual(metrics["true_positive"], 1)
+        self.assertEqual(metrics["match_layers"]["fuzzy"], 1)
+
+    def test_fuzzy_rejects_inverse_function_modifier_mismatch(self) -> None:
+        predicted = {
+            "id": "claim_acosh_monotone",
+            "type": "Claim",
+            "claim_kind": "property",
+            "name": "反双曲余弦的单调性",
+            "aliases": [],
+            "description": "Monotonicity of the inverse hyperbolic cosine.",
+        }
+        report = self.evaluate_gold(
+            [predicted],
+            [
+                {
+                    "requirement": "M",
+                    "type": "Claim",
+                    "claim_kind": "property",
+                    "items": [{"gold_id": "cosh_monotone", "name": "双曲余弦单调性"}],
+                }
+            ],
+        )
+
+        metrics = report["node_metrics"]
+        self.assertEqual(metrics["true_positive"], 0)
+        self.assertEqual(metrics["false_positive"], 1)
+        self.assertEqual(metrics["false_negative"], 1)
+        self.assertNotIn("fuzzy", metrics["match_layers"])
+
+    def test_fuzzy_requires_same_claim_kind(self) -> None:
+        predicted = {
+            "id": "claim_uniqueness",
+            "type": "Claim",
+            "claim_kind": "property",
+            "name": "极限唯一性",
+            "aliases": [],
+            "description": "A limit is unique.",
+        }
+        report = self.evaluate_gold(
+            [predicted],
+            [
+                {
+                    "requirement": "M",
+                    "type": "Claim",
+                    "claim_kind": "criterion",
+                    "items": [{"gold_id": "limit_uniqueness", "name": "极限唯一性"}],
+                }
+            ],
+        )
+
+        metrics = report["node_metrics"]
+        self.assertEqual(metrics["true_positive"], 0)
+        self.assertNotIn("fuzzy", metrics["match_layers"])
+
+    def test_fuzzy_forbidden_is_a_false_positive(self) -> None:
+        report = self.evaluate_gold(
+            [self.concept("双曲余弦单调性")],
+            [
+                {
+                    "requirement": "X",
+                    "type": "Concept",
+                    "items": [{"gold_id": "cosh_monotone", "name": "双曲余弦单调"}],
+                }
+            ],
+        )
+
+        metrics = report["node_metrics"]
+        self.assertEqual(metrics["false_positive"], 1)
+        self.assertEqual(report["false_positives"][0]["reason"], "explicitly forbidden")
+
+
+class FuzzySimilarityTests(unittest.TestCase):
+    def test_identical_names_score_one(self) -> None:
+        self.assertEqual(fuzzy_similarity("映射", "映射"), 1.0)
+
+    def test_unrelated_names_score_low(self) -> None:
+        self.assertLess(fuzzy_similarity("映射", "函数"), 0.85)
+
+    def test_laTeX_variant_normalizes_to_identity(self) -> None:
+        self.assertEqual(fuzzy_similarity("$x_0$", "x0"), 1.0)
+
+    def test_modifier_mismatch_detects_inverse_pair(self) -> None:
+        self.assertTrue(critical_modifier_mismatch("反双曲余弦", "双曲余弦"))
+        self.assertFalse(critical_modifier_mismatch("复合函数的极限运算法则", "复合函数极限的运算法则"))
+
+    def test_fuzzy_gold_candidates_filters_wrong_type(self) -> None:
+        predicted = {"id": "p", "type": "Concept", "name": "有界", "aliases": []}
+        gold_items = [
+            {"gold_id": "m", "requirement": "M", "type": "Claim", "claim_kind": "property", "name": "有界"},
+            {"gold_id": "o", "requirement": "O", "type": "Concept", "name": "有界"},
+        ]
+        hits = fuzzy_gold_candidates(predicted, gold_items)
+        self.assertEqual([h["gold_id"] for h in hits], ["o"])
 
 
 class GoldAlignmentLookupTests(unittest.TestCase):
