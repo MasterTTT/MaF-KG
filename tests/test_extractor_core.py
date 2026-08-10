@@ -27,10 +27,60 @@ from agents.Extractor import (
     RelationMemoryItem,
     RelationRecord,
     VerifyResponse,
+    _provider_class,
+    _provider_name,
     _node_id,
     _normalize_name,
     classify_definition_segments,
 )
+
+
+class ProviderAdapterTests(unittest.TestCase):
+    def test_opencode_alias_resolves_to_go_provider(self) -> None:
+        self.assertEqual(_provider_name("opencode"), "opencode-go")
+        adapter = _provider_class("opencode-go")
+        self.assertEqual(adapter.default_model, "deepseek-v4-flash")
+        self.assertEqual(adapter.default_base_url, "https://opencode.ai/zen/go/v1")
+        self.assertEqual(adapter.api_key_envs, ("OPENCODE_GO_API_KEY",))
+
+    def test_opencode_go_uses_openai_compatible_deepseek_payload(self) -> None:
+        response = {
+            "id": "response_1",
+            "model": "deepseek-v4-flash",
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": '{"ok": true}'},
+                }
+            ],
+            "usage": {},
+        }
+        with patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "unit-test"}, clear=False):
+            client = ProviderChatClient(
+                provider="opencode-go",
+                model="deepseek-v4-flash",
+                base_url="https://opencode.ai/zen/go/v1",
+                api_key_env=None,
+                temperature=0.1,
+                timeout=1,
+                max_retries=0,
+                max_tokens=4096,
+                thinking="enabled",
+                reasoning_effort="low",
+            )
+        with patch("agents.Extractor._post_httpx", return_value=response) as post:
+            self.assertEqual(client.complete_json("system", "user"), {"ok": True})
+        endpoint, _, _, headers, payload = post.call_args.args
+        self.assertEqual(
+            endpoint,
+            "https://opencode.ai/zen/go/v1/chat/completions",
+        )
+        self.assertEqual(headers["Authorization"], "Bearer unit-test")
+        self.assertEqual(payload["model"], "deepseek-v4-flash")
+        self.assertEqual(payload["thinking"], {"type": "enabled"})
+        self.assertEqual(payload["reasoning_effort"], "low")
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertNotIn("temperature", payload)
 
 
 class SemanticIdentityTests(unittest.TestCase):

@@ -1118,6 +1118,8 @@ class ModelProviderAdapter:
     model_envs: tuple[str, ...] = ()
     base_url_envs: tuple[str, ...] = ()
     supports_response_format = False
+    supports_reasoning_effort = False
+    omits_temperature_when_thinking = False
 
     def build_payload(
         self,
@@ -1171,6 +1173,8 @@ class DeepSeekProviderAdapter(ModelProviderAdapter):
     model_envs = ("DEEPSEEK_MODEL", "DS_MODEL")
     base_url_envs = ("DEEPSEEK_BASE_URL", "DS_BASE_URL", "OPENAI_BASE_URL")
     supports_response_format = True
+    supports_reasoning_effort = True
+    omits_temperature_when_thinking = True
 
     def build_payload(
         self,
@@ -1200,6 +1204,16 @@ class DeepSeekProviderAdapter(ModelProviderAdapter):
         if use_response_format:
             payload["response_format"] = {"type": "json_object"}
         return payload
+
+
+class OpenCodeGoProviderAdapter(DeepSeekProviderAdapter):
+    """DeepSeek models served through the OpenCode Go gateway."""
+
+    name = "opencode-go"
+    default_base_url = "https://opencode.ai/zen/go/v1"
+    api_key_envs = ("OPENCODE_GO_API_KEY",)
+    model_envs = ("OPENCODE_GO_MODEL",)
+    base_url_envs = ("OPENCODE_GO_BASE_URL",)
 
 
 class SparkProviderAdapter(ModelProviderAdapter):
@@ -1243,10 +1257,14 @@ class SparkProviderAdapter(ModelProviderAdapter):
 
 PROVIDER_REGISTRY: dict[str, type[ModelProviderAdapter]] = {
     "deepseek": DeepSeekProviderAdapter,
+    "opencode-go": OpenCodeGoProviderAdapter,
     "spark": SparkProviderAdapter,
 }
 PROVIDER_ALIASES = {
     "ds": "deepseek",
+    "opencode": "opencode-go",
+    "opencode_go": "opencode-go",
+    "oc-go": "opencode-go",
     "xfyun": "spark",
     "spark-x": "spark",
 }
@@ -3602,13 +3620,15 @@ class Extractor:
             expression.evidences.append(evidence)
 
     def _run_config(self, state: ExtractionState) -> dict[str, Any]:
+        adapter_class = _provider_class(str(state.get("provider")))
+        thinking_enabled = state.get("thinking") == "enabled"
         reasoning_effort_sent = (
             state.get("reasoning_effort")
-            if state.get("provider") == "deepseek" and state.get("thinking") == "enabled"
+            if adapter_class.supports_reasoning_effort and thinking_enabled
             else None
         )
         temperature_sent = not (
-            state.get("provider") == "deepseek" and state.get("thinking") == "enabled"
+            adapter_class.omits_temperature_when_thinking and thinking_enabled
         )
         return {
             "run_started_at": state.get("run_started_at"),
@@ -3940,7 +3960,7 @@ def check_config(
                 "reasoning_effort_requested": reasoning_effort,
                 "reasoning_effort_sent": (
                     reasoning_effort
-                    if provider_name == "deepseek" and thinking == "enabled"
+                    if adapter_class.supports_reasoning_effort and thinking == "enabled"
                     else None
                 ),
                 "response_format_supported": adapter_class.supports_response_format,
@@ -3963,7 +3983,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--provider",
         default=None,
-        choices=sorted(PROVIDER_REGISTRY),
+        choices=sorted(set(PROVIDER_REGISTRY) | set(PROVIDER_ALIASES)),
         help="Model provider. Defaults to MODEL_PROVIDER or deepseek.",
     )
     parser.add_argument("--model", default=None, help="Provider model name. Uses the provider-specific environment variable or default.")
