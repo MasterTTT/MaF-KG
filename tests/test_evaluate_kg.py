@@ -9,10 +9,13 @@ from scripts.evaluate_kg import (
     canonical_node_name,
     critical_modifier_mismatch,
     evaluate,
+    evaluate_gold_scopes,
     evaluate_nodes_against_gold,
     evaluate_relation_stability,
+    filter_nodes_to_source_scope,
     fuzzy_gold_candidates,
     fuzzy_similarity,
+    gold_targets_for_source,
     resolve_input,
 )
 
@@ -215,6 +218,162 @@ class GoldNodeEvaluatorTests(unittest.TestCase):
         self.assertEqual(metrics["false_negative"], 1)
         self.assertEqual(metrics["recall"], 0.5)
         self.assertEqual(report["true_positive_matches"][0]["gold_id"], "mapping")
+        self.assertEqual(
+            metrics["per_tier"]["unclassified"],
+            {"gold_count": 2, "matched": 1, "false_negative": 1, "recall": 0.5},
+        )
+
+    def test_required_nodes_report_core_and_detail_recall_separately(self) -> None:
+        report = self.evaluate_gold(
+            [self.concept("映射"), self.concept("双曲正弦")],
+            [
+                {
+                    "requirement": "M",
+                    "evaluation_tier": "core",
+                    "type": "Concept",
+                    "items": [
+                        {"gold_id": "mapping", "name": "映射"},
+                        {"gold_id": "function", "name": "函数"},
+                        {
+                            "gold_id": "sinh",
+                            "name": "双曲正弦",
+                            "evaluation_tier": "detail",
+                        },
+                    ],
+                }
+            ],
+        )
+
+        metrics = report["node_metrics"]
+        self.assertEqual(
+            metrics["per_tier"]["core"],
+            {"gold_count": 2, "matched": 1, "false_negative": 1, "recall": 0.5},
+        )
+        self.assertEqual(
+            metrics["per_tier"]["detail"],
+            {"gold_count": 1, "matched": 1, "false_negative": 0, "recall": 1.0},
+        )
+        tiers = {
+            item["gold_id"]: item["evaluation_tier"]
+            for item in report["true_positive_matches"]
+        }
+        self.assertEqual(tiers, {"mapping": "core", "sinh": "detail"})
+
+    def test_full_chapter_source_is_filtered_by_declared_gold_scope(self) -> None:
+        chapter = "第一章_全章_无习题_保留行号.md"
+        scoped_evidence = lambda line: [
+            {
+                "source_path": chapter,
+                "start_line": line,
+                "end_line": line,
+                "text": "source text",
+                "chunk_id": "chunk_001",
+                "heading_path": ["第一章"],
+                "teaching_block_id": f"teaching_{line}",
+                "discourse_role": "definition",
+            }
+        ]
+        graph = {
+            "source_path": chapter,
+            "nodes": [
+                {**self.concept("映射"), "evidence": scoped_evidence(500)},
+                {**self.concept("数列"), "evidence": scoped_evidence(1300)},
+            ],
+        }
+        gold = {
+            "schema_version": "maf-kg.semantic-gold.v4",
+            "graphs": [
+                {
+                    "source_file": "第一章第一节_映射与函数.md",
+                    "source_scopes": [
+                        {"source_file": chapter, "start_line": 424, "end_line": 1259}
+                    ],
+                    "node_groups": [
+                        {
+                            "requirement": "M",
+                            "evaluation_tier": "core",
+                            "type": "Concept",
+                            "items": [{"gold_id": "mapping", "name": "映射"}],
+                        }
+                    ],
+                },
+                {
+                    "source_file": "第一章第二节.md",
+                    "source_scopes": [
+                        {"source_file": chapter, "start_line": 1260, "end_line": 1685}
+                    ],
+                    "node_groups": [
+                        {
+                            "requirement": "M",
+                            "evaluation_tier": "core",
+                            "type": "Concept",
+                            "items": [{"gold_id": "sequence", "name": "数列"}],
+                        }
+                    ],
+                },
+            ],
+        }
+
+        reports = evaluate_gold_scopes(graph, gold, Path("gold.json"))
+
+        self.assertEqual(len(reports), 2)
+        self.assertEqual(
+            [report["gold_source_file"] for report in reports],
+            ["第一章第一节_映射与函数.md", "第一章第二节.md"],
+        )
+        self.assertTrue(all(report["node_metrics"]["recall"] == 1.0 for report in reports))
+        self.assertTrue(all(report["node_metrics"]["predicted_count"] == 1 for report in reports))
+        self.assertTrue(all(report["node_metrics"]["predicted_total_count"] == 2 for report in reports))
+
+    def test_full_chapter_node_must_have_evidence_inside_selected_scope(self) -> None:
+        chapter = "chapter.md"
+        nodes = [
+            {
+                **self.concept("边界外节点"),
+                "evidence": [
+                    {
+                        "source_path": chapter,
+                        "start_line": 99,
+                        "end_line": 101,
+                    }
+                ],
+            },
+            {
+                **self.concept("边界内节点"),
+                "evidence": [
+                    {
+                        "source_path": chapter,
+                        "start_line": 101,
+                        "end_line": 102,
+                    }
+                ],
+            },
+        ]
+
+        selected = filter_nodes_to_source_scope(
+            nodes,
+            chapter,
+            {"source_file": chapter, "start_line": 100, "end_line": 200},
+        )
+
+        self.assertEqual([node["name"] for node in selected], ["边界内节点"])
+
+    def test_exact_source_match_takes_precedence_over_scoped_match(self) -> None:
+        graphs = [
+            {
+                "source_file": "section.md",
+                "source_scopes": [
+                    {"source_file": "chapter.md", "start_line": 10, "end_line": 20}
+                ],
+            },
+            {"source_file": "chapter.md"},
+        ]
+
+        targets = gold_targets_for_source("chapter.md", graphs)
+
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0][0]["source_file"], "chapter.md")
+        self.assertIsNone(targets[0][1])
 
     def test_optional_match_is_ignored_by_false_positive_and_false_negative_counts(self) -> None:
         report = self.evaluate_gold(
@@ -770,6 +929,213 @@ class RelationStabilityTests(unittest.TestCase):
         self.assertEqual(report["runs"][0]["dropped_relation_count"], 1)
         self.assertEqual(report["runs"][0]["relation_count"], 2)
         self.assertEqual(report["runs"][0]["aligned_edge_count"], 1)
+
+    def test_full_chapter_relations_are_evaluated_per_gold_scope(self) -> None:
+        chapter = "chapter.md"
+
+        def scoped_node(
+            node_id: str, name: str, line: int
+        ) -> dict[str, object]:
+            return {
+                **self.node(node_id, "Concept", name),
+                "evidence": [
+                    {
+                        "source_path": chapter,
+                        "start_line": line,
+                        "end_line": line,
+                    }
+                ],
+            }
+
+        gold = {
+            "schema_version": "maf-kg.semantic-gold.v4",
+            "graphs": [
+                {
+                    "source_file": "section_1.md",
+                    "relation_annotation_status": "pending",
+                    "source_scopes": [
+                        {"source_file": chapter, "start_line": 1, "end_line": 100}
+                    ],
+                    "node_groups": [
+                        {
+                            "requirement": "M",
+                            "type": "Concept",
+                            "items": [
+                                {"gold_id": "mapping", "name": "映射"},
+                                {"gold_id": "function", "name": "函数"},
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "source_file": "section_2.md",
+                    "relation_annotation_status": "pending",
+                    "source_scopes": [
+                        {"source_file": chapter, "start_line": 101, "end_line": 200}
+                    ],
+                    "node_groups": [
+                        {
+                            "requirement": "M",
+                            "type": "Concept",
+                            "items": [
+                                {"gold_id": "sequence", "name": "数列"},
+                                {"gold_id": "limit", "name": "极限"},
+                            ],
+                        }
+                    ],
+                },
+            ],
+        }
+
+        def run(suffix: str) -> dict[str, object]:
+            def scoped_relation(
+                relation_id: str,
+                source_id: str,
+                target_id: str,
+                line: int,
+            ) -> dict[str, object]:
+                return {
+                    **self.relation(relation_id, source_id, target_id),
+                    "evidence": [
+                        {
+                            "source_path": chapter,
+                            "start_line": line,
+                            "end_line": line,
+                        }
+                    ],
+                }
+
+            return {
+                "schema_version": "maf-kg.semantic.v1.5.9",
+                "source_path": chapter,
+                "nodes": [
+                    scoped_node(f"m_{suffix}", "映射", 10),
+                    scoped_node(f"f_{suffix}", "函数", 20),
+                    scoped_node(f"s_{suffix}", "数列", 110),
+                    scoped_node(f"l_{suffix}", "极限", 120),
+                ],
+                "relations": [
+                    scoped_relation(
+                        f"r1_{suffix}", f"m_{suffix}", f"f_{suffix}", 30
+                    ),
+                    scoped_relation(
+                        f"r2_{suffix}", f"s_{suffix}", f"l_{suffix}", 130
+                    ),
+                    scoped_relation(
+                        f"cross_{suffix}", f"m_{suffix}", f"s_{suffix}", 100
+                    ),
+                ],
+            }
+
+        report = evaluate_relation_stability(
+            [run("a"), run("b")], gold, Path("gold.json")
+        )
+
+        self.assertEqual(report["scope_count"], 2)
+        self.assertEqual(
+            [scope["gold_source_file"] for scope in report["scope_reports"]],
+            ["section_1.md", "section_2.md"],
+        )
+        for scope in report["scope_reports"]:
+            self.assertEqual(scope["runs"][0]["relation_count"], 1)
+            self.assertEqual(scope["runs"][0]["out_of_scope_relation_count"], 2)
+            self.assertEqual(scope["pairwise"][0]["gold_aligned_jaccard"], 1.0)
+
+    def test_scoped_relation_requires_evidence_inside_scope(self) -> None:
+        chapter = "chapter.md"
+
+        def node(node_id: str, name: str, line: int) -> dict[str, object]:
+            return {
+                **self.node(node_id, "Concept", name),
+                "evidence": [
+                    {
+                        "source_path": chapter,
+                        "start_line": line,
+                        "end_line": line,
+                    }
+                ],
+            }
+
+        gold = {
+            "schema_version": "maf-kg.semantic-gold.v4",
+            "graphs": [
+                {
+                    "source_file": "section.md",
+                    "source_scopes": [
+                        {"source_file": chapter, "start_line": 1, "end_line": 100}
+                    ],
+                    "node_groups": [
+                        {
+                            "requirement": "M",
+                            "type": "Concept",
+                            "items": [
+                                {"gold_id": "mapping", "name": "映射"},
+                                {"gold_id": "function", "name": "函数"},
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        relation = {
+            **self.relation("r1", "mapping", "function"),
+            "evidence": [
+                {
+                    "source_path": chapter,
+                    "start_line": 150,
+                    "end_line": 150,
+                }
+            ],
+        }
+        graph = {
+            "schema_version": "maf-kg.semantic.v1.5.9",
+            "source_path": chapter,
+            "nodes": [node("mapping", "映射", 10), node("function", "函数", 20)],
+            "relations": [relation],
+        }
+
+        report = evaluate_relation_stability([graph], gold, Path("gold.json"))
+
+        self.assertEqual(report["runs"][0]["relation_count"], 0)
+        self.assertEqual(report["runs"][0]["out_of_scope_relation_count"], 1)
+
+    def test_gold_source_selects_one_full_chapter_relation_scope(self) -> None:
+        chapter = "chapter.md"
+        gold = {
+            "schema_version": "maf-kg.semantic-gold.v4",
+            "graphs": [
+                {
+                    "source_file": "section_1.md",
+                    "source_scopes": [
+                        {"source_file": chapter, "start_line": 1, "end_line": 100}
+                    ],
+                    "node_groups": [],
+                },
+                {
+                    "source_file": "section_2.md",
+                    "source_scopes": [
+                        {"source_file": chapter, "start_line": 101, "end_line": 200}
+                    ],
+                    "node_groups": [],
+                },
+            ],
+        }
+        graph = {
+            "schema_version": "maf-kg.semantic.v1.5.9",
+            "source_path": chapter,
+            "nodes": [],
+            "relations": [],
+        }
+
+        report = evaluate_relation_stability(
+            [graph],
+            gold,
+            Path("gold.json"),
+            gold_source_file="section_2.md",
+        )
+
+        self.assertEqual(report["gold_source_file"], "section_2.md")
+        self.assertNotIn("scope_reports", report)
 
 
 if __name__ == "__main__":

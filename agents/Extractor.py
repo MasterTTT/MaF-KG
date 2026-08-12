@@ -85,8 +85,8 @@ def classify_definition_segments(
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT_DIR = ROOT / "prompts"
 DEFAULT_INPUT = ROOT / "data" / "raw" / "第一章第一节_映射与函数.md"
-DEFAULT_OUTPUT = ROOT / "KG" / "第一章第一节_映射与函数_semantic_v1_5_9.json"
-SCHEMA_VERSION = "maf-kg.semantic.v1.5.9"
+DEFAULT_OUTPUT = ROOT / "KG" / "第一章第一节_映射与函数_semantic_v1_6_0.json"
+SCHEMA_VERSION = "maf-kg.semantic.v1.6.0"
 CHUNK_STRATEGIES = ["budget", "teaching-units"]
 RELATION_SIGNATURES: dict[str, tuple[tuple[str, str], ...]] = {
     "involves": (("Claim", "Concept"),),
@@ -311,6 +311,8 @@ class ExtractionState(TypedDict, total=False):
     max_retries: int
     request_timeout: float
     max_tokens: int
+    memory_node_bytes: int
+    memory_relation_bytes: int
     save_output: bool
     use_response_format: bool
     no_proxy: bool
@@ -320,6 +322,7 @@ class ExtractionState(TypedDict, total=False):
     verbose: bool
     thinking: str
     reasoning_effort: str
+    coverage_review: bool
     run_started_at: str
     raw_lines: list[str]
     chunks: list[DocumentChunk]
@@ -387,7 +390,6 @@ def _is_theorem_leadin(block: DocumentBlock) -> bool:
     return bool(
         re.search(r"(下面|以下|下列|下述).{0,24}(定理|结论)", text)
         or re.search(r"有如下.{0,16}(定理|结论)", text)
-        or re.search(r"(定理|结论).{0,18}(说明|表明|给出)", text)
         or re.search(r"(?:即|如下)\s*[。.]?$", text)
     )
 
@@ -1493,6 +1495,7 @@ class Extractor:
         semantic_dedupe: bool = False,
         embedding_memory: bool = False,
         seed_graph_path: str | Path | None = None,
+        coverage_review: bool = False,
     ) -> None:
         self.input_path = Path(input_path)
         self.output_path = Path(output_path)
@@ -1537,6 +1540,9 @@ class Extractor:
         self.semantic_dedupe = semantic_dedupe
         self.embedding_memory = embedding_memory
         self.seed_graph_path = Path(seed_graph_path) if seed_graph_path else None
+        if coverage_review and chunk_strategy != "teaching-units":
+            raise ValueError("coverage_review requires chunk_strategy='teaching-units'")
+        self.coverage_review = coverage_review
         self._sem_embed_cache: dict[str, list[float]] = {}
         self._sem_judge_cache: dict[tuple[str, str], bool] = {}
         self._chunk_embed_cache: dict[str, list[float]] = {}
@@ -1576,6 +1582,7 @@ class Extractor:
             "verbose": self.verbose,
             "thinking": self.thinking,
             "reasoning_effort": self.reasoning_effort,
+            "coverage_review": self.coverage_review,
             "run_started_at": datetime.now(timezone.utc).isoformat(),
             "diagnostics": {},
         }
@@ -1699,8 +1706,29 @@ class Extractor:
         def is_example(text: str) -> bool:
             return bool(re.match(r"^\s*(例\s*\d+|例题\s*\d+)", without_markdown_list_marker(text)))
 
+        def is_theorem_reference(text: str) -> bool:
+            normalized = without_markdown_list_marker(text)
+            match = re.match(
+                r"^\s*定理\s*(?:[0-9一二三四五六七八九十百]+)?",
+                normalized,
+            )
+            if not match:
+                return False
+            continuation = normalized[match.end() :].lstrip()
+            return bool(
+                re.match(
+                    r"^(?:表示|表明|说明|给出|中的|中所|的(?:结论|条件|证明|推论|内容|结果))",
+                    continuation,
+                )
+            )
+
         def is_theorem(text: str) -> bool:
-            return bool(re.match(r"^\s*(定理\s*\d+|定理\b)", without_markdown_list_marker(text)))
+            normalized = without_markdown_list_marker(text)
+            match = re.match(
+                r"^\s*定理\s*(?:[0-9一二三四五六七八九十百]+)?",
+                normalized,
+            )
+            return bool(match) and not is_theorem_reference(normalized)
 
         def is_property(text: str) -> bool:
             return bool(re.match(r"^\s*性质\s*\d*", without_markdown_list_marker(text)))
@@ -1806,6 +1834,7 @@ class Extractor:
                         is_heading(nxt)
                         or is_example(nxt)
                         or is_theorem(nxt)
+                        or is_theorem_reference(nxt)
                         or is_corollary(nxt)
                         or is_definition(nxt)
                         or (kind_fn in {"property", "corollary", "proof"} and is_property(nxt))
@@ -2323,6 +2352,137 @@ class Extractor:
                 f"+{summary['new_relation_count']} relations, +{summary['new_expression_count']} expressions, "
                 f"totals={len(node_store)} nodes/{len(relation_store)} relations/{len(expression_store)} expressions"
             )
+        coverage_ledger = self._build_coverage_ledger(
+            state["chunks"],
+            node_store,
+            expression_store,
+            chunk_strategy=str(state.get("chunk_strategy", "budget")),
+        )
+        coverage_ledger_before_review = coverage_ledger
+        coverage_review_summaries: list[dict[str, Any]] = []
+        if state.get("coverage_review", False):
+            review_chunks = [
+                chunk
+                for chunk in state["chunks"]
+                if any(
+                    item["chunk_id"] == chunk.id and item["review_eligible"]
+                    for item in coverage_ledger["uncovered_items"]
+                )
+            ]
+            for review_index, chunk in enumerate(review_chunks, start=1):
+                if state.get("request_delay", 0) > 0:
+                    time.sleep(float(state["request_delay"]))
+                uncovered = [
+                    item
+                    for item in coverage_ledger["uncovered_items"]
+                    if item["chunk_id"] == chunk.id and item["review_eligible"]
+                ]
+                self._log(
+                    f"Coverage review {review_index}/{len(review_chunks)} start: {chunk.id}, "
+                    f"uncovered={len(uncovered)}"
+                )
+                node_memory, relation_memory, _ = self._build_memory_for_chunk(
+                    chunk,
+                    node_store,
+                    relation_store,
+                    expression_store,
+                    recent_chunk_ids=set(processed_chunk_ids[-2:]),
+                    node_char_budget=state.get("memory_node_bytes", 12000),
+                    relation_char_budget=state.get("memory_relation_bytes", 6000),
+                )
+                payload = client.complete_json(
+                    self.system_prompt,
+                    self._chunk_extraction_prompt(
+                        chunk,
+                        state["input_path"],
+                        node_memory,
+                        relation_memory,
+                        coverage_guidance=uncovered,
+                    ),
+                    label=f"{chunk.id}_coverage_review",
+                )
+                response = self._validate_chunk_response(
+                    payload,
+                    chunk,
+                    state,
+                    client,
+                    processed_chunk_ids,
+                    chunk_summaries,
+                    len(node_store),
+                    len(relation_store),
+                    len(expression_store),
+                    request_label=f"{chunk.id}_coverage_review",
+                )
+                working_node_store = {
+                    node_id: node.model_copy(deep=True)
+                    for node_id, node in node_store.items()
+                }
+                working_relation_store = {
+                    key: relation.model_copy(deep=True)
+                    for key, relation in relation_store.items()
+                }
+                working_expression_store = {
+                    key: expression.model_copy(deep=True)
+                    for key, expression in expression_store.items()
+                }
+                try:
+                    summary = self._merge_chunk_response(
+                        response,
+                        chunk,
+                        state["input_path"],
+                        lines,
+                        working_node_store,
+                        working_relation_store,
+                        working_expression_store,
+                        allowed_existing_ids={item.id for item in node_memory},
+                    )
+                except ChunkMergeError as exc:
+                    metadata = {
+                        "schema_version": SCHEMA_VERSION,
+                        "input_path": state.get("input_path"),
+                        "chunk_id": chunk.id,
+                        "review_kind": "coverage",
+                        "uncovered_items": uncovered,
+                        "processed_chunk_ids": list(processed_chunk_ids),
+                        "partial_counts": {
+                            "nodes": len(node_store),
+                            "relations": len(relation_store),
+                            "math_expressions": len(expression_store),
+                        },
+                        "api_summary": self._api_summary(client.request_history),
+                        "api_requests": client.request_history,
+                    }
+                    debug_path = _write_invalid_response(
+                        json.dumps(response.model_dump(mode="json"), ensure_ascii=False, indent=2),
+                        f"{chunk.id}_coverage_review_merge",
+                        exc,
+                        metadata,
+                    )
+                    raise ChunkMergeError(
+                        exc.chunk_id,
+                        exc.item_kind,
+                        exc.item_ref,
+                        f"{exc.reason} (raw response saved to {debug_path})",
+                        exc.details,
+                    ) from exc
+                node_store = working_node_store
+                relation_store = working_relation_store
+                expression_store = working_expression_store
+                summary["chunk_id"] = chunk.id
+                summary["reviewed_items"] = uncovered
+                coverage_review_summaries.append(summary)
+                notes.extend(response.notes)
+                decision_ledger.extend(summary["decisions"])
+                self._log(
+                    f"Coverage review {review_index}/{len(review_chunks)} done: {chunk.id}, "
+                    f"create={summary['created_node_count']}, reuse={summary['reused_node_count']}"
+                )
+            coverage_ledger = self._build_coverage_ledger(
+                state["chunks"],
+                node_store,
+                expression_store,
+                chunk_strategy=str(state.get("chunk_strategy", "budget")),
+            )
         result = self._finalize_result(
             state["input_path"],
             lines,
@@ -2335,6 +2495,16 @@ class Extractor:
                 "chunk_summaries": chunk_summaries,
                 "memory_decisions": decision_ledger,
                 "notes": notes,
+                "coverage_ledger": coverage_ledger,
+                "coverage_review": {
+                    "enabled": bool(state.get("coverage_review", False)),
+                    "reviewed_chunk_count": len(coverage_review_summaries),
+                    "uncovered_before": coverage_ledger_before_review.get(
+                        "uncovered_count", 0
+                    ),
+                    "uncovered_after": coverage_ledger.get("uncovered_count", 0),
+                    "chunk_summaries": coverage_review_summaries,
+                },
                 "run_config": self._run_config(state),
                 "api_summary": self._api_summary(client.request_history),
                 "api_requests": client.request_history,
@@ -2368,6 +2538,7 @@ class Extractor:
         node_count: int,
         relation_count: int,
         expression_count: int,
+        request_label: str | None = None,
     ) -> ChunkExtractionResponse:
         try:
             return ChunkExtractionResponse.model_validate(payload)
@@ -2376,7 +2547,8 @@ class Extractor:
                 (
                     record
                     for record in reversed(client.request_history)
-                    if record.get("label") == chunk.id and record.get("status") == "success"
+                    if record.get("label") == (request_label or chunk.id)
+                    and record.get("status") == "success"
                 ),
                 None,
             )
@@ -2393,6 +2565,7 @@ class Extractor:
                 "input_path": state.get("input_path"),
                 "output_path": state.get("output_path"),
                 "chunk_id": chunk.id,
+                "request_label": request_label or chunk.id,
                 "chunk_span": {"start_line": chunk.start_line, "end_line": chunk.end_line},
                 "processed_chunk_ids": list(processed_chunk_ids),
                 "chunk_summaries": list(chunk_summaries),
@@ -2663,6 +2836,7 @@ class Extractor:
         node_memory: list[NodeMemoryItem],
         relation_memory: list[RelationMemoryItem],
         verifier_guidance: list[dict[str, Any]] | None = None,
+        coverage_guidance: list[dict[str, Any]] | None = None,
     ) -> str:
         evidence_line_numbers = [int(match.group(1)) for line in chunk.text.splitlines() if (match := re.match(r"^([0-9]+):", line))]
         source_latex_candidates = self._source_latex_candidates_for_chunk(chunk)
@@ -2687,6 +2861,18 @@ class Extractor:
         }
         if verifier_guidance:
             payload["verifier_guidance"] = verifier_guidance
+        if coverage_guidance:
+            payload["coverage_review"] = {
+                "mode": "targeted_recheck",
+                "instruction": (
+                    "Re-examine the listed source units for eligible reusable mathematical "
+                    "semantics omitted by the first pass. Apply the normal ontology and evidence "
+                    "rules without relaxing them. Return create/reuse actions only when the source "
+                    "really supports an eligible node or expression; an empty response is correct "
+                    "when a flagged unit contains no eligible first-layer semantic item."
+                ),
+                "uncovered_items": coverage_guidance,
+            }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
     def _build_verify_prompt(self, result: ExtractionResult) -> str:
@@ -2945,6 +3131,7 @@ class Extractor:
                     len(node_store),
                     len(relation_store),
                     len(expression_store),
+                    request_label=f"{chunk.id}_correct",
                 )
                 summary = self._merge_chunk_response(
                     response,
@@ -2989,6 +3176,204 @@ class Extractor:
             {"candidate_id": candidate_id, "line": line_no, "latex": latex}
             for candidate_id, (line_no, latex) in self.source_latex_candidates.items()
             if line_no in visible_lines
+        ]
+
+    def _build_coverage_ledger(
+        self,
+        chunks: list[DocumentChunk],
+        node_store: dict[str, NodeRecord],
+        expression_store: dict[tuple[str, str, str], MathExpressionRecord],
+        *,
+        chunk_strategy: str,
+    ) -> dict[str, Any]:
+        if chunk_strategy != "teaching-units":
+            return {
+                "status": "not_applicable",
+                "reason": "semantic coverage requires chunk_strategy='teaching-units'",
+                "unit_count": 0,
+                "check_count": 0,
+                "uncovered_count": 0,
+                "review_eligible_count": 0,
+                "uncovered_items": [],
+                "units": [],
+            }
+
+        nodes = list(node_store.values())
+        expressions = list(expression_store.values())
+        units: list[dict[str, Any]] = []
+        uncovered_items: list[dict[str, Any]] = []
+        reviewable_kinds = {
+            "definition",
+            "definition_group",
+            "definition_theorem_family",
+            "theorem",
+            "theorem_group",
+            "theorem_family",
+            "corollary",
+            "property",
+            "core_statement",
+        }
+
+        for chunk in chunks:
+            checks: list[dict[str, Any]] = []
+            for block in chunk.teaching_blocks:
+                block_id = str(block.get("teaching_block_id", ""))
+                role = str(block.get("discourse_role", ""))
+                start_line = int(block.get("start_line", chunk.start_line))
+                end_line = int(block.get("end_line", chunk.end_line))
+                node_ids = sorted(
+                    {
+                        node.id
+                        for node in nodes
+                        for evidence in node.evidence
+                        if evidence.teaching_block_id == block_id
+                    }
+                )
+                concept_ids = sorted(
+                    {
+                        node.id
+                        for node in nodes
+                        if node.type == "Concept"
+                        for evidence in node.evidence
+                        if evidence.teaching_block_id == block_id
+                    }
+                )
+                claim_ids = sorted(
+                    {
+                        node.id
+                        for node in nodes
+                        if node.type == "Claim"
+                        for evidence in node.evidence
+                        if evidence.teaching_block_id == block_id
+                    }
+                )
+                expression_ids = sorted(
+                    {
+                        expression.id
+                        for expression in expressions
+                        for evidence in expression.evidences
+                        if evidence.teaching_block_id == block_id
+                    }
+                )
+
+                expected_semantics: list[str] = []
+                if role == "definition":
+                    expected_semantics.append("Concept")
+                elif role in {"theorem", "corollary", "property"}:
+                    expected_semantics.append("Claim")
+                elif (
+                    role in {"paragraph", "formula_exposition"}
+                    and chunk.teaching_unit_kind == "core_statement"
+                    and block_id in set(chunk.anchor_block_ids)
+                ):
+                    expected_semantics.append("Node")
+
+                latex_candidate_ids = self._source_latex_candidates_in_span(
+                    start_line, end_line
+                )
+                candidate_semantics = (
+                    ["MathExpression"]
+                    if role in {"formula_block", "formula_exposition"}
+                    and latex_candidate_ids
+                    else []
+                )
+                candidate_missing = [
+                    semantic
+                    for semantic in candidate_semantics
+                    if semantic == "MathExpression" and not expression_ids
+                ]
+
+                covered = True
+                missing: list[str] = []
+                for expected in expected_semantics:
+                    present = {
+                        "Concept": bool(concept_ids),
+                        "Claim": bool(claim_ids),
+                        "Node": bool(node_ids),
+                        "MathExpression": bool(expression_ids),
+                    }[expected]
+                    if not present:
+                        covered = False
+                        missing.append(expected)
+                if not expected_semantics:
+                    covered = bool(node_ids or expression_ids)
+
+                check = {
+                    "chunk_id": chunk.id,
+                    "teaching_unit_kind": chunk.teaching_unit_kind,
+                    "teaching_block_id": block_id,
+                    "discourse_role": role,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "expected_semantics": expected_semantics,
+                    "candidate_semantics": candidate_semantics,
+                    "latex_candidate_ids": latex_candidate_ids,
+                    "covered": covered,
+                    "missing_semantics": missing,
+                    "candidate_missing_semantics": candidate_missing,
+                    "node_ids": node_ids,
+                    "expression_ids": expression_ids,
+                    "review_eligible": bool(missing)
+                    and chunk.teaching_unit_kind in reviewable_kinds,
+                }
+                checks.append(check)
+                if missing:
+                    uncovered_items.append(check)
+
+            units.append(
+                {
+                    "chunk_id": chunk.id,
+                    "start_line": chunk.start_line,
+                    "end_line": chunk.end_line,
+                    "teaching_unit_kind": chunk.teaching_unit_kind,
+                    "anchor_block_ids": list(chunk.anchor_block_ids),
+                    "checks": checks,
+                    "required_check_count": sum(
+                        bool(check["expected_semantics"]) for check in checks
+                    ),
+                    "uncovered_check_count": sum(
+                        bool(check["missing_semantics"]) for check in checks
+                    ),
+                }
+            )
+
+        required_checks = [
+            check
+            for unit in units
+            for check in unit["checks"]
+            if check["expected_semantics"]
+        ]
+        candidate_checks = [
+            check
+            for unit in units
+            for check in unit["checks"]
+            if check["candidate_semantics"]
+        ]
+        return {
+            "status": "completed",
+            "unit_count": len(units),
+            "check_count": len(required_checks),
+            "covered_count": sum(check["covered"] for check in required_checks),
+            "uncovered_count": len(uncovered_items),
+            "review_eligible_count": sum(
+                item["review_eligible"] for item in uncovered_items
+            ),
+            "formula_candidate_check_count": len(candidate_checks),
+            "formula_candidate_without_expression_count": sum(
+                bool(check["candidate_missing_semantics"])
+                for check in candidate_checks
+            ),
+            "uncovered_items": uncovered_items,
+            "units": units,
+        }
+
+    def _source_latex_candidates_in_span(
+        self, start_line: int, end_line: int
+    ) -> list[str]:
+        return [
+            candidate_id
+            for candidate_id, (line_no, _) in self.source_latex_candidates.items()
+            if start_line <= line_no <= end_line
         ]
 
     def _judge_same_concept(self, name_a: str, desc_a: str, name_b: str, desc_b: str) -> bool:
@@ -3664,6 +4049,7 @@ class Extractor:
             "response_format_enabled": state.get("use_response_format"),
             "resume_enabled": state.get("resume"),
             "include_exercises": state.get("include_exercises"),
+            "coverage_review_enabled": state.get("coverage_review", False),
         }
 
     def _api_summary(self, records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -3871,7 +4257,7 @@ class Extractor:
         return self.input_path.stem
 
     def _cache_dir(self) -> Path:
-        path = ROOT / "node_cache" / "semantic_layer_v1_5_9"
+        path = ROOT / "node_cache" / "semantic_layer_v1_6_0"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -4067,6 +4453,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "(incremental update). Seed nodes participate in memory and dedupe; relations "
         "dedupe by exact (source, type, target) key against seed relations.",
     )
+    parser.add_argument(
+        "--coverage-review",
+        action="store_true",
+        help=(
+            "After the first pass, re-run the same Extractor only on high-confidence "
+            "uncovered definition/theorem/property/corollary teaching units. Requires "
+            "--chunk-strategy teaching-units. The coverage ledger is always diagnostic "
+            "and never creates facts by rule."
+        ),
+    )
     parser.add_argument("--check-config", action="store_true", help="Check the selected provider configuration without calling the model.")
     return parser
 
@@ -4121,6 +4517,7 @@ def main() -> None:
         semantic_dedupe=args.semantic_dedupe,
         embedding_memory=args.embedding_memory,
         seed_graph_path=args.seed_graph,
+        coverage_review=args.coverage_review,
     )
     try:
         result = extractor.run()

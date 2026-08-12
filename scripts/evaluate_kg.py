@@ -61,14 +61,27 @@ def main() -> int:
     if args.gold:
         gold_path = Path(args.gold)
         gold_data = load_json(gold_path)
-        report["gold_evaluation"] = evaluate_nodes_against_gold(
-            data, gold_data, gold_path, semantic_match=args.semantic_match
+        gold_reports = evaluate_gold_scopes(
+            data,
+            gold_data,
+            gold_path,
+            semantic_match=args.semantic_match,
+            gold_source_file=args.gold_source,
         )
+        if len(gold_reports) == 1:
+            report["gold_evaluation"] = gold_reports[0]
+        else:
+            report["gold_scope_evaluations"] = gold_reports
     if args.additional_inputs:
         if not args.gold:
             raise SystemExit("Relation stability evaluation requires --gold for endpoint alignment")
         graphs = [data, *(load_json(Path(p)) for p in args.additional_inputs)]
-        report["relation_stability"] = evaluate_relation_stability(graphs, gold_data, gold_path)
+        report["relation_stability"] = evaluate_relation_stability(
+            graphs,
+            gold_data,
+            gold_path,
+            gold_source_file=args.gold_source,
+        )
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
@@ -88,14 +101,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "additional_inputs",
         nargs="*",
-        help="Additional KG JSON runs of the same source section for cross-run relation "
-        "stability evaluation (requires --gold).",
+        help="Additional KG JSON runs of the same source document for cross-run relation "
+        "stability evaluation (requires --gold). Gold source scopes are evaluated separately.",
     )
     parser.add_argument("--kg-dir", default="KG", help="Directory used when input is omitted.")
     parser.add_argument("--json", action="store_true", help="Print full machine-readable JSON report.")
     parser.add_argument(
         "--gold",
         help="Optional reviewed semantic Gold JSON used to calculate node precision, recall, and F1.",
+    )
+    parser.add_argument(
+        "--gold-source",
+        help=(
+            "Evaluate only the named source_file entry in Gold. This is optional for a "
+            "single-section output and useful for selecting one declared scope from a "
+            "full-chapter output."
+        ),
     )
     parser.add_argument("--samples", type=int, default=12, help="Number of sample issues to print per category.")
     parser.add_argument(
@@ -732,21 +753,43 @@ def evaluate_nodes_against_gold(
     gold_data: dict[str, Any],
     gold_path: Path,
     semantic_match: bool = False,
+    gold_source_file: str | None = None,
 ) -> dict[str, Any]:
     source_file = Path(str(data.get("source_path", ""))).name
     graphs = gold_data.get("graphs", [])
-    selected = next(
-        (graph for graph in graphs if str(graph.get("source_file", "")) == source_file),
-        None,
-    )
-    if selected is None:
+    targets = gold_targets_for_source(source_file, graphs)
+    if gold_source_file is not None:
+        selected_source = Path(gold_source_file).name
+        targets = [
+            target
+            for target in targets
+            if Path(str(target[0].get("source_file", ""))).name == selected_source
+        ]
+        if not targets:
+            raise SystemExit(
+                f"Gold file {gold_path} has no annotation {selected_source!r} applicable "
+                f"to source {source_file!r}"
+            )
+    if not targets:
         raise SystemExit(f"Gold file {gold_path} has no graph annotation for source {source_file!r}")
+    if len(targets) > 1:
+        choices = [str(target[0].get("source_file", "")) for target in targets]
+        raise SystemExit(
+            f"Gold file {gold_path} has multiple scoped annotations for source {source_file!r}: "
+            f"{choices}. Select one with --gold-source."
+        )
+    selected, source_scope = targets[0]
 
     gold_nodes = flatten_gold_node_groups(selected.get("node_groups", []))
     must_nodes = [item for item in gold_nodes if item["requirement"] == "M"]
     optional_nodes = [item for item in gold_nodes if item["requirement"] == "O"]
     forbidden_nodes = [item for item in gold_nodes if item["requirement"] == "X"]
-    predicted_nodes = data.get("nodes", []) if isinstance(data.get("nodes"), list) else []
+    all_predicted_nodes = data.get("nodes", []) if isinstance(data.get("nodes"), list) else []
+    predicted_nodes = filter_nodes_to_source_scope(
+        all_predicted_nodes,
+        source_file,
+        source_scope,
+    )
 
     matched_must: dict[str, dict[str, Any]] = {}
     matched_optional: dict[str, dict[str, Any]] = {}
@@ -862,16 +905,38 @@ def evaluate_nodes_against_gold(
             "f1": safe_ratio(2 * type_precision * type_recall, type_precision + type_recall),
         }
 
+    per_tier = {}
+    tier_names = sorted(
+        {str(item.get("evaluation_tier") or "unclassified") for item in must_nodes},
+        key=lambda value: (value not in {"core", "detail"}, value),
+    )
+    for tier in tier_names:
+        tier_must = [
+            item
+            for item in must_nodes
+            if str(item.get("evaluation_tier") or "unclassified") == tier
+        ]
+        tier_matched = sum(item["gold_id"] in matched_must for item in tier_must)
+        per_tier[tier] = {
+            "gold_count": len(tier_must),
+            "matched": tier_matched,
+            "false_negative": len(tier_must) - tier_matched,
+            "recall": safe_ratio(tier_matched, len(tier_must)),
+        }
+
     return {
         "gold_file": str(gold_path),
         "gold_schema_version": gold_data.get("schema_version"),
         "source_file": source_file,
+        "gold_source_file": selected.get("source_file"),
+        "source_scope": source_scope,
         "annotation_status": selected.get("annotation_status"),
         "node_metrics": {
             "must_gold_count": len(must_nodes),
             "optional_gold_count": len(optional_nodes),
             "forbidden_gold_count": len(forbidden_nodes),
             "predicted_count": len(predicted_nodes),
+            "predicted_total_count": len(all_predicted_nodes),
             "true_positive": true_positive_count,
             "false_positive": false_positive_count,
             "false_negative": false_negative_count,
@@ -880,6 +945,7 @@ def evaluate_nodes_against_gold(
             "recall": recall,
             "f1": f1,
             "per_type": per_type,
+            "per_tier": per_tier,
             "match_layers": dict(match_layer_counts),
         },
         "false_positives": false_positives,
@@ -887,6 +953,14 @@ def evaluate_nodes_against_gold(
         "true_positive_matches": [
             {
                 "gold_id": gold_id,
+                "evaluation_tier": next(
+                    (
+                        item.get("evaluation_tier") or "unclassified"
+                        for item in must_nodes
+                        if item["gold_id"] == gold_id
+                    ),
+                    "unclassified",
+                ),
                 "predicted": node_label(predicted),
             }
             for gold_id, predicted in sorted(matched_must.items())
@@ -903,6 +977,120 @@ def evaluate_nodes_against_gold(
     }
 
 
+def evaluate_gold_scopes(
+    data: dict[str, Any],
+    gold_data: dict[str, Any],
+    gold_path: Path,
+    *,
+    semantic_match: bool = False,
+    gold_source_file: str | None = None,
+) -> list[dict[str, Any]]:
+    source_file = Path(str(data.get("source_path", ""))).name
+    targets = gold_targets_for_source(source_file, gold_data.get("graphs", []))
+    if gold_source_file is not None:
+        selected_source = Path(gold_source_file).name
+        targets = [
+            target
+            for target in targets
+            if Path(str(target[0].get("source_file", ""))).name == selected_source
+        ]
+    if not targets:
+        detail = f" for Gold source {gold_source_file!r}" if gold_source_file else ""
+        raise SystemExit(
+            f"Gold file {gold_path} has no graph annotation{detail} applicable to "
+            f"source {source_file!r}"
+        )
+    return [
+        evaluate_nodes_against_gold(
+            data,
+            gold_data,
+            gold_path,
+            semantic_match=semantic_match,
+            gold_source_file=str(graph.get("source_file", "")),
+        )
+        for graph, _ in targets
+    ]
+
+
+def gold_targets_for_source(
+    source_file: str,
+    graphs: Any,
+) -> list[tuple[dict[str, Any], dict[str, Any] | None]]:
+    if not isinstance(graphs, list):
+        return []
+    source_name = Path(source_file).name
+    exact = [
+        (graph, None)
+        for graph in graphs
+        if isinstance(graph, dict)
+        and Path(str(graph.get("source_file", ""))).name == source_name
+    ]
+    if exact:
+        return exact
+
+    scoped: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for graph in graphs:
+        if not isinstance(graph, dict):
+            continue
+        for scope in graph.get("source_scopes", []):
+            if not isinstance(scope, dict):
+                continue
+            if Path(str(scope.get("source_file", ""))).name != source_name:
+                continue
+            start_line = scope.get("start_line")
+            end_line = scope.get("end_line")
+            if not isinstance(start_line, int) or not isinstance(end_line, int):
+                raise ValueError(
+                    f"Invalid source scope for {graph.get('source_file')!r}: "
+                    "start_line and end_line must be integers"
+                )
+            if start_line < 1 or end_line < start_line:
+                raise ValueError(
+                    f"Invalid source scope for {graph.get('source_file')!r}: "
+                    f"L{start_line}-L{end_line}"
+                )
+            scoped.append((graph, dict(scope)))
+    return scoped
+
+
+def filter_nodes_to_source_scope(
+    nodes: list[dict[str, Any]],
+    source_file: str,
+    source_scope: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if source_scope is None:
+        return list(nodes)
+    return [
+        node
+        for node in nodes
+        if evidence_within_source_scope(
+            node.get("evidence", []), source_file, source_scope
+        )
+    ]
+
+
+def evidence_within_source_scope(
+    evidence_items: Any,
+    source_file: str,
+    source_scope: dict[str, Any] | None,
+) -> bool:
+    if source_scope is None:
+        return True
+    if not isinstance(evidence_items, list):
+        return False
+    start_line = int(source_scope["start_line"])
+    end_line = int(source_scope["end_line"])
+    source_name = Path(source_file).name
+    return any(
+        isinstance(evidence, dict)
+        and Path(str(evidence.get("source_path", ""))).name == source_name
+        and isinstance(evidence.get("start_line"), int)
+        and isinstance(evidence.get("end_line"), int)
+        and start_line <= evidence["start_line"] <= evidence["end_line"] <= end_line
+        for evidence in evidence_items
+    )
+
+
 def flatten_gold_node_groups(groups: Any) -> list[dict[str, Any]]:
     flattened = []
     if not isinstance(groups, list):
@@ -913,6 +1101,7 @@ def flatten_gold_node_groups(groups: Any) -> list[dict[str, Any]]:
         requirement = group.get("requirement")
         node_type = group.get("type")
         claim_kind = group.get("claim_kind")
+        group_tier = group.get("evaluation_tier")
         for item in group.get("items", []):
             if not isinstance(item, dict):
                 continue
@@ -922,6 +1111,7 @@ def flatten_gold_node_groups(groups: Any) -> list[dict[str, Any]]:
                     "requirement": requirement,
                     "type": node_type,
                     "claim_kind": claim_kind,
+                    "evaluation_tier": item.get("evaluation_tier", group_tier),
                 }
             )
     return flattened
@@ -1095,7 +1285,9 @@ def gold_id_for_predicted_node(
 
 
 def gold_aligned_relation_report(
-    data: dict[str, Any], gold_data: dict[str, Any], gold_path: Path
+    data: dict[str, Any],
+    selected_gold: dict[str, Any],
+    source_scope: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Map one graph's relation endpoints to reviewed gold ids.
 
@@ -1104,19 +1296,25 @@ def gold_aligned_relation_report(
     gold id and drops relations that do not.
     """
     source_file = Path(str(data.get("source_path", ""))).name
-    graphs = gold_data.get("graphs", [])
-    selected = next(
-        (graph for graph in graphs if str(graph.get("source_file", "")) == source_file),
-        None,
-    )
-    if selected is None:
-        raise SystemExit(f"Gold file {gold_path} has no graph annotation for source {source_file!r}")
-
-    gold_nodes = flatten_gold_node_groups(selected.get("node_groups", []))
+    gold_nodes = flatten_gold_node_groups(selected_gold.get("node_groups", []))
     lookup = _gold_alignment_lookup(gold_nodes)
-    nodes = data.get("nodes", []) if isinstance(data.get("nodes"), list) else []
+    all_nodes = data.get("nodes", []) if isinstance(data.get("nodes"), list) else []
+    nodes = filter_nodes_to_source_scope(all_nodes, source_file, source_scope)
     node_by_id = {node.get("id"): node for node in nodes if node.get("id")}
-    relations = data.get("relations", []) if isinstance(data.get("relations"), list) else []
+    all_relations = data.get("relations", []) if isinstance(data.get("relations"), list) else []
+    if source_scope is None:
+        relations = all_relations
+    else:
+        scoped_node_ids = set(node_by_id)
+        relations = [
+            relation
+            for relation in all_relations
+            if relation.get("source_id") in scoped_node_ids
+            and relation.get("target_id") in scoped_node_ids
+            and evidence_within_source_scope(
+                relation.get("evidence", []), source_file, source_scope
+            )
+        ]
 
     raw_edges: set[tuple[str, str, str]] = set()
     aligned_edges: set[tuple[str, str, str]] = set()
@@ -1164,7 +1362,15 @@ def gold_aligned_relation_report(
 
     return {
         "source_file": source_file,
-        "relation_annotation_status": selected.get("relation_annotation_status", "pending"),
+        "gold_source_file": selected_gold.get("source_file"),
+        "source_scope": source_scope,
+        "relation_annotation_status": selected_gold.get(
+            "relation_annotation_status", "pending"
+        ),
+        "predicted_total_node_count": len(all_nodes),
+        "scoped_node_count": len(nodes),
+        "predicted_total_relation_count": len(all_relations),
+        "out_of_scope_relation_count": len(all_relations) - len(relations),
         "relation_count": len(relations),
         "raw_edge_count": len(raw_edges),
         "aligned_edge_count": len(aligned_edges),
@@ -1176,29 +1382,19 @@ def gold_aligned_relation_report(
     }
 
 
-def evaluate_relation_stability(
-    graphs: list[dict[str, Any]], gold_data: dict[str, Any], gold_path: Path
+def _relation_stability_for_gold_target(
+    graphs: list[dict[str, Any]],
+    selected_gold: dict[str, Any],
+    source_scope: dict[str, Any] | None,
+    gold_data: dict[str, Any],
+    gold_path: Path,
 ) -> dict[str, Any]:
-    """Cross-run relation-set stability using gold-aligned endpoints.
-
-    Jaccard is computed twice per run pair: raw_name uses the model-generated
-    endpoint names and therefore counts naming drift as instability;
-    gold_aligned maps endpoints to reviewed gold ids first. relation_metrics
-    stays null because gold relations are not annotated yet: stability is not
-    precision, recall, or F1.
-    """
-    if not graphs:
-        raise SystemExit("Relation stability evaluation requires at least one KG JSON")
-    source_files = {Path(str(g.get("source_path", ""))).name for g in graphs}
-    if len(source_files) > 1:
-        raise SystemExit(
-            "Relation stability evaluation requires runs of one source section, "
-            f"got: {sorted(source_files)}"
-        )
-
-    reports = [gold_aligned_relation_report(g, gold_data, gold_path) for g in graphs]
-    raw_edge_sets = [set(r["raw_edges"]) for r in reports]
-    aligned_edge_sets = [set(r["aligned_edges"]) for r in reports]
+    reports = [
+        gold_aligned_relation_report(graph, selected_gold, source_scope)
+        for graph in graphs
+    ]
+    raw_edge_sets = [set(report["raw_edges"]) for report in reports]
+    aligned_edge_sets = [set(report["aligned_edges"]) for report in reports]
 
     pairwise = []
     for i in range(len(reports)):
@@ -1228,20 +1424,30 @@ def evaluate_relation_stability(
     return {
         "gold_file": str(gold_path),
         "gold_schema_version": gold_data.get("schema_version"),
-        "source_file": sorted(source_files)[0] if source_files else None,
+        "source_file": reports[0]["source_file"],
+        "gold_source_file": selected_gold.get("source_file"),
+        "source_scope": source_scope,
         "run_count": len(reports),
         "relation_annotation_status": reports[0]["relation_annotation_status"],
         "runs": [
             {
                 "run_index": i + 1,
-                "relation_count": r["relation_count"],
-                "raw_edge_count": r["raw_edge_count"],
-                "aligned_edge_count": r["aligned_edge_count"],
-                "dropped_relation_count": r["dropped_relation_count"],
-                "alignment_coverage": r["alignment_coverage"],
-                "dropped_relations": r["dropped_relations"],
+                "predicted_total_node_count": report["predicted_total_node_count"],
+                "scoped_node_count": report["scoped_node_count"],
+                "predicted_total_relation_count": report[
+                    "predicted_total_relation_count"
+                ],
+                "out_of_scope_relation_count": report[
+                    "out_of_scope_relation_count"
+                ],
+                "relation_count": report["relation_count"],
+                "raw_edge_count": report["raw_edge_count"],
+                "aligned_edge_count": report["aligned_edge_count"],
+                "dropped_relation_count": report["dropped_relation_count"],
+                "alignment_coverage": report["alignment_coverage"],
+                "dropped_relations": report["dropped_relations"],
             }
-            for i, r in enumerate(reports)
+            for i, report in enumerate(reports)
         ],
         "pairwise": pairwise,
         "stable_edges": {
@@ -1250,8 +1456,72 @@ def evaluate_relation_stability(
         },
         "edge_union_counts": {
             "raw_name": len(set().union(*raw_edge_sets)) if raw_edge_sets else 0,
-            "gold_aligned": len(set().union(*aligned_edge_sets)) if aligned_edge_sets else 0,
+            "gold_aligned": len(set().union(*aligned_edge_sets))
+            if aligned_edge_sets
+            else 0,
         },
+        "relation_metrics": None,
+    }
+
+
+def evaluate_relation_stability(
+    graphs: list[dict[str, Any]],
+    gold_data: dict[str, Any],
+    gold_path: Path,
+    gold_source_file: str | None = None,
+) -> dict[str, Any]:
+    """Cross-run relation-set stability using gold-aligned endpoints.
+
+    Jaccard is computed twice per run pair: raw_name uses the model-generated
+    endpoint names and therefore counts naming drift as instability;
+    gold_aligned maps endpoints to reviewed gold ids first. relation_metrics
+    stays null because gold relations are not annotated yet: stability is not
+    precision, recall, or F1.
+    """
+    if not graphs:
+        raise SystemExit("Relation stability evaluation requires at least one KG JSON")
+    source_files = {Path(str(g.get("source_path", ""))).name for g in graphs}
+    if len(source_files) > 1:
+        raise SystemExit(
+            "Relation stability evaluation requires runs of one source document, "
+            f"got: {sorted(source_files)}"
+        )
+
+    source_file = sorted(source_files)[0]
+    targets = gold_targets_for_source(source_file, gold_data.get("graphs", []))
+    if gold_source_file is not None:
+        selected_name = Path(gold_source_file).name
+        targets = [
+            target
+            for target in targets
+            if Path(str(target[0].get("source_file", ""))).name == selected_name
+        ]
+    if not targets:
+        scope_note = f" for Gold source {gold_source_file!r}" if gold_source_file else ""
+        raise SystemExit(
+            f"Gold file {gold_path} has no graph annotation applicable to "
+            f"source {source_file!r}{scope_note}"
+        )
+
+    scope_reports = [
+        _relation_stability_for_gold_target(
+            graphs,
+            selected_gold,
+            source_scope,
+            gold_data,
+            gold_path,
+        )
+        for selected_gold, source_scope in targets
+    ]
+    if len(scope_reports) == 1:
+        return scope_reports[0]
+    return {
+        "gold_file": str(gold_path),
+        "gold_schema_version": gold_data.get("schema_version"),
+        "source_file": source_file,
+        "run_count": len(graphs),
+        "scope_count": len(scope_reports),
+        "scope_reports": scope_reports,
         "relation_metrics": None,
     }
 
@@ -1554,36 +1824,60 @@ def print_text_report(report: dict[str, Any], sample_size: int) -> None:
     print(f"Severe issues: {summary['severe_issue_count']}")
     print(f"Warning issues: {summary['warning_issue_count']}")
     print(f"Structurally clean: {summary['is_structurally_clean']}")
-    gold = report.get("gold_evaluation")
-    if gold:
+    gold_reports = []
+    if report.get("gold_evaluation"):
+        gold_reports.append(report["gold_evaluation"])
+    gold_reports.extend(report.get("gold_scope_evaluations", []))
+    for gold in gold_reports:
         metrics = gold["node_metrics"]
+        scope_label = gold.get("gold_source_file") or gold.get("source_file")
+        prefix = f"Gold [{scope_label}]" if len(gold_reports) > 1 else "Gold"
         print(
-            "Gold node P/R/F1: "
+            f"{prefix} node P/R/F1: "
             f"{metrics['precision']:.4f} / {metrics['recall']:.4f} / {metrics['f1']:.4f} "
             f"(TP={metrics['true_positive']}, FP={metrics['false_positive']}, "
             f"FN={metrics['false_negative']}, optional={metrics['optional_matched']})"
         )
-        print(f"Gold relation status: {gold['relation_annotation_status']}")
+        for tier, tier_metrics in metrics.get("per_tier", {}).items():
+            print(
+                f"  {tier} recall: {tier_metrics['recall']:.4f} "
+                f"({tier_metrics['matched']}/{tier_metrics['gold_count']}, "
+                f"FN={tier_metrics['false_negative']})"
+            )
+        print(f"{prefix} relation status: {gold['relation_annotation_status']}")
     stability = report.get("relation_stability")
     if stability:
-        print(f"Relation stability: {stability['run_count']} runs of {stability['source_file']}")
-        print(f"  Gold relation status: {stability['relation_annotation_status']}")
-        for pair in stability["pairwise"]:
-            print(
-                f"  Jaccard r{pair['run_a']}-r{pair['run_b']}: "
-                f"raw_name={pair['raw_name_jaccard']:.4f} "
-                f"gold_aligned={pair['gold_aligned_jaccard']:.4f}"
-            )
-        for run in stability["runs"]:
-            print(
-                f"  Run {run['run_index']}: {run['aligned_edge_count']}/{run['relation_count']} aligned edges "
-                f"(coverage {run['alignment_coverage']:.2%}, dropped {run['dropped_relation_count']})"
-            )
+        stability_reports = stability.get("scope_reports") or [stability]
         print(
-            "  Stable gold-aligned edges: "
-            f"{len(stability['stable_edges']['gold_aligned'])} "
-            f"(union {stability['edge_union_counts']['gold_aligned']})"
+            f"Relation stability: {stability['run_count']} runs of "
+            f"{stability['source_file']}"
         )
+        for scoped in stability_reports:
+            scope_label = scoped.get("gold_source_file") or scoped["source_file"]
+            if len(stability_reports) > 1:
+                print(f"  Scope [{scope_label}]")
+            print(
+                "    Gold relation status: "
+                f"{scoped['relation_annotation_status']}"
+            )
+            for pair in scoped["pairwise"]:
+                print(
+                    f"    Jaccard r{pair['run_a']}-r{pair['run_b']}: "
+                    f"raw_name={pair['raw_name_jaccard']:.4f} "
+                    f"gold_aligned={pair['gold_aligned_jaccard']:.4f}"
+                )
+            for run in scoped["runs"]:
+                print(
+                    f"    Run {run['run_index']}: "
+                    f"{run['aligned_edge_count']}/{run['relation_count']} aligned edges "
+                    f"(coverage {run['alignment_coverage']:.2%}, "
+                    f"dropped {run['dropped_relation_count']})"
+                )
+            print(
+                "    Stable gold-aligned edges: "
+                f"{len(scoped['stable_edges']['gold_aligned'])} "
+                f"(union {scoped['edge_union_counts']['gold_aligned']})"
+            )
     print()
     print("Node types:")
     for key, value in sorted(counts["node_count_by_type"].items()):

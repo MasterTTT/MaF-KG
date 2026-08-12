@@ -5,6 +5,7 @@ import os
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 from pydantic import ValidationError
@@ -16,6 +17,7 @@ from agents.Extractor import (
     DocumentChunk,
     Evidence,
     EvidenceRef,
+    ExtractionState,
     ExtractionResult,
     Extractor,
     KGNode,
@@ -491,7 +493,339 @@ class ClaimKindTests(unittest.TestCase):
             )
 
 
+class CoverageLedgerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.extractor = Extractor(save_output=False, verbose=False)
+
+    def chunk(
+        self,
+        *,
+        chunk_id: str,
+        unit_kind: str,
+        role: str,
+        block_id: str,
+    ) -> DocumentChunk:
+        return DocumentChunk(
+            id=chunk_id,
+            start_line=1,
+            end_line=2,
+            heading_path=["第一节"],
+            text="1: 教材正文。\n2: 教材正文。",
+            teaching_unit_kind=unit_kind,
+            teaching_block_ids=(block_id,),
+            teaching_blocks=(
+                {
+                    "teaching_block_id": block_id,
+                    "discourse_role": role,
+                    "start_line": 1,
+                    "end_line": 2,
+                    "segments": [],
+                },
+            ),
+            anchor_block_ids=(block_id,),
+        )
+
+    def node(self, node_type: str, block_id: str) -> NodeRecord:
+        return NodeRecord(
+            id=f"{node_type.lower()}_covered",
+            type=node_type,
+            name="已覆盖语义",
+            description="教材明确陈述的可复用数学语义。",
+            claim_kind="property" if node_type == "Claim" else None,
+            evidence=[
+                Evidence(
+                    source_path="source.md",
+                    start_line=1,
+                    end_line=2,
+                    text="教材正文。",
+                    chunk_id="chunk_1",
+                    heading_path=["第一节"],
+                    teaching_block_id=block_id,
+                    discourse_role="definition" if node_type == "Concept" else "theorem",
+                )
+            ],
+        )
+
+    def test_definition_requires_concept_evidence(self) -> None:
+        chunk = self.chunk(
+            chunk_id="chunk_1",
+            unit_kind="definition",
+            role="definition",
+            block_id="definition_1",
+        )
+        ledger = self.extractor._build_coverage_ledger(
+            [chunk], {}, {}, chunk_strategy="teaching-units"
+        )
+        self.assertEqual(ledger["uncovered_count"], 1)
+        self.assertEqual(
+            ledger["uncovered_items"][0]["missing_semantics"], ["Concept"]
+        )
+        self.assertTrue(ledger["uncovered_items"][0]["review_eligible"])
+
+        concept = self.node("Concept", "definition_1")
+        covered = self.extractor._build_coverage_ledger(
+            [chunk], {concept.id: concept}, {}, chunk_strategy="teaching-units"
+        )
+        self.assertEqual(covered["uncovered_count"], 0)
+        self.assertEqual(covered["covered_count"], 1)
+
+    def test_theorem_requires_claim_not_merely_related_concept(self) -> None:
+        chunk = self.chunk(
+            chunk_id="chunk_1",
+            unit_kind="theorem",
+            role="theorem",
+            block_id="theorem_1",
+        )
+        concept = self.node("Concept", "theorem_1")
+        ledger = self.extractor._build_coverage_ledger(
+            [chunk], {concept.id: concept}, {}, chunk_strategy="teaching-units"
+        )
+        self.assertEqual(
+            ledger["uncovered_items"][0]["missing_semantics"], ["Claim"]
+        )
+
+        claim = self.node("Claim", "theorem_1")
+        covered = self.extractor._build_coverage_ledger(
+            [chunk],
+            {concept.id: concept, claim.id: claim},
+            {},
+            chunk_strategy="teaching-units",
+        )
+        self.assertEqual(covered["uncovered_count"], 0)
+
+    def test_exposition_without_output_is_not_reported_as_required_gap(self) -> None:
+        chunk = self.chunk(
+            chunk_id="chunk_1",
+            unit_kind="exposition",
+            role="paragraph",
+            block_id="paragraph_1",
+        )
+        ledger = self.extractor._build_coverage_ledger(
+            [chunk], {}, {}, chunk_strategy="teaching-units"
+        )
+        self.assertEqual(ledger["check_count"], 0)
+        self.assertEqual(ledger["uncovered_count"], 0)
+
+    def test_core_statement_accepts_any_node_evidence(self) -> None:
+        chunk = self.chunk(
+            chunk_id="chunk_1",
+            unit_kind="core_statement",
+            role="paragraph",
+            block_id="statement_1",
+        )
+        ledger = self.extractor._build_coverage_ledger(
+            [chunk], {}, {}, chunk_strategy="teaching-units"
+        )
+        self.assertEqual(
+            ledger["uncovered_items"][0]["missing_semantics"], ["Node"]
+        )
+        self.assertTrue(ledger["uncovered_items"][0]["review_eligible"])
+
+        concept = self.node("Concept", "statement_1")
+        covered = self.extractor._build_coverage_ledger(
+            [chunk], {concept.id: concept}, {}, chunk_strategy="teaching-units"
+        )
+        self.assertEqual(covered["uncovered_count"], 0)
+
+    def test_budget_strategy_marks_coverage_not_applicable(self) -> None:
+        ledger = self.extractor._build_coverage_ledger(
+            [], {}, {}, chunk_strategy="budget"
+        )
+        self.assertEqual(ledger["status"], "not_applicable")
+
+    def test_coverage_review_requires_teaching_units(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires chunk_strategy"):
+            Extractor(coverage_review=True, save_output=False, verbose=False)
+
+
+class RunConfigTests(unittest.TestCase):
+    def test_memory_budgets_are_recorded(self) -> None:
+        extractor = Extractor(save_output=False, verbose=False)
+        state: ExtractionState = {
+            "provider": "deepseek",
+            "thinking": "disabled",
+            "memory_node_bytes": 14000,
+            "memory_relation_bytes": 7000,
+        }
+
+        config = extractor._run_config(state)
+
+        self.assertEqual(config["memory_node_bytes"], 14000)
+        self.assertEqual(config["memory_relation_bytes"], 7000)
+
+
+class CoveragePipelineTests(unittest.TestCase):
+    def chunk(self, *, role: str = "theorem", unit_kind: str = "theorem") -> DocumentChunk:
+        return DocumentChunk(
+            id="chunk_1",
+            start_line=1,
+            end_line=1,
+            heading_path=["第一节"],
+            text="1: 定理1 极限具有唯一性。",
+            block_count=1,
+            block_types=(role,),
+            teaching_block_ids=("teaching_1",),
+            teaching_blocks=(
+                {
+                    "teaching_block_id": "teaching_1",
+                    "discourse_role": role,
+                    "start_line": 1,
+                    "end_line": 1,
+                    "segments": [],
+                },
+            ),
+            teaching_unit_kind=unit_kind,
+            anchor_block_ids=("teaching_1",),
+        )
+
+    def state(self, chunk: DocumentChunk, *, coverage_review: bool) -> dict[str, Any]:
+        return {
+            "input_path": "source.md",
+            "output_path": "result.json",
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash",
+            "base_url": "https://api.deepseek.com",
+            "temperature": 0.1,
+            "thinking": "enabled",
+            "reasoning_effort": "low",
+            "max_tokens": 4096,
+            "raw_lines": ["定理1 极限具有唯一性。"],
+            "chunks": [chunk],
+            "diagnostics": {},
+            "resume": False,
+            "request_delay": 0,
+            "save_output": False,
+            "memory_node_bytes": 12000,
+            "memory_relation_bytes": 6000,
+            "use_response_format": True,
+            "no_proxy": True,
+            "max_chunk_chars": 3200,
+            "chunk_strategy": "teaching-units",
+            "chunk_context_before_lines": 6,
+            "chunk_context_after_lines": 4,
+            "experimental_chunk_spans": (),
+            "experimental_skip_pure_example_chunks": False,
+            "max_retries": 0,
+            "request_timeout": 1,
+            "include_exercises": False,
+            "coverage_review": coverage_review,
+            "verbose": False,
+            "run_started_at": "2026-08-12T00:00:00+00:00",
+        }
+
+    def run_pipeline(
+        self,
+        *,
+        coverage_review: bool,
+        responses: dict[str, dict[str, Any]],
+        chunk: DocumentChunk | None = None,
+        latex_candidates: dict[str, tuple[int, str]] | None = None,
+    ) -> tuple[ExtractionResult, list[str]]:
+        extractor = Extractor(
+            chunk_strategy="teaching-units",
+            coverage_review=coverage_review,
+            save_output=False,
+            verbose=False,
+        )
+        source_chunk = chunk or self.chunk()
+        role = str(source_chunk.teaching_blocks[0]["discourse_role"])
+        extractor.source_context_by_line = {1: (["第一节"], "teaching_1", role)}
+        extractor.source_latex_candidates = latex_candidates or {}
+        calls: list[str] = []
+        client = SimpleNamespace(
+            complete_json=lambda system, user, label: calls.append(label)
+            or responses[label],
+            request_history=[],
+        )
+        with (
+            patch.object(extractor, "_client", return_value=client),
+            patch.object(extractor, "_write_chunk_cache"),
+        ):
+            result = extractor._extract_sequentially(
+                self.state(source_chunk, coverage_review=coverage_review)
+            )["result"]
+        return result, calls
+
+    def test_first_pass_ledger_adds_no_model_call(self) -> None:
+        empty = {"node_actions": [], "relations": [], "expressions": [], "notes": []}
+        result, calls = self.run_pipeline(
+            coverage_review=False,
+            responses={"chunk_1": empty},
+        )
+
+        self.assertEqual(calls, ["chunk_1"])
+        self.assertEqual(result.diagnostics["coverage_ledger"]["uncovered_count"], 1)
+        self.assertEqual(result.diagnostics["coverage_review"]["reviewed_chunk_count"], 0)
+
+    def test_empty_coverage_review_is_recorded_and_gap_remains(self) -> None:
+        empty = {"node_actions": [], "relations": [], "expressions": [], "notes": []}
+        result, calls = self.run_pipeline(
+            coverage_review=True,
+            responses={
+                "chunk_1": empty,
+                "chunk_1_coverage_review": empty,
+            },
+        )
+
+        self.assertEqual(calls, ["chunk_1", "chunk_1_coverage_review"])
+        review = result.diagnostics["coverage_review"]
+        self.assertEqual(review["reviewed_chunk_count"], 1)
+        self.assertEqual((review["uncovered_before"], review["uncovered_after"]), (1, 1))
+
+    def test_review_can_create_claim_and_close_gap(self) -> None:
+        empty = {"node_actions": [], "relations": [], "expressions": [], "notes": []}
+        review_payload = {
+            "node_actions": [
+                {
+                    "ref_id": "claim_1",
+                    "action": "create",
+                    "type": "Claim",
+                    "name": "极限唯一性",
+                    "description": "收敛对象的极限是唯一的。",
+                    "claim_kind": "property",
+                    "evidence": {"start_line": 1, "end_line": 1},
+                }
+            ],
+            "relations": [],
+            "expressions": [],
+            "notes": [],
+        }
+        result, calls = self.run_pipeline(
+            coverage_review=True,
+            responses={
+                "chunk_1": empty,
+                "chunk_1_coverage_review": review_payload,
+            },
+        )
+
+        self.assertEqual(calls, ["chunk_1", "chunk_1_coverage_review"])
+        self.assertEqual([node.name for node in result.nodes], ["极限唯一性"])
+        review = result.diagnostics["coverage_review"]
+        self.assertEqual((review["uncovered_before"], review["uncovered_after"]), (1, 0))
+
+    def test_formula_candidates_are_diagnostic_not_required(self) -> None:
+        chunk = self.chunk(role="formula_block", unit_kind="exposition")
+        empty = {"node_actions": [], "relations": [], "expressions": [], "notes": []}
+        result, calls = self.run_pipeline(
+            coverage_review=False,
+            responses={"chunk_1": empty},
+            chunk=chunk,
+            latex_candidates={"latex_1": (1, r"f(x)=x^2")},
+        )
+
+        ledger = result.diagnostics["coverage_ledger"]
+        self.assertEqual(calls, ["chunk_1"])
+        self.assertEqual(ledger["check_count"], 0)
+        self.assertEqual(ledger["uncovered_count"], 0)
+        self.assertEqual(ledger["formula_candidate_check_count"], 1)
+        self.assertEqual(ledger["formula_candidate_without_expression_count"], 1)
+
+
 class StructureAwareChunkTests(unittest.TestCase):
+    def test_extraction_state_preserves_memory_budgets(self) -> None:
+        self.assertIn("memory_node_bytes", ExtractionState.__annotations__)
+        self.assertIn("memory_relation_bytes", ExtractionState.__annotations__)
+
     def test_formula_exposition_is_not_split_at_formula_boundary(self) -> None:
         extractor = Extractor(save_output=False, verbose=False)
         lines = [
@@ -959,6 +1293,80 @@ class StructureAwareChunkTests(unittest.TestCase):
         )
         self.assertEqual(extractor.source_context_by_line[2][2], "paragraph")
         self.assertEqual(extractor.source_context_by_line[3][2], "paragraph")
+
+    def test_theorem_references_are_exposition_not_new_theorems(self) -> None:
+        extractor = Extractor(save_output=False, verbose=False)
+        lines = [
+            "# 第五节 极限运算法则",
+            "定理6表示，如果满足该定理的条件，那么可作变量代换。",
+            "定理 2 表明, 求两个无穷小之比时可作等价替换。",
+            "定理3说明该结论还可推广。",
+            "定理3中的(1)、(2)可推广到有限个函数。",
+            "定理4的结论也适用于另一种情形。",
+        ]
+        extractor._chunk_document(
+            {
+                "raw_lines": lines,
+                "max_chunk_chars": 3200,
+                "chunk_strategy": "teaching-units",
+                "chunk_context_before_lines": 0,
+                "chunk_context_after_lines": 0,
+                "experimental_chunk_spans": (),
+                "diagnostics": {},
+            }
+        )
+        self.assertTrue(
+            all(
+                extractor.source_context_by_line[line_no][2] == "paragraph"
+                for line_no in range(2, 7)
+            )
+        )
+
+    def test_actual_named_theorem_remains_theorem(self) -> None:
+        extractor = Extractor(save_output=False, verbose=False)
+        extractor._chunk_document(
+            {
+                "raw_lines": [
+                    "# 第五节 极限运算法则",
+                    "定理6（复合函数的极限运算法则）设函数满足下列条件。",
+                ],
+                "max_chunk_chars": 3200,
+                "chunk_strategy": "teaching-units",
+                "chunk_context_before_lines": 0,
+                "chunk_context_after_lines": 0,
+                "experimental_chunk_spans": (),
+                "diagnostics": {},
+            }
+        )
+        self.assertEqual(extractor.source_context_by_line[2][2], "theorem")
+
+    def test_theorem_reference_ends_preceding_theorem_block(self) -> None:
+        extractor = Extractor(save_output=False, verbose=False)
+        extractor._chunk_document(
+            {
+                "raw_lines": [
+                    "# 第五节 极限运算法则",
+                    "定理6（复合函数的极限运算法则）设函数满足下列条件。",
+                    "则复合函数的极限存在。",
+                    "定理6表示，如果满足该定理的条件，那么可作变量代换。",
+                    "这里给出应用说明。",
+                ],
+                "max_chunk_chars": 3200,
+                "chunk_strategy": "teaching-units",
+                "chunk_context_before_lines": 0,
+                "chunk_context_after_lines": 0,
+                "experimental_chunk_spans": (),
+                "diagnostics": {},
+            }
+        )
+        self.assertEqual(extractor.source_context_by_line[2][2], "theorem")
+        self.assertEqual(extractor.source_context_by_line[3][2], "theorem")
+        self.assertEqual(extractor.source_context_by_line[4][2], "paragraph")
+        self.assertEqual(extractor.source_context_by_line[5][2], "paragraph")
+        self.assertNotEqual(
+            extractor.source_context_by_line[2][1],
+            extractor.source_context_by_line[4][1],
+        )
 
     def test_teaching_unit_kind_definition_group(self) -> None:
         extractor = Extractor(save_output=False, verbose=False)
