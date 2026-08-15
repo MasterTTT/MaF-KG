@@ -149,12 +149,18 @@ def rule_claim_without_involves(g: Graph) -> list[Hit]:
     for n in g.nodes:
         if n["type"] != "Claim":
             continue
-        if not any(r["type"] == "involves" for r in g.outgoing(n["id"])):
-            hits.append(Hit(
-                "claim_without_involves", n["name"], n["type"], n["id"], "low",
-                "Claim has no involves anchor",
-                "add_involves", g.is_seed(n["id"]),
-            ))
+        outs = g.outgoing(n["id"])
+        if any(r["type"] == "involves" for r in outs):
+            continue
+        basis = [g.name(r["target_id"]) for r in outs if r["type"] == "derived_from"]
+        reason = "Claim has no involves anchor"
+        if basis:
+            reason += "; derived_from " + "、".join(basis) + "（继承的 involves 可能是有意省略）"
+        hits.append(Hit(
+            "claim_without_involves", n["name"], n["type"], n["id"], "low",
+            reason, "add_involves", g.is_seed(n["id"]),
+            {"derived_from_basis": basis},
+        ))
     return hits
 
 
@@ -254,6 +260,8 @@ _JUDGE_SYSTEM = (
     "special_case_of/derived_from/establishes）和目标概念名\n"
     "- drop：该节点是纯记号或例题局部内容，应删除\n"
     "不要臆造关系；只有当描述明确支撑时才 add_relation 或 retag_type。\n"
+    "注意：若某 Claim 已有 derived_from 指向基结论，其 involves 可能经基结论继承；此时只补该 Claim "
+    "自身陈述所必需的核心概念锚，不要重复添加基结论已有的继承锚。\n"
     '只输出 JSON：{"decisions":[{"node_id":"...","name":"...","verdict":"keep|retag_type|add_relation|drop",'
     '"detail":"...","reason":"一句话"}]}'
 )
@@ -331,23 +339,61 @@ def judge(g: Graph, hits: list[Hit]) -> list[dict]:
 
 
 def resolve_target(g: Graph, name: str) -> str | None:
-    """Resolve a target concept name to a node id (exact, then substring both ways)."""
+    """Resolve a target concept name to a node id.
+
+    Exact match first; then substring only when UNIQUE. An ambiguous substring
+    returns None so the caller skips instead of picking an arbitrary node.
+    """
     for n in g.nodes:
         if n["name"] == name:
             return n["id"]
-    for n in g.nodes:
-        if name in n["name"]:
-            return n["id"]
-    for n in g.nodes:
-        if n["name"] and n["name"] in name:
-            return n["id"]
+    hits = [n["id"] for n in g.nodes if name in n["name"]]
+    if len(hits) == 1:
+        return hits[0]
     return None
 
 
-def apply_decisions(data: dict, g: Graph, decisions: list[dict], out_path: str) -> tuple[list[dict], list[dict]]:
+def _select_evidence(src_node: dict, rel_type: str) -> list[dict]:
+    evs = src_node.get("evidence", []) or []
+    if rel_type == "defined_in_terms_of":
+        defn = [e for e in evs if e.get("discourse_role") == "definition"]
+        return list((defn or evs)[:1])
+    return list(evs[:1])
+
+
+def _source_chapter(src_node: dict) -> str:
+    for ev in src_node.get("evidence", []):
+        sp = ev.get("source_path", "")
+        if "第一章" in sp:
+            return "第一章"
+        if "第二章" in sp:
+            return "第二章"
+    return "未知"
+
+
+def _recompute_audit(data: dict) -> None:
+    nodes = data.get("nodes", [])
+    relations = data.get("relations", [])
+    deg = Counter()
+    for r in relations:
+        deg[r["source_id"]] += 1
+        deg[r["target_id"]] += 1
+    iso = [n["id"] for n in nodes if deg[n["id"]] == 0]
+    dg = data.setdefault("diagnostics", {})
+    audit = dg.setdefault("audit", {})
+    audit["isolated_node_count"] = len(iso)
+    audit["isolated_node_ids"] = iso
+    dg["node_count"] = len(nodes)
+    dg["relation_count"] = len(relations)
+    dg["relation_type_counts"] = dict(Counter(r["type"] for r in relations))
+    dg["post_repair"] = True
+
+
+def apply_decisions(data: dict, g: Graph, decisions: list[dict]) -> tuple[list[dict], list[dict]]:
     """Apply add_relation decisions in place; retag_type/drop are only logged.
 
-    Returns (applied, skipped). ``data`` is the full graph JSON (mutated and written).
+    Returns (applied, skipped). ``data`` is the full graph JSON, mutated; the
+    caller writes it out after attaching the verifier_run record.
     """
     import secrets
 
@@ -376,24 +422,29 @@ def apply_decisions(data: dict, g: Graph, decisions: list[dict], out_path: str) 
                 skipped.append({"node_id": node_id, "name": name, "verdict": verdict,
                                 "detail": detail, "reason": "relation already exists"})
                 continue
-            src_node = g.by_id.get(node_id)
-            evidence = list(src_node.get("evidence", [])) if src_node else []
+            src_node = g.by_id.get(node_id) or {}
+            evidence = _select_evidence(src_node, rel_type)
+            chapter = _source_chapter(src_node)
             relations.append({
                 "id": "relation_" + secrets.token_hex(6),
                 "type": rel_type,
                 "source_id": node_id,
                 "target_id": target_id,
                 "evidence": evidence,
+                "synthesized": True,
             })
             existing.add((node_id, rel_type, target_id))
-            applied.append({"node_id": node_id, "name": name,
-                            "relation": f"{rel_type}->{target_name}", "target_id": target_id})
+            applied.append({
+                "node_id": node_id, "name": name,
+                "relation": f"{rel_type}->{target_name}",
+                "target_id": target_id, "chapter": chapter,
+            })
         elif verdict in ("retag_type", "drop"):
             skipped.append({"node_id": node_id, "name": name, "verdict": verdict,
                             "detail": detail, "reason": "manual confirm required"})
         # keep -> no-op
 
-    Path(out_path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    _recompute_audit(data)
     return applied, skipped
 
 
@@ -486,12 +537,26 @@ def main() -> int:
     if args.apply and decisions:
         print()
         print("--- applying add_relation decisions ---")
-        applied, skipped = apply_decisions(data, g, decisions, args.apply)
+        applied, skipped = apply_decisions(data, g, decisions)
         print(f"applied: {len(applied)}  |  skipped (manual): {len(skipped)}")
         for a in applied:
-            print(f"  [applied ] {a['name']}  ->  {a['relation']}")
+            print(f"  [applied ] {a['name']}  ->  {a['relation']}  ({a['chapter']})")
         for s in skipped:
             print(f"  [skipped ] {s['name']}  ({s['reason']})")
+
+        import datetime
+        verifier_run = {
+            "model": JUDGE_MODEL,
+            "endpoints": [url for url, _ in JUDGE_ENDPOINTS],
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "candidates": [asdict(h) for h in hits],
+            "decisions": decisions,
+            "applied": applied,
+            "skipped": skipped,
+        }
+        data.setdefault("diagnostics", {})["verifier_run"] = verifier_run
+        Path(args.apply).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"wrote repaired graph -> {args.apply}")
     return 0
 
 
