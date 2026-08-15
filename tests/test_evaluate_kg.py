@@ -5,6 +5,8 @@ from tempfile import TemporaryDirectory
 from pathlib import Path
 
 from scripts.evaluate_kg import (
+    DEFAULT_MATCH_POLICY,
+    MatchPolicy,
     _gold_alignment_lookup,
     canonical_node_name,
     critical_modifier_mismatch,
@@ -12,10 +14,12 @@ from scripts.evaluate_kg import (
     evaluate_gold_scopes,
     evaluate_nodes_against_gold,
     evaluate_relation_stability,
+    evaluate_relations_against_gold,
     filter_nodes_to_source_scope,
     fuzzy_gold_candidates,
     fuzzy_similarity,
     gold_targets_for_source,
+    match_node_to_gold,
     resolve_input,
 )
 
@@ -186,7 +190,7 @@ class GoldNodeEvaluatorTests(unittest.TestCase):
                 }
             ],
         }
-        return evaluate_nodes_against_gold(graph, gold, Path("gold.json"))
+        return evaluate_nodes_against_gold(graph, gold, Path("gold.json"), semantic_match=False)
 
     def concept(self, name: str, aliases: list[str] | None = None) -> dict[str, object]:
         return {
@@ -314,7 +318,7 @@ class GoldNodeEvaluatorTests(unittest.TestCase):
             ],
         }
 
-        reports = evaluate_gold_scopes(graph, gold, Path("gold.json"))
+        reports = evaluate_gold_scopes(graph, gold, Path("gold.json"), semantic_match=False)
 
         self.assertEqual(len(reports), 2)
         self.assertEqual(
@@ -1136,6 +1140,329 @@ class RelationStabilityTests(unittest.TestCase):
 
         self.assertEqual(report["gold_source_file"], "section_2.md")
         self.assertNotIn("scope_reports", report)
+
+
+class RelationGoldEvaluationTests(unittest.TestCase):
+    def node_gold(self) -> dict:
+        return {
+            "schema_version": "maf-kg.semantic-gold.v2",
+            "graphs": [
+                {
+                    "source_file": "section2.md",
+                    "node_groups": [
+                        {
+                            "requirement": "M",
+                            "type": "Concept",
+                            "items": [
+                                {"gold_id": "s2_c_seq", "name": "数列"},
+                                {"gold_id": "s2_c_subseq", "name": "子数列"},
+                            ],
+                        },
+                        {
+                            "requirement": "M",
+                            "type": "Claim",
+                            "claim_kind": "property",
+                            "items": [
+                                {"gold_id": "s2_p_uniq", "name": "极限唯一性"},
+                                {"gold_id": "s2_p_sign", "name": "保号性"},
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+
+    def relation_gold(self, relations: list[dict]) -> dict:
+        return {
+            "schema_version": "maf-kg.relation-gold.v1",
+            "source_file": "section2.md",
+            "annotation_status": "reviewed_positive_set",
+            "closed_world": False,
+            "relations": relations,
+        }
+
+    @staticmethod
+    def graph(nodes: list[dict], relations: list[dict]) -> dict:
+        return {
+            "schema_version": "maf-kg.semantic.v1.7.0",
+            "source_path": "section2.md",
+            "nodes": nodes,
+            "relations": relations,
+            "math_expressions": [],
+        }
+
+    @staticmethod
+    def concept(node_id: str, name: str) -> dict:
+        return {"id": node_id, "type": "Concept", "name": name, "aliases": [], "description": "d"}
+
+    @staticmethod
+    def claim(node_id: str, name: str) -> dict:
+        return {
+            "id": node_id,
+            "type": "Claim",
+            "name": name,
+            "claim_kind": "property",
+            "aliases": [],
+            "description": "d",
+        }
+
+    @staticmethod
+    def rel(rel_id: str, rel_type: str, source: str, target: str) -> dict:
+        return {"id": rel_id, "type": rel_type, "source_id": source, "target_id": target}
+
+    def _run(self, nodes: list[dict], relations: list[dict], gold_relations: list[dict]) -> dict:
+        return evaluate_relations_against_gold(
+            self.graph(nodes, relations),
+            self.relation_gold(gold_relations),
+            self.node_gold(),
+            Path("relation_gold.json"),
+            semantic_match=False,
+        )
+
+    def test_full_recall_reports_no_precision_or_f1(self) -> None:
+        nodes = [
+            self.concept("c_seq", "数列"),
+            self.concept("c_subseq", "子数列"),
+            self.claim("p_uniq", "极限唯一性"),
+        ]
+        relations = [
+            self.rel("r1", "special_case_of", "c_subseq", "c_seq"),
+            self.rel("r2", "involves", "p_uniq", "c_seq"),
+        ]
+        gold_relations = [
+            {
+                "gold_id": "s2_r01",
+                "source_gold_id": "s2_c_subseq",
+                "type": "special_case_of",
+                "target_gold_id": "s2_c_seq",
+            },
+            {
+                "gold_id": "s2_r02",
+                "source_gold_id": "s2_p_uniq",
+                "type": "involves",
+                "target_gold_id": "s2_c_seq",
+            },
+        ]
+
+        report = self._run(nodes, relations, gold_relations)
+
+        self.assertEqual(report["positive_count"], 2)
+        self.assertEqual(report["matched_count"], 2)
+        self.assertEqual(report["recall"], 1.0)
+        self.assertEqual(report["misses"], [])
+        self.assertNotIn("precision", report)
+        self.assertNotIn("f1", report)
+
+    def test_wrong_type_is_classified(self) -> None:
+        nodes = [self.concept("c_seq", "数列"), self.concept("c_subseq", "子数列")]
+        relations = [self.rel("r1", "defined_in_terms_of", "c_subseq", "c_seq")]
+        gold_relations = [
+            {
+                "gold_id": "s2_r01",
+                "source_gold_id": "s2_c_subseq",
+                "type": "special_case_of",
+                "target_gold_id": "s2_c_seq",
+            }
+        ]
+
+        report = self._run(nodes, relations, gold_relations)
+
+        self.assertEqual(report["matched_count"], 0)
+        self.assertEqual(report["recall"], 0.0)
+        self.assertEqual(report["miss_category_counts"]["wrong_type"], 1)
+        self.assertEqual(report["misses"][0]["status"], "wrong_type")
+        self.assertIn("defined_in_terms_of", report["misses"][0]["detail"])
+
+    def test_wrong_direction_is_classified(self) -> None:
+        nodes = [self.concept("c_seq", "数列"), self.concept("c_subseq", "子数列")]
+        relations = [self.rel("r1", "special_case_of", "c_seq", "c_subseq")]
+        gold_relations = [
+            {
+                "gold_id": "s2_r01",
+                "source_gold_id": "s2_c_subseq",
+                "type": "special_case_of",
+                "target_gold_id": "s2_c_seq",
+            }
+        ]
+
+        report = self._run(nodes, relations, gold_relations)
+
+        self.assertEqual(report["miss_category_counts"]["wrong_direction"], 1)
+        self.assertEqual(report["misses"][0]["status"], "wrong_direction")
+
+    def test_missing_endpoint_is_classified(self) -> None:
+        nodes = [self.concept("c_seq", "数列")]
+        relations = []
+        gold_relations = [
+            {
+                "gold_id": "s2_r01",
+                "source_gold_id": "s2_c_subseq",
+                "type": "special_case_of",
+                "target_gold_id": "s2_c_seq",
+            }
+        ]
+
+        report = self._run(nodes, relations, gold_relations)
+
+        self.assertEqual(report["miss_category_counts"]["missing_endpoint"], 1)
+        self.assertEqual(report["misses"][0]["status"], "missing_endpoint")
+
+    def test_missing_edge_is_classified_when_both_endpoints_present(self) -> None:
+        nodes = [self.concept("c_seq", "数列"), self.concept("c_subseq", "子数列")]
+        relations = []
+        gold_relations = [
+            {
+                "gold_id": "s2_r01",
+                "source_gold_id": "s2_c_subseq",
+                "type": "special_case_of",
+                "target_gold_id": "s2_c_seq",
+            }
+        ]
+
+        report = self._run(nodes, relations, gold_relations)
+
+        self.assertEqual(report["miss_category_counts"]["missing_edge"], 1)
+        self.assertEqual(report["misses"][0]["status"], "missing_edge")
+
+    def test_unreviewed_endpoint_relation_is_dropped_not_matched(self) -> None:
+        nodes = [
+            self.concept("c_seq", "数列"),
+            self.concept("c_subseq", "子数列"),
+            self.concept("c_func", "函数"),
+        ]
+        relations = [
+            self.rel("r1", "special_case_of", "c_subseq", "c_seq"),
+            self.rel("r2", "defined_in_terms_of", "c_func", "c_seq"),
+        ]
+        gold_relations = [
+            {
+                "gold_id": "s2_r01",
+                "source_gold_id": "s2_c_subseq",
+                "type": "special_case_of",
+                "target_gold_id": "s2_c_seq",
+            }
+        ]
+
+        report = self._run(nodes, relations, gold_relations)
+
+        self.assertEqual(report["matched_count"], 1)
+        self.assertEqual(report["dropped_relation_count"], 1)
+        self.assertEqual(report["dropped_relations"][0]["reason"], "endpoint without a reviewed gold id")
+
+    def test_fuzzy_alignment_recovers_naming_drift(self) -> None:
+        node_gold = {
+            "schema_version": "maf-kg.semantic-gold.v2",
+            "graphs": [
+                {
+                    "source_file": "section2.md",
+                    "node_groups": [
+                        {
+                            "requirement": "M",
+                            "type": "Claim",
+                            "claim_kind": "criterion",
+                            "items": [
+                                {
+                                    "gold_id": "s2_crit",
+                                    "name": "两个子数列收敛到不同极限则原数列发散",
+                                }
+                            ],
+                        },
+                        {
+                            "requirement": "M",
+                            "type": "Claim",
+                            "claim_kind": "property",
+                            "items": [{"gold_id": "s2_prop", "name": "子数列极限性质"}],
+                        },
+                    ],
+                }
+            ],
+        }
+        relation_gold = self.relation_gold(
+            [
+                {
+                    "gold_id": "s2_r1",
+                    "source_gold_id": "s2_crit",
+                    "type": "derived_from",
+                    "target_gold_id": "s2_prop",
+                }
+            ]
+        )
+        nodes = [
+            {
+                "id": "c1",
+                "type": "Claim",
+                "name": "两个子数列收敛于不同极限则数列发散",
+                "claim_kind": "criterion",
+                "aliases": [],
+                "description": "d",
+            },
+            self.claim("c2", "子数列极限性质"),
+        ]
+        relations = [self.rel("r1", "derived_from", "c1", "c2")]
+
+        report = evaluate_relations_against_gold(
+            self.graph(nodes, relations), relation_gold, node_gold, Path("rg.json"), semantic_match=False
+        )
+
+        # Relation endpoints reuse node-eval matching (rule -> fuzzy): a drifted
+        # node name is fuzzy-rescued so the relation is still recalled.
+        self.assertEqual(report["matched_count"], 1)
+        self.assertEqual(report["recall"], 1.0)
+
+    def test_match_policy_controls_fuzzy_layer(self) -> None:
+        predicted = {
+            "id": "c1",
+            "type": "Claim",
+            "name": "两个子数列收敛于不同极限则数列发散",
+            "claim_kind": "criterion",
+            "aliases": [],
+            "description": "d",
+        }
+        gold = [
+            {
+                "requirement": "M",
+                "type": "Claim",
+                "claim_kind": "criterion",
+                "gold_id": "s2_crit",
+                "name": "两个子数列收敛到不同极限则原数列发散",
+            }
+        ]
+
+        matched, layer = match_node_to_gold(predicted, gold, MatchPolicy())
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["gold_id"], "s2_crit")
+        self.assertEqual(layer, "fuzzy")
+
+        matched, layer = match_node_to_gold(predicted, gold, MatchPolicy(fuzzy=False))
+        self.assertIsNone(matched)
+        self.assertIsNone(layer)
+
+    def test_semantic_layer_defaults_on_and_is_consulted(self) -> None:
+        self.assertTrue(MatchPolicy().semantic)
+        self.assertTrue(DEFAULT_MATCH_POLICY.semantic)
+
+        class StubMatcher:
+            def best_candidates(self, predicted, gold_items):
+                return list(gold_items)
+
+            def judge_same(self, predicted, gold_item):
+                return True
+
+        predicted = {
+            "id": "c1",
+            "type": "Concept",
+            "name": "映射",
+            "claim_kind": None,
+            "aliases": [],
+            "description": "d",
+        }
+        gold = [
+            {"requirement": "M", "type": "Concept", "claim_kind": None, "gold_id": "g1", "name": "数列"}
+        ]
+
+        matched, layer = match_node_to_gold(predicted, gold, MatchPolicy(), semantic_matcher=StubMatcher())
+        self.assertEqual(layer, "semantic")
+        self.assertEqual(matched["gold_id"], "g1")
 
 
 if __name__ == "__main__":

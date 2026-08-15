@@ -1,97 +1,236 @@
 {
-  "schema_version": "maf-kg.semantic-gold.v2",
-  "scope": "Atomic first-layer semantic nodes in textbook section 1.4",
-  "requirements": {
-    "M": "Required node. A missing match is a false negative.",
-    "O": "Optional node. A match is accepted; absence is not a false negative.",
-    "X": "Forbidden standalone node. A prediction is a false positive.",
-    "Merge": "Represented as one required aggregate node plus forbidden standalone fragments."
-  },
-  "graphs": [
+ "schema_version": "maf-kg.semantic-gold.v2",
+ "scope": "Atomic first-layer semantic nodes in textbook section 1.4",
+ "requirements": {
+  "M": "Required node. A missing match is a false negative.",
+  "O": "Optional node. A match is accepted; absence is not a false negative.",
+  "X": "Forbidden standalone node. A prediction is a false positive.",
+  "Merge": "Represented as one required aggregate node plus forbidden standalone fragments."
+ },
+ "graphs": [
+  {
+   "source_file": "第一章第四节.md",
+   "annotation_status": "reviewed_pre_extraction",
+   "surface_name_alignment_status": "extended_after_v1_5_5_without_boundary_changes",
+   "relation_annotation_status": "pending",
+   "node_groups": [
     {
-      "source_file": "第一章第四节.md",
-      "annotation_status": "reviewed_pre_extraction",
-      "surface_name_alignment_status": "extended_after_v1_5_5_without_boundary_changes",
-      "relation_annotation_status": "pending",
-      "node_groups": [
-        {
-          "requirement": "M",
-          "type": "Concept",
-          "items": [
-            {"gold_id": "s4_concept_infinitesimal", "name": "无穷小"},
-            {"gold_id": "s4_concept_infinite_quantity", "name": "无穷大"},
-            {"gold_id": "s4_concept_positive_infinity", "name": "正无穷大", "accepted_names": ["正无穷", "+∞"]},
-            {"gold_id": "s4_concept_negative_infinity", "name": "负无穷大", "accepted_names": ["负无穷", "-∞"]},
-            {"gold_id": "s4_concept_vertical_asymptote", "name": "铅直渐近线", "accepted_names": ["垂直渐近线"]}
-          ]
-        },
-        {
-          "requirement": "M",
-          "type": "Claim",
-          "claim_kind": "property",
-          "items": [
-            {"gold_id": "s4_property_zero_only_constant_infinitesimal", "name": "零是唯一的常数无穷小", "accepted_names": ["零是无穷小的唯一常数", "零是唯一可作为无穷小的常数", "常数无穷小只能是零", "零是唯一的常量无穷小"]},
-            {"gold_id": "s4_property_infinite_has_no_finite_limit", "name": "无穷大函数不存在有限极限", "accepted_names": ["无穷大的函数极限不存在", "无穷大函数的极限不存在", "无穷大不是有限极限"]}
-          ]
-        },
-        {
-          "requirement": "M",
-          "type": "Claim",
-          "claim_kind": "criterion",
-          "items": [
-            {"gold_id": "s4_criterion_limit_infinitesimal_representation", "name": "函数极限的无穷小表征", "accepted_names": ["函数极限与无穷小的关系", "函数极限存在的无穷小判据", "函数极限的充分必要条件", "函数极限的充要条件", "函数具有极限的充要条件", "函数极限的充要条件 (无穷小形式)", "函数极限的无穷小刻画", "极限的无穷小刻画", "极限存在的无穷小表示", "函数极限与无穷小的等价关系", "函数极限的无穷小充要条件", "极限的无穷小充要条件"]}
-          ]
-        },
-        {
-          "requirement": "M",
-          "type": "Claim",
-          "claim_kind": "result",
-          "items": [
-            {"gold_id": "s4_result_reciprocal_relation", "name": "无穷大与无穷小的倒数关系", "accepted_names": ["无穷小与无穷大的倒数关系", "无穷大和无穷小的倒数关系", "无穷大与无穷小的关系定理", "无穷大与无穷小的关系"]}
-          ]
-        },
-        {
-          "requirement": "O",
-          "type": "Concept",
-          "items": [
-            {"gold_id": "s4_optional_sequence_infinitesimal", "name": "数列无穷小", "accepted_names": ["无穷小数列"]},
-            {"gold_id": "s4_optional_function_limit", "name": "函数极限", "accepted_names": ["函数的极限"]},
-            {"gold_id": "s4_optional_sequence", "name": "数列"},
-            {"gold_id": "s4_optional_sequence_limit", "name": "数列极限", "accepted_names": ["数列的极限"]},
-            {"gold_id": "s4_optional_punctured_neighborhood", "name": "去心邻域"},
-            {"gold_id": "s4_optional_zero_function", "name": "零函数"},
-            {"gold_id": "s4_optional_function", "name": "函数"}
-          ]
-        },
-        {
-          "requirement": "X",
-          "type": "Claim",
-          "claim_kind": "property",
-          "items": [
-            {"gold_id": "s4_forbidden_small_number_distinction", "name": "无穷小与很小的数不同"},
-            {"gold_id": "s4_forbidden_infinity_not_number", "name": "无穷大不是数"}
-          ]
-        },
-        {
-          "requirement": "X",
-          "type": "Claim",
-          "claim_kind": "result",
-          "items": [
-            {"gold_id": "s4_forbidden_example_x_minus_one", "name": "x-1在x趋于1时是无穷小"},
-            {"gold_id": "s4_forbidden_example_reciprocal_infinitesimal", "name": "1/x在x趋于无穷时是无穷小"},
-            {"gold_id": "s4_forbidden_example_infinite_limit", "name": "1/(x-1)在x趋于1时为无穷大"},
-            {"gold_id": "s4_forbidden_example_vertical_asymptote", "name": "x=1是1/(x-1)的铅直渐近线"}
-          ]
-        },
-        {
-          "requirement": "X",
-          "type": "Method",
-          "items": [
-            {"gold_id": "s4_forbidden_m_delta_method", "name": "M-δ论证法"},
-            {"gold_id": "s4_forbidden_reciprocal_method", "name": "倒数法"}
-          ]
-        }
-      ]
+     "requirement": "M",
+     "type": "Concept",
+     "items": [
+      {
+       "gold_id": "s4_concept_infinitesimal",
+       "name": "无穷小",
+       "description": "如果函数 f(x) 当 x→x0（或 x→∞）时的极限为零，那么称 f(x) 为当 x→x0（或 x→∞）时的无穷小。"
+      },
+      {
+       "gold_id": "s4_concept_infinite_quantity",
+       "name": "无穷大",
+       "description": "如果当 x→x0（或 x→∞）时，函数值 f(x) 的绝对值 |f(x)| 无限增大，则称 f(x) 为当 x→x0（或 x→∞）时的无穷大。"
+      },
+      {
+       "gold_id": "s4_concept_positive_infinity",
+       "name": "正无穷大",
+       "accepted_names": [
+        "正无穷",
+        "+∞"
+       ],
+       "description": "当 x→x0（或 x→∞）时，f(x) 保持正值且无限增大，则称 f(x) 为正无穷大。"
+      },
+      {
+       "gold_id": "s4_concept_negative_infinity",
+       "name": "负无穷大",
+       "accepted_names": [
+        "负无穷",
+        "-∞"
+       ],
+       "description": "当 x→x0（或 x→∞）时，f(x) 保持负值且 |f(x)| 无限增大，则称 f(x) 为负无穷大。"
+      },
+      {
+       "gold_id": "s4_concept_vertical_asymptote",
+       "name": "铅直渐近线",
+       "accepted_names": [
+        "垂直渐近线"
+       ],
+       "description": "如果 x→x0 时函数 f(x) 为无穷大，则称直线 x=x0 为曲线 y=f(x) 的铅直渐近线。"
+      }
+     ]
+    },
+    {
+     "requirement": "M",
+     "type": "Claim",
+     "claim_kind": "property",
+     "items": [
+      {
+       "gold_id": "s4_property_zero_only_constant_infinitesimal",
+       "name": "零是唯一的常数无穷小",
+       "accepted_names": [
+        "零是无穷小的唯一常数",
+        "零是唯一可作为无穷小的常数",
+        "常数无穷小只能是零",
+        "零是唯一的常量无穷小"
+       ],
+       "description": "常数函数 f(x)=0 是唯一的常数无穷小。"
+      },
+      {
+       "gold_id": "s4_property_infinite_has_no_finite_limit",
+       "name": "无穷大函数不存在有限极限",
+       "accepted_names": [
+        "无穷大的函数极限不存在",
+        "无穷大函数的极限不存在",
+        "无穷大不是有限极限"
+       ],
+       "description": "如果 f(x) 为当 x→x0（或 x→∞）时的无穷大，那么 f(x) 在该变化过程下不存在有限极限。"
+      }
+     ]
+    },
+    {
+     "requirement": "M",
+     "type": "Claim",
+     "claim_kind": "criterion",
+     "items": [
+      {
+       "gold_id": "s4_criterion_limit_infinitesimal_representation",
+       "name": "函数极限的无穷小表征",
+       "accepted_names": [
+        "函数极限与无穷小的关系",
+        "函数极限存在的无穷小判据",
+        "函数极限的充分必要条件",
+        "函数极限的充要条件",
+        "函数具有极限的充要条件",
+        "函数极限的充要条件 (无穷小形式)",
+        "函数极限的无穷小刻画",
+        "极限的无穷小刻画",
+        "极限存在的无穷小表示",
+        "函数极限与无穷小的等价关系",
+        "函数极限的无穷小充要条件",
+        "极限的无穷小充要条件"
+       ],
+       "description": "函数 f(x) 当 x→x0 时极限为 A 的充分必要条件是 f(x)-A 为该变化过程下的无穷小。"
+      }
+     ]
+    },
+    {
+     "requirement": "M",
+     "type": "Claim",
+     "claim_kind": "property",
+     "items": [
+      {
+       "gold_id": "s4_property_reciprocal_relation",
+       "name": "无穷大与无穷小的倒数关系",
+       "accepted_names": [
+        "无穷小与无穷大的倒数关系",
+        "无穷大和无穷小的倒数关系",
+        "无穷大与无穷小的关系定理",
+        "无穷大与无穷小的关系"
+       ],
+       "description": "在自变量的同一变化过程中，如果 f(x) 是无穷小且 f(x)≠0，则 1/f(x) 是无穷大；反之，如果 f(x) 是无穷大，则 1/f(x) 是无穷小。"
+      }
+     ]
+    },
+    {
+     "requirement": "O",
+     "type": "Concept",
+     "items": [
+      {
+       "gold_id": "s4_optional_sequence_infinitesimal",
+       "name": "数列无穷小",
+       "accepted_names": [
+        "无穷小数列"
+       ],
+       "description": "如果数列 {xn} 的极限为零，则称 {xn} 为无穷小数列。"
+      },
+      {
+       "gold_id": "s4_optional_function_limit",
+       "name": "函数极限",
+       "accepted_names": [
+        "函数的极限"
+       ],
+       "description": "函数极限的一般概念：当自变量按某种变化过程趋于某一值时，对应函数值无限接近于某个确定常数。"
+      },
+      {
+       "gold_id": "s4_optional_sequence",
+       "name": "数列",
+       "description": "按正整数顺序排列的一列数。"
+      },
+      {
+       "gold_id": "s4_optional_sequence_limit",
+       "name": "数列极限",
+       "accepted_names": [
+        "数列的极限"
+       ],
+       "description": "若存在常数 a，对任意 ε>0 存在正整数 N，使当 n>N 时 |xn-a|<ε，则称 a 为数列 {xn} 的极限。"
+      },
+      {
+       "gold_id": "s4_optional_punctured_neighborhood",
+       "name": "去心邻域",
+       "description": "点 x0 的 δ 邻域去掉点 x0 本身。"
+      },
+      {
+       "gold_id": "s4_optional_zero_function",
+       "name": "零函数",
+       "description": "恒等于零的函数 f(x)=0。"
+      },
+      {
+       "gold_id": "s4_optional_function",
+       "name": "函数",
+       "description": "从数集 D 到实数集的一种对应法则，使每个 x∈D 都有唯一确定的数与之对应。"
+      }
+     ]
+    },
+    {
+     "requirement": "X",
+     "type": "Claim",
+     "claim_kind": "property",
+     "items": [
+      {
+       "gold_id": "s4_forbidden_small_number_distinction",
+       "name": "无穷小与很小的数不同"
+      },
+      {
+       "gold_id": "s4_forbidden_infinity_not_number",
+       "name": "无穷大不是数"
+      }
+     ]
+    },
+    {
+     "requirement": "X",
+     "type": "Claim",
+     "claim_kind": "result",
+     "items": [
+      {
+       "gold_id": "s4_forbidden_example_x_minus_one",
+       "name": "x-1在x趋于1时是无穷小"
+      },
+      {
+       "gold_id": "s4_forbidden_example_reciprocal_infinitesimal",
+       "name": "1/x在x趋于无穷时是无穷小"
+      },
+      {
+       "gold_id": "s4_forbidden_example_infinite_limit",
+       "name": "1/(x-1)在x趋于1时为无穷大"
+      },
+      {
+       "gold_id": "s4_forbidden_example_vertical_asymptote",
+       "name": "x=1是1/(x-1)的铅直渐近线"
+      }
+     ]
+    },
+    {
+     "requirement": "X",
+     "type": "Method",
+     "items": [
+      {
+       "gold_id": "s4_forbidden_m_delta_method",
+       "name": "M-δ论证法"
+      },
+      {
+       "gold_id": "s4_forbidden_reciprocal_method",
+       "name": "倒数法"
+      }
+     ]
     }
-  ]
+   ]
+  }
+ ]
 }

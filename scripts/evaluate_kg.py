@@ -6,32 +6,9 @@ import json
 import re
 import sys
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-
-HIERARCHY_LEVEL = {
-    "Chapter": 0,
-    "Section": 1,
-    "Topic": 2,
-    "Subtopic": 3,
-}
-
-SEMANTIC_RELATION_TYPES = {
-    "has_definition",
-    "has_formula",
-    "has_property",
-    "requires",
-    "has_condition",
-    "derived_from",
-    "equivalent_to",
-    "applies_to",
-    "uses_method",
-    "involves_concept",
-    "example_of",
-    "proved_by",
-    "illustrated_by",
-}
 
 SEMANTIC_NODE_TYPES = {"Concept", "Claim", "Method"}
 SEMANTIC_CLAIM_KINDS = {"property", "criterion", "identity", "result"}
@@ -50,7 +27,6 @@ SEMANTIC_EXPRESSION_ROLES = {
     "method_template": "Method",
 }
 
-
 def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -58,6 +34,8 @@ def main() -> int:
     path = resolve_input(args.input, args.kg_dir)
     data = load_json(path)
     report = evaluate(data, path)
+    gold_data = None
+    gold_path = None
     if args.gold:
         gold_path = Path(args.gold)
         gold_data = load_json(gold_path)
@@ -72,6 +50,18 @@ def main() -> int:
             report["gold_evaluation"] = gold_reports[0]
         else:
             report["gold_scope_evaluations"] = gold_reports
+    if args.relation_gold:
+        if not args.gold:
+            raise SystemExit("Relation gold evaluation requires --gold for endpoint alignment")
+        relation_gold_path = Path(args.relation_gold)
+        relation_gold_data = load_json(relation_gold_path)
+        report["relation_gold_evaluation"] = evaluate_relations_against_gold(
+            data,
+            relation_gold_data,
+            gold_data,
+            relation_gold_path,
+            semantic_match=args.semantic_match,
+        )
     if args.additional_inputs:
         if not args.gold:
             raise SystemExit("Relation stability evaluation requires --gold for endpoint alignment")
@@ -90,9 +80,8 @@ def main() -> int:
         return 1
     return 0
 
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate a MaF-KG legacy or semantic KG JSON output.")
+    parser = argparse.ArgumentParser(description="Evaluate a MaF-KG semantic KG JSON output.")
     parser.add_argument(
         "input",
         nargs="?",
@@ -118,6 +107,15 @@ def parse_args() -> argparse.Namespace:
             "full-chapter output."
         ),
     )
+    parser.add_argument(
+        "--relation-gold",
+        help=(
+            "Optional reviewed positive relation set JSON (e.g. relations_section2_v1.json). "
+            "Requires --gold for endpoint alignment. Reports recall plus wrong_type / "
+            "wrong_direction / missing_endpoint / missing_edge; because relation gold is "
+            "not a closed negative set, precision and F1 are not reported."
+        ),
+    )
     parser.add_argument("--samples", type=int, default=12, help="Number of sample issues to print per category.")
     parser.add_argument(
         "--fail-on-severe",
@@ -126,13 +124,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--semantic-match",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Fall back to embedding retrieval + LLM judge for gold name matching "
-        "when canonical rule matching fails (requires local ollama qwen3-embedding "
-        "and the DEEPSEEK_API_KEY environment variable).",
+        "when canonical rule + fuzzy matching fail. Enabled by default; use "
+        "--no-semantic-match to disable. Requires local ollama qwen3-embedding "
+        "and the OPENCODE_API_KEY environment variable.",
     )
     return parser.parse_args()
-
 
 def resolve_input(input_arg: str | None, kg_dir: str) -> Path:
     if input_arg:
@@ -143,7 +142,6 @@ def resolve_input(input_arg: str | None, kg_dir: str) -> Path:
     root = Path(kg_dir)
     candidates = sorted(
         {
-            *root.glob("*_concept_formula_kg_agent_v3.json"),
             *root.glob("*_语义图_*.json"),
             *root.glob("*_semantic_*.json"),
         },
@@ -154,7 +152,6 @@ def resolve_input(input_arg: str | None, kg_dir: str) -> Path:
         raise SystemExit(f"No supported KG JSON files found under {kg_dir}")
     return candidates[0]
 
-
 def load_json(path: Path) -> dict[str, Any]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -163,171 +160,13 @@ def load_json(path: Path) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise SystemExit(f"Invalid JSON in {path}: {exc}") from exc
 
-
 def evaluate(data: dict[str, Any], path: Path) -> dict[str, Any]:
-    if str(data.get("schema_version", "")).startswith("maf-kg.semantic."):
-        return evaluate_semantic_graph(data, path)
-
-    nodes = data.get("nodes", [])
-    relationships = data.get("relationships", [])
-    node_by_id = {node.get("id"): node for node in nodes if node.get("id")}
-    node_type_by_id = {node_id: node.get("type") for node_id, node in node_by_id.items()}
-
-    invalid_refs = [
-        rel
-        for rel in relationships
-        if rel.get("source") not in node_by_id or rel.get("target") not in node_by_id
-    ]
-    self_loops = [rel for rel in relationships if rel.get("source") == rel.get("target")]
-    ids_with_edges = {rel.get("source") for rel in relationships} | {rel.get("target") for rel in relationships}
-    isolated_nodes = [node for node in nodes if node.get("id") not in ids_with_edges]
-
-    contains = [rel for rel in relationships if rel.get("type") == "contains"]
-    bad_contains = [rel for rel in contains if not contains_is_adjacent_hierarchy(rel, node_type_by_id)]
-    bad_directions = [
-        rel for rel in relationships if not relationship_direction_allowed(rel, node_type_by_id, bad_contains)
-    ]
-
-    formula_nodes = [node for node in nodes if node.get("type") == "Formula"]
-    formula_without_latex = [node for node in formula_nodes if not node.get("content", {}).get("latex")]
-    top_level_latex_nodes = [node for node in nodes if "latex" in node]
-    top_level_confidence_nodes = [node for node in nodes if "confidence" in node]
-    top_level_confidence_relationships = [rel for rel in relationships if "confidence" in rel]
-    content_text_nodes = [node for node in nodes if "text" in node.get("content", {})]
-    missing_description_nodes = [
-        node
-        for node in nodes
-        if node.get("type") not in {"Formula", "Figure"} and not str(node.get("description", "")).strip()
-    ]
-    weak_description_nodes = [
-        node
-        for node in nodes
-        if node.get("type") in {"Definition", "Theorem", "Property", "Example", "Method", "Condition"}
-        and len(str(node.get("description", "")).strip()) < 12
-    ]
-
-    relationship_no_evidence = [rel for rel in relationships if not rel.get("evidence")]
-    relationship_no_reason = [
-        rel
-        for rel in relationships
-        if rel.get("type") not in {"belongs_to", "contains"} and not rel.get("content", {}).get("reason")
-    ]
-    low_quality_relationships = [
-        rel for rel in relationships if relationship_confidence(rel) < 0.55
-    ]
-
-    figure_nodes = [node for node in nodes if node.get("type") == "Figure"]
-    illustrated_targets = {rel.get("target") for rel in relationships if rel.get("type") == "illustrated_by"}
-    figures_without_illustrated_by = [
-        node for node in figure_nodes if node.get("id") not in illustrated_targets
-    ]
-
-    semantic_relationships = [
-        rel for rel in relationships if rel.get("type") in SEMANTIC_RELATION_TYPES
-    ]
-    semantic_node_ids = {rel.get("source") for rel in semantic_relationships} | {
-        rel.get("target") for rel in semantic_relationships
-    }
-    only_structural_nodes = [
-        node
-        for node in nodes
-        if node.get("type") not in HIERARCHY_LEVEL and node.get("id") not in semantic_node_ids
-    ]
-
-    duplicate_node_ids = duplicate_values([node.get("id") for node in nodes if node.get("id")])
-    near_duplicate_groups = detect_near_duplicate_groups(nodes)
-    suspicious_pairs = detect_suspicious_pairs(nodes)
-    semantic_evidence_mismatches = detect_semantic_evidence_mismatches(
-        semantic_relationships, node_by_id
-    )
-    opposite_example_of_suspects = detect_opposite_example_of_suspects(relationships, node_by_id)
-
-    counts = {
-        "node_count": len(nodes),
-        "relationship_count": len(relationships),
-        "node_count_by_type": dict(Counter(node.get("type") for node in nodes)),
-        "relationship_count_by_type": dict(Counter(rel.get("type") for rel in relationships)),
-    }
-    issues = {
-        "invalid_ref": issue_block(invalid_refs, relationship_label, relationships),
-        "self_loop": issue_block(self_loops, relationship_label, relationships),
-        "isolated_node": issue_block(isolated_nodes, node_label, nodes),
-        "bad_direction": issue_block(bad_directions, relationship_label, relationships),
-        "bad_contains": issue_block(bad_contains, relationship_label, relationships),
-        "formula_without_latex": issue_block(formula_without_latex, node_label, nodes),
-        "top_level_latex_node": issue_block(top_level_latex_nodes, node_label, nodes),
-        "top_level_confidence_node": issue_block(top_level_confidence_nodes, node_label, nodes),
-        "top_level_confidence_relationship": issue_block(
-            top_level_confidence_relationships, relationship_label, relationships
-        ),
-        "content_text_node": issue_block(content_text_nodes, node_label, nodes),
-        "missing_description_node": issue_block(missing_description_nodes, node_label, nodes),
-        "weak_description_node": issue_block(weak_description_nodes, node_label, nodes),
-        "relationship_without_evidence": issue_block(
-            relationship_no_evidence, relationship_label, relationships
-        ),
-        "semantic_relationship_without_reason": issue_block(
-            relationship_no_reason, relationship_label, relationships
-        ),
-        "low_quality_relationship": issue_block(
-            low_quality_relationships, relationship_label, relationships
-        ),
-        "figure_without_illustrated_by": issue_block(
-            figures_without_illustrated_by, node_label, nodes
-        ),
-        "only_structural_nonhierarchy_node": issue_block(
-            only_structural_nodes, node_label, nodes
-        ),
-        "duplicate_node_id": {
-            "count": len(duplicate_node_ids),
-            "samples": [{"id": key, "count": value} for key, value in duplicate_node_ids[:20]],
-        },
-        "near_duplicate_group": {
-            "count": len(near_duplicate_groups),
-            "samples": near_duplicate_groups[:20],
-        },
-        "suspicious_pair": {
-            "count": len(suspicious_pairs),
-            "samples": suspicious_pairs[:20],
-        },
-        "semantic_evidence_mismatch": {
-            "count": len(semantic_evidence_mismatches),
-            "samples": semantic_evidence_mismatches[:20],
-        },
-        "opposite_example_of_suspect": {
-            "count": len(opposite_example_of_suspects),
-            "samples": opposite_example_of_suspects[:20],
-        },
-    }
-    severe_issue_keys = [
-        "invalid_ref",
-        "self_loop",
-        "bad_direction",
-        "bad_contains",
-        "formula_without_latex",
-        "top_level_latex_node",
-        "top_level_confidence_node",
-        "top_level_confidence_relationship",
-        "content_text_node",
-    ]
-    severe_issue_count = sum(issues[key]["count"] for key in severe_issue_keys)
-
-    return {
-        "file": str(path),
-        "schema_version": data.get("schema_version"),
-        "source_path": data.get("source_path"),
-        "title": data.get("title"),
-        "model": data.get("model"),
-        "counts": counts,
-        "diagnostics": data.get("diagnostics", {}),
-        "issues": issues,
-        "summary": {
-            "severe_issue_count": severe_issue_count,
-            "warning_issue_count": sum(block["count"] for block in issues.values()) - severe_issue_count,
-            "is_structurally_clean": severe_issue_count == 0,
-        },
-    }
-
+    schema_version = str(data.get("schema_version", ""))
+    if not schema_version.startswith("maf-kg.semantic."):
+        raise SystemExit(
+            f"Unsupported schema_version {schema_version!r}: only maf-kg.semantic.* graphs are supported"
+        )
+    return evaluate_semantic_graph(data, path)
 
 def evaluate_semantic_graph(data: dict[str, Any], path: Path) -> dict[str, Any]:
     nodes = data.get("nodes", []) if isinstance(data.get("nodes"), list) else []
@@ -551,7 +390,6 @@ def evaluate_semantic_graph(data: dict[str, Any], path: Path) -> dict[str, Any]:
         },
     }
 
-
 def canonical_node_name(value: str) -> str:
     normalized = re.sub(r"[fg]\(x\)", "", value)
     normalized = (
@@ -563,14 +401,12 @@ def canonical_node_name(value: str) -> str:
     )
     return re.sub(r"[\s_·,，。.;；:：'\"“”‘’()（）\[\]【】{}]+", "", normalized).casefold()
 
-
 def semantic_record_label(kind: str, record: dict[str, Any]) -> str:
     if kind == "relation":
         return f"{record.get('source_id')} -[{record.get('type')}]-> {record.get('target_id')}"
     if kind == "expression":
         return f"{record.get('owner_id')}:{record.get('role')}:{record.get('id')}"
     return str(record.get("id"))
-
 
 def validate_semantic_evidence(item: Any) -> str | None:
     if not isinstance(item, dict):
@@ -585,7 +421,6 @@ def validate_semantic_evidence(item: Any) -> str | None:
     if not isinstance(item.get("heading_path"), list):
         return "heading_path must be a list"
     return None
-
 
 def semantic_component_sizes(
     node_by_id: dict[str, dict[str, Any]], relations: list[dict[str, Any]]
@@ -611,7 +446,6 @@ def semantic_component_sizes(
         sizes.append(size)
     return sorted(sizes, reverse=True)
 
-
 def semantic_relation_label(relation: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": relation.get("id"),
@@ -619,7 +453,6 @@ def semantic_relation_label(relation: dict[str, Any]) -> dict[str, Any]:
         "source_id": relation.get("source_id"),
         "target_id": relation.get("target_id"),
     }
-
 
 def semantic_expression_label(expression: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -629,17 +462,14 @@ def semantic_expression_label(expression: dict[str, Any]) -> dict[str, Any]:
         "latex": str(expression.get("latex", ""))[:120],
     }
 
-
 def direct_issue_block(items: list[dict[str, Any]], sample_size: int = 20) -> dict[str, Any]:
     return {"count": len(items), "samples": items[:sample_size]}
-
 
 def value_issue_block(items: list[tuple[str, int]], key_name: str) -> dict[str, Any]:
     return {
         "count": len(items),
         "samples": [{key_name: value, "count": count} for value, count in items[:20]],
     }
-
 
 class SemanticNameMatcher:
     """Fallback gold matching: embedding retrieval selects candidates, an LLM
@@ -650,8 +480,12 @@ class SemanticNameMatcher:
     EMBED_MODEL = "qwen3-embedding:0.6b"
     JUDGE_MODEL = "deepseek-v4-flash"
     OLLAMA_URL = "http://localhost:11434/api/embed"
-    JUDGE_URL = "https://api.deepseek.com/chat/completions"
-    SIM_THRESHOLD = 0.80
+    JUDGE_ENDPOINTS: tuple[tuple[str, str], ...] = (
+        ("https://opencode.ai/zen/go/v1/chat/completions", "OPENCODE_API_KEY"),
+        ("https://api.deepseek.com/chat/completions", "DEEPSEEK_API_KEY"),
+    )
+    SIM_THRESHOLD = 0.65
+    TOP_K = 3
 
     def __init__(self) -> None:
         self._mem_embed: dict[str, list[float]] = {}
@@ -659,6 +493,7 @@ class SemanticNameMatcher:
         self._call_count = 0
 
     def _embed(self, texts: list[str]) -> list[list[float]]:
+        import urllib.error
         import urllib.request
 
         req = urllib.request.Request(
@@ -666,30 +501,36 @@ class SemanticNameMatcher:
             data=json.dumps({"model": self.EMBED_MODEL, "input": texts}).encode(),
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            return json.loads(resp.read())["embeddings"]
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return json.loads(resp.read())["embeddings"]
+        except urllib.error.URLError as exc:
+            raise SystemExit(
+                f"semantic matching requires a local ollama serving {self.EMBED_MODEL} "
+                f"at {self.OLLAMA_URL}; start it or pass --no-semantic-match. ({exc})"
+            ) from exc
 
-    def _judge(self, name_a: str, name_b: str, context: str) -> bool:
-        key = (name_a, name_b)
+    def _judge(self, name_a: str, name_b: str, desc_a: str, desc_b: str) -> bool:
+        key = (name_a, name_b, desc_a, desc_b)
         if key in self._judge_cache:
             return self._judge_cache[key]
         import os
+        import urllib.error
         import urllib.request
 
-        api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("DS_API_KEY")
-        if not api_key:
-            raise SystemExit("--semantic-match requires DEEPSEEK_API_KEY for the judge model")
         sys_prompt = (
-            "你是数学知识图谱的命名判定器。给定两个数学概念名，判断它们是否指代"
-            "同一个数学对象。同一对象的不同写法（同义改写、措辞顺序不同、含 f(x) "
-            "与否、“x→+∞”与“x趋于正无穷”等写法差异）应判定为同一；名称相近但指代"
-            "不同对象（如左极限与右极限、概念与其性质、“自变量趋于无穷大”这一趋近"
-            "方式与“自变量趋于无穷大时的函数极限”这一极限概念）应判定为不同。"
+            "你是数学知识图谱的命题判定器。给定两个数学对象（各有一个名称和一个"
+            "完整描述/命题），判断它们是否指代同一个数学对象。以完整描述/命题为准，"
+            "名称只是辅助线索：同一对象可有不同名称（同义改写、措辞不同、含 f(x) "
+            "与否、“x→+∞”与“x趋于正无穷”等写法差异），只要两个描述表述同一命题就判"
+            "同一；名称相近但命题不同（如左极限与右极限、一个定理与其推论、概念与"
+            "其性质）应判不同。"
             '只输出 JSON：{"same": true/false, "reason": "一句话理由"}'
         )
         user_prompt = (
-            f'概念A: "{name_a}"；概念B: "{name_b}"。\n'
-            f"概念A 的上下文描述：{context}\n判断二者是否同一对象。"
+            f'对象A：名称"{name_a}"；命题/描述：{desc_a}\n'
+            f'对象B：名称"{name_b}"；命题/描述：{desc_b}\n'
+            "判断二者是否同一数学对象。"
         )
         payload = {
             "model": self.JUDGE_MODEL,
@@ -700,20 +541,36 @@ class SemanticNameMatcher:
             "temperature": 0,
             "response_format": {"type": "json_object"},
         }
-        req = urllib.request.Request(
-            self.JUDGE_URL,
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
-        )
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            content = json.loads(resp.read())["choices"][0]["message"]["content"]
-        self._call_count += 1
-        try:
-            verdict = json.loads(content).get("same", False)
-        except json.JSONDecodeError:
-            verdict = False
-        self._judge_cache[key] = verdict
-        return verdict
+
+        errors: list[str] = []
+        for url, key_env in self.JUDGE_ENDPOINTS:
+            api_key = os.getenv(key_env)
+            if not api_key:
+                errors.append(f"{key_env} not set")
+                continue
+            try:
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+                )
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    response = json.loads(resp.read())
+                if response.get("code") not in (None, 0):
+                    errors.append(f"{url} API error {response.get('code')}: {response.get('message')}")
+                    continue
+                content = response["choices"][0]["message"]["content"]
+                self._call_count += 1
+                try:
+                    verdict = json.loads(content).get("same", False)
+                except json.JSONDecodeError:
+                    verdict = False
+                self._judge_cache[key] = verdict
+                return verdict
+            except urllib.error.URLError as exc:
+                errors.append(f"{url} unreachable: {exc}")
+                continue
+        raise SystemExit("semantic judge failed on all endpoints: " + "; ".join(errors))
 
     def cosine(self, a: list[float], b: list[float]) -> float:
         return sum(x * y for x, y in zip(a, b)) / (
@@ -721,22 +578,38 @@ class SemanticNameMatcher:
         )
 
     def judge_same(self, predicted: dict[str, Any], gold_item: dict[str, Any]) -> bool:
-        """Ask the flash judge whether predicted and gold names denote the same object."""
+        """Ask the flash judge whether predicted and gold nodes denote the same object.
+
+        The judge compares the complete proposition/description of both sides,
+        not just names, so a concise predicted name can still match a gold node
+        whose proposition is identical.
+        """
         name_a = str(predicted.get("name", ""))
         name_b = str(gold_item.get("name", ""))
-        context = str(predicted.get("description", ""))[:400]
-        return self._judge(name_a, name_b, context)
+        desc_a = str(predicted.get("description", ""))[:400]
+        desc_b = str(gold_item.get("description", ""))[:400]
+        return self._judge(name_a, name_b, desc_a, desc_b)
+
+    @staticmethod
+    def _embed_text(node: dict[str, Any]) -> str:
+        name = str(node.get("name", ""))
+        desc = str(node.get("description", ""))
+        return (name + " " + desc).strip() or name
 
     def best_candidates(self, predicted: dict[str, Any], gold_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Rank same-type gold items by embedding similarity to the predicted name."""
+        """Rank same-type gold items by embedding similarity to name + description.
+
+        Returns at most ``TOP_K`` candidates above ``SIM_THRESHOLD``, so the
+        number of LLM judge calls per query is bounded.
+        """
         if predicted.get("type") not in ("Concept", "Claim", "Method"):
             return []
-        query = str(predicted.get("name", ""))
+        query = self._embed_text(predicted)
         if not query.strip():
             return []
         unembedded = [item for item in gold_items if item["gold_id"] not in self._mem_embed]
         if unembedded:
-            embs = self._embed([item.get("name", "") for item in unembedded])
+            embs = self._embed([self._embed_text(item) for item in unembedded])
             for item, emb in zip(unembedded, embs):
                 self._mem_embed[item["gold_id"]] = emb
         (q_emb,) = self._embed([query])
@@ -745,14 +618,14 @@ class SemanticNameMatcher:
             sim = self.cosine(q_emb, self._mem_embed[item["gold_id"]])
             scored.append((sim, item))
         scored.sort(reverse=True)
-        return [item for sim, item in scored if sim >= self.SIM_THRESHOLD]
-
+        candidates = [item for sim, item in scored if sim >= self.SIM_THRESHOLD]
+        return candidates[: self.TOP_K]
 
 def evaluate_nodes_against_gold(
     data: dict[str, Any],
     gold_data: dict[str, Any],
     gold_path: Path,
-    semantic_match: bool = False,
+    semantic_match: bool = True,
     gold_source_file: str | None = None,
 ) -> dict[str, Any]:
     source_file = Path(str(data.get("source_path", ""))).name
@@ -796,43 +669,13 @@ def evaluate_nodes_against_gold(
     false_positives: list[dict[str, Any]] = []
     match_layer_counts: Counter = Counter()
 
-    semantic_matcher: SemanticNameMatcher | None = None
-    if semantic_match:
-        semantic_matcher = SemanticNameMatcher()
+    policy = MatchPolicy(semantic=semantic_match)
+    semantic_matcher = SemanticNameMatcher() if semantic_match else None
 
     gold_pool = [*must_nodes, *optional_nodes]
 
-    def same_claim_kind_pool(predicted: dict[str, Any]) -> list[dict[str, Any]]:
-        return [
-            item
-            for item in gold_pool
-            if item.get("type") == predicted.get("type")
-            and (
-                predicted.get("type") != "Claim"
-                or item.get("claim_kind") == predicted.get("claim_kind")
-            )
-        ]
-
     for predicted in predicted_nodes:
-        candidates = [item for item in gold_pool if gold_node_matches(predicted, item)]
-        candidates.sort(key=lambda item: (item["requirement"] != "M", item["gold_id"]))
-        chosen: dict[str, Any] | None = None
-        layer = "rule"
-        if candidates:
-            chosen = candidates[0]
-        if chosen is None:
-            fuzzy = fuzzy_gold_candidates(predicted, gold_pool)
-            if fuzzy:
-                chosen = fuzzy[0]
-                layer = "fuzzy"
-        if chosen is None and semantic_matcher is not None:
-            for candidate in semantic_matcher.best_candidates(
-                predicted, same_claim_kind_pool(predicted)
-            ):
-                if semantic_matcher.judge_same(predicted, candidate):
-                    chosen = candidate
-                    layer = "semantic"
-                    break
+        chosen, layer = match_node_to_gold(predicted, gold_pool, policy, semantic_matcher)
         if chosen is not None:
             match_layer_counts[layer] += 1
             matched = matched_must if chosen["requirement"] == "M" else matched_optional
@@ -976,13 +819,12 @@ def evaluate_nodes_against_gold(
         "relation_annotation_status": selected.get("relation_annotation_status", "pending"),
     }
 
-
 def evaluate_gold_scopes(
     data: dict[str, Any],
     gold_data: dict[str, Any],
     gold_path: Path,
     *,
-    semantic_match: bool = False,
+    semantic_match: bool = True,
     gold_source_file: str | None = None,
 ) -> list[dict[str, Any]]:
     source_file = Path(str(data.get("source_path", ""))).name
@@ -1010,7 +852,6 @@ def evaluate_gold_scopes(
         )
         for graph, _ in targets
     ]
-
 
 def gold_targets_for_source(
     source_file: str,
@@ -1052,7 +893,6 @@ def gold_targets_for_source(
             scoped.append((graph, dict(scope)))
     return scoped
 
-
 def filter_nodes_to_source_scope(
     nodes: list[dict[str, Any]],
     source_file: str,
@@ -1067,7 +907,6 @@ def filter_nodes_to_source_scope(
             node.get("evidence", []), source_file, source_scope
         )
     ]
-
 
 def evidence_within_source_scope(
     evidence_items: Any,
@@ -1089,7 +928,6 @@ def evidence_within_source_scope(
         and start_line <= evidence["start_line"] <= evidence["end_line"] <= end_line
         for evidence in evidence_items
     )
-
 
 def flatten_gold_node_groups(groups: Any) -> list[dict[str, Any]]:
     flattened = []
@@ -1116,7 +954,6 @@ def flatten_gold_node_groups(groups: Any) -> list[dict[str, Any]]:
             )
     return flattened
 
-
 def fuzzy_similarity(name_a: str, name_b: str) -> float:
     """Character-level name similarity on canonical forms, for all node types.
 
@@ -1138,7 +975,6 @@ def fuzzy_similarity(name_a: str, name_b: str) -> float:
     jaccard = len(bigrams_a & bigrams_b) / len(bigrams_a | bigrams_b)
     return max(ratio, jaccard)
 
-
 FUZZY_MATCH_THRESHOLD = 0.85
 
 # Single-character mathematical modifiers that change the identity of an
@@ -1146,12 +982,10 @@ FUZZY_MATCH_THRESHOLD = 0.85
 # Fuzzy string similarity cannot be trusted across a mismatch here.
 CRITICAL_MODIFIERS = "反左右上下正负奇偶增减内外"
 
-
 def critical_modifier_mismatch(name_a: str, name_b: str) -> bool:
     set_a = {c for c in canonical_node_name(str(name_a)) if c in CRITICAL_MODIFIERS}
     set_b = {c for c in canonical_node_name(str(name_b)) if c in CRITICAL_MODIFIERS}
     return bool(set_a.symmetric_difference(set_b))
-
 
 def fuzzy_gold_candidates(
     predicted: dict[str, Any],
@@ -1203,7 +1037,6 @@ def fuzzy_gold_candidates(
     )
     return [item for _, item in scored]
 
-
 def gold_node_matches(predicted: dict[str, Any], gold: dict[str, Any]) -> bool:
     if predicted.get("type") != gold.get("type"):
         return False
@@ -1223,7 +1056,6 @@ def gold_node_matches(predicted: dict[str, Any], gold: dict[str, Any]) -> bool:
     }
     return bool(predicted_keys & accepted_keys)
 
-
 def gold_node_summary(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "gold_id": item.get("gold_id"),
@@ -1231,7 +1063,6 @@ def gold_node_summary(item: dict[str, Any]) -> dict[str, Any]:
         "claim_kind": item.get("claim_kind"),
         "name": item.get("name"),
     }
-
 
 def _gold_alignment_lookup(gold_nodes: list[dict[str, Any]]) -> dict[tuple[Any, Any, str], str]:
     """Map reviewed (type, claim_kind, canonical name) to gold_id for endpoint alignment.
@@ -1266,7 +1097,6 @@ def _gold_alignment_lookup(gold_nodes: list[dict[str, Any]]) -> dict[tuple[Any, 
             set_by[key] = requirement
     return lookup
 
-
 def gold_id_for_predicted_node(
     predicted: dict[str, Any], lookup: dict[tuple[Any, Any, str], str]
 ) -> str | None:
@@ -1283,6 +1113,64 @@ def gold_id_for_predicted_node(
             return gold_id
     return None
 
+@dataclass(frozen=True)
+class MatchPolicy:
+    """Global gold node-matching preset shared by node and relation evaluation.
+
+    ``fuzzy`` enables character-level fuzzy fallback after the exact rule
+    match; ``semantic`` enables embedding retrieval + LLM judge (requires a
+    ``SemanticNameMatcher`` supplied by the caller). ``fuzzy_threshold`` is the
+    minimum ``fuzzy_similarity`` for the fuzzy layer.
+    """
+
+    fuzzy: bool = True
+    semantic: bool = True
+    fuzzy_threshold: float = FUZZY_MATCH_THRESHOLD
+
+
+#: Default preset: rule + fuzzy + semantic (semantic judge is on by default).
+DEFAULT_MATCH_POLICY = MatchPolicy()
+
+
+def match_node_to_gold(
+    predicted: dict[str, Any],
+    gold_items: list[dict[str, Any]],
+    policy: MatchPolicy,
+    semantic_matcher: SemanticNameMatcher | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Match a predicted node to the best eligible gold item under ``policy``.
+
+    Layers, in order: rule (exact canonical name/alias) -> fuzzy -> semantic.
+    Only M and O gold items are eligible; X items are forbidden and handled
+    separately by callers. Returns ``(matched_item, layer)``; both ``None``
+    when there is no match.
+    """
+    eligible = [item for item in gold_items if item.get("requirement") != "X"]
+
+    exact = [item for item in eligible if gold_node_matches(predicted, item)]
+    exact.sort(key=lambda item: (item["requirement"] != "M", item.get("gold_id", "")))
+    if exact:
+        return exact[0], "rule"
+
+    if policy.fuzzy:
+        fuzzy = fuzzy_gold_candidates(predicted, eligible, threshold=policy.fuzzy_threshold)
+        if fuzzy:
+            return fuzzy[0], "fuzzy"
+
+    if policy.semantic and semantic_matcher is not None:
+        pool = [
+            item
+            for item in eligible
+            if item.get("type") == predicted.get("type")
+            and (
+                predicted.get("type") != "Claim"
+                or item.get("claim_kind") == predicted.get("claim_kind")
+            )
+        ]
+        for candidate in semantic_matcher.best_candidates(predicted, pool):
+            if semantic_matcher.judge_same(predicted, candidate):
+                return candidate, "semantic"
+    return None, None
 
 def gold_aligned_relation_report(
     data: dict[str, Any],
@@ -1381,7 +1269,6 @@ def gold_aligned_relation_report(
         "aligned_edges": sorted(aligned_edges),
     }
 
-
 def _relation_stability_for_gold_target(
     graphs: list[dict[str, Any]],
     selected_gold: dict[str, Any],
@@ -1463,7 +1350,6 @@ def _relation_stability_for_gold_target(
         "relation_metrics": None,
     }
 
-
 def evaluate_relation_stability(
     graphs: list[dict[str, Any]],
     gold_data: dict[str, Any],
@@ -1525,124 +1411,164 @@ def evaluate_relation_stability(
         "relation_metrics": None,
     }
 
+def evaluate_relations_against_gold(
+    data: dict[str, Any],
+    relation_gold_data: dict[str, Any],
+    node_gold_data: dict[str, Any],
+    relation_gold_path: Path,
+    semantic_match: bool = True,
+) -> dict[str, Any]:
+    """Evaluate predicted relations against a reviewed positive relation set.
+
+    Endpoints are aligned to reviewed node gold ids first, then each positive
+    relation is checked for a matching predicted edge (same source, type,
+    target). Because the relation gold is not a closed negative set
+    (``closed_world=false``), this reports recall plus error categories
+    (wrong_type / wrong_direction / missing_endpoint / missing_edge) but never
+    precision or F1.
+    """
+    relation_source = Path(str(relation_gold_data.get("source_file", ""))).name
+    predicted_source = Path(str(data.get("source_path", ""))).name
+
+    node_targets = gold_targets_for_source(
+        relation_source or predicted_source, node_gold_data.get("graphs", [])
+    )
+    if not node_targets:
+        raise SystemExit(
+            "Node gold has no graph annotation applicable to relation gold "
+            f"source {relation_source or predicted_source!r}"
+        )
+    selected_gold, source_scope = node_targets[0]
+
+    gold_nodes = flatten_gold_node_groups(selected_gold.get("node_groups", []))
+    policy = MatchPolicy(semantic=semantic_match)
+    semantic_matcher = SemanticNameMatcher() if semantic_match else None
+
+    nodes = data.get("nodes", []) if isinstance(data.get("nodes"), list) else []
+    scoped_nodes = filter_nodes_to_source_scope(nodes, predicted_source, source_scope)
+    node_by_id = {node.get("id"): node for node in scoped_nodes if node.get("id")}
+    relations = data.get("relations", []) if isinstance(data.get("relations"), list) else []
+
+    aligned_node_gold_ids: set[str] = set()
+    for node in scoped_nodes:
+        matched, _ = match_node_to_gold(node, gold_nodes, policy, semantic_matcher)
+        if matched is not None:
+            aligned_node_gold_ids.add(matched["gold_id"])
+
+    aligned: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    dropped: list[dict[str, Any]] = []
+    for rel in relations:
+        source_node = node_by_id.get(rel.get("source_id"))
+        target_node = node_by_id.get(rel.get("target_id"))
+        if source_node is None or target_node is None:
+            dropped.append(
+                {"relation_id": rel.get("id"), "reason": "endpoint missing from predicted nodes"}
+            )
+            continue
+        source_match, _ = match_node_to_gold(source_node, gold_nodes, policy, semantic_matcher)
+        target_match, _ = match_node_to_gold(target_node, gold_nodes, policy, semantic_matcher)
+        source_gold = source_match["gold_id"] if source_match else None
+        target_gold = target_match["gold_id"] if target_match else None
+        if source_gold is None or target_gold is None:
+            dropped.append(
+                {
+                    "relation_id": rel.get("id"),
+                    "type": rel.get("type"),
+                    "source_name": str(source_node.get("name", "")),
+                    "target_name": str(target_node.get("name", "")),
+                    "reason": "endpoint without a reviewed gold id",
+                }
+            )
+            continue
+        aligned.setdefault((source_gold, rel.get("type"), target_gold), []).append(rel)
+
+    positive = (
+        relation_gold_data.get("relations", [])
+        if isinstance(relation_gold_data.get("relations"), list)
+        else []
+    )
+
+    matched_count = 0
+    misses: list[dict[str, Any]] = []
+    for gold_rel in positive:
+        source_gold_id = gold_rel.get("source_gold_id")
+        target_gold_id = gold_rel.get("target_gold_id")
+        rel_type = gold_rel.get("type")
+        if (source_gold_id, rel_type, target_gold_id) in aligned:
+            matched_count += 1
+            continue
+
+        if source_gold_id not in aligned_node_gold_ids or target_gold_id not in aligned_node_gold_ids:
+            status = "missing_endpoint"
+            detail = (
+                "endpoint without an aligned predicted node "
+                f"(source={source_gold_id in aligned_node_gold_ids}, "
+                f"target={target_gold_id in aligned_node_gold_ids})"
+            )
+        else:
+            same_direction_types = {
+                other_type
+                for (src, other_type, tgt) in aligned
+                if src == source_gold_id and tgt == target_gold_id
+            }
+            reversed_present = (target_gold_id, rel_type, source_gold_id) in aligned
+            if same_direction_types:
+                status = "wrong_type"
+                detail = "predicted " + ", ".join(sorted(same_direction_types))
+            elif reversed_present:
+                status = "wrong_direction"
+                detail = "predicted reversed direction"
+            else:
+                status = "missing_edge"
+                detail = "both endpoints aligned but no predicted relation"
+        misses.append(
+            {
+                "gold_id": gold_rel.get("gold_id"),
+                "type": rel_type,
+                "source_gold_id": source_gold_id,
+                "target_gold_id": target_gold_id,
+                "status": status,
+                "detail": detail,
+            }
+        )
+
+    positive_count = len(positive)
+    miss_category_counts: dict[str, int] = {
+        "wrong_type": 0,
+        "wrong_direction": 0,
+        "missing_endpoint": 0,
+        "missing_edge": 0,
+    }
+    for miss in misses:
+        miss_category_counts[miss["status"]] = miss_category_counts.get(miss["status"], 0) + 1
+
+    return {
+        "relation_gold_file": str(relation_gold_path),
+        "relation_gold_schema_version": relation_gold_data.get("schema_version"),
+        "annotation_status": relation_gold_data.get("annotation_status"),
+        "closed_world": bool(relation_gold_data.get("closed_world", False)),
+        "semantic_match": semantic_match,
+        "source_file": relation_source or predicted_source,
+        "note": (
+            "closed_world=false: recall only; precision/F1 require a reviewed closed "
+            "candidate universe and are not reported."
+        ),
+        "predicted_relation_count": len(relations),
+        "aligned_relation_count": len(relations) - len(dropped),
+        "dropped_relation_count": len(dropped),
+        "dropped_relations": dropped,
+        "positive_count": positive_count,
+        "matched_count": matched_count,
+        "recall": safe_ratio(matched_count, positive_count),
+        "miss_category_counts": miss_category_counts,
+        "misses": misses,
+    }
+
 
 def safe_ratio(numerator: float, denominator: float) -> float:
     if denominator == 0:
         return 0.0
     return round(numerator / denominator, 6)
-
-
-def contains_is_adjacent_hierarchy(rel: dict[str, Any], node_type_by_id: dict[str, str]) -> bool:
-    source_type = node_type_by_id.get(rel.get("source"))
-    target_type = node_type_by_id.get(rel.get("target"))
-    if source_type not in HIERARCHY_LEVEL or target_type not in HIERARCHY_LEVEL:
-        return False
-    return HIERARCHY_LEVEL[target_type] == HIERARCHY_LEVEL[source_type] + 1
-
-
-def relationship_direction_allowed(
-    rel: dict[str, Any],
-    node_type_by_id: dict[str, str],
-    bad_contains: list[dict[str, Any]],
-) -> bool:
-    rel_type = rel.get("type")
-    source_type = node_type_by_id.get(rel.get("source"))
-    target_type = node_type_by_id.get(rel.get("target"))
-    if not source_type or not target_type:
-        return False
-    if rel_type == "belongs_to":
-        return target_type in HIERARCHY_LEVEL
-    if rel_type == "contains":
-        return rel not in bad_contains
-    if rel_type == "has_definition":
-        return source_type == "Concept" and target_type == "Definition"
-    if rel_type == "has_formula":
-        return target_type == "Formula" and source_type in {
-            "Concept",
-            "Definition",
-            "Theorem",
-            "Property",
-            "Method",
-            "Example",
-        }
-    if rel_type == "has_property":
-        return target_type == "Property" and source_type in {
-            "Concept",
-            "Definition",
-            "Formula",
-            "Theorem",
-            "Example",
-        }
-    if rel_type == "has_condition":
-        return target_type == "Condition" and source_type in {
-            "Concept",
-            "Definition",
-            "Formula",
-            "Theorem",
-            "Property",
-            "Method",
-            "Example",
-        }
-    if rel_type == "requires":
-        return target_type == "Condition" and source_type in {
-            "Concept",
-            "Formula",
-            "Theorem",
-            "Property",
-            "Method",
-            "Example",
-        }
-    if rel_type in {"derived_from", "equivalent_to"}:
-        return source_type == "Formula" and target_type == "Formula"
-    if rel_type == "applies_to":
-        return source_type in {"Formula", "Theorem", "Method"} and target_type in {
-            "Concept",
-            "Condition",
-            "Example",
-        }
-    if rel_type == "uses_method":
-        return source_type == "Example" and target_type == "Method"
-    if rel_type == "involves_concept":
-        return source_type in {
-            "Example",
-            "Formula",
-            "Theorem",
-            "Property",
-            "Method",
-            "Definition",
-            "Proof",
-            "Figure",
-        } and target_type == "Concept"
-    if rel_type == "example_of":
-        return source_type == "Example" and target_type in {
-            "Concept",
-            "Definition",
-            "Formula",
-            "Theorem",
-            "Property",
-            "Method",
-        }
-    if rel_type == "proved_by":
-        return target_type == "Proof" and source_type in {"Formula", "Theorem", "Property", "Definition"}
-    if rel_type == "illustrated_by":
-        return target_type == "Figure" and source_type in {
-            "Concept",
-            "Definition",
-            "Formula",
-            "Theorem",
-            "Property",
-            "Example",
-        }
-    return False
-
-
-def relationship_confidence(rel: dict[str, Any]) -> float:
-    value = rel.get("quality", {}).get("confidence", 0.75)
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
-
 
 def duplicate_values(values: list[str]) -> list[tuple[str, int]]:
     counts = Counter(values)
@@ -1650,128 +1576,6 @@ def duplicate_values(values: list[str]) -> list[tuple[str, int]]:
         [(key, count) for key, count in counts.items() if count > 1],
         key=lambda item: (-item[1], item[0]),
     )
-
-
-def normalized_name(name: str) -> str:
-    text = re.sub(r"\s+", "", str(name))
-    for char in "：:、.-（）()[]【】":
-        text = text.replace(char, "")
-    return text.replace("的", "")
-
-
-def detect_near_duplicate_groups(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
-    for node in nodes:
-        node_type = node.get("type")
-        if node_type in HIERARCHY_LEVEL:
-            continue
-        groups[(node_type, normalized_name(node.get("name", "")))].append(node)
-    result = []
-    for (node_type, key), items in groups.items():
-        if len(items) <= 1:
-            continue
-        result.append(
-            {
-                "type": node_type,
-                "normalized_name": key,
-                "nodes": [node_label(node) for node in items],
-            }
-        )
-    return sorted(result, key=lambda item: (item["type"], item["normalized_name"]))
-
-
-def detect_suspicious_pairs(nodes: list[dict[str, Any]]) -> list[dict[str, str]]:
-    pairs = []
-    for index, left in enumerate(nodes):
-        left_type = left.get("type")
-        if left_type in HIERARCHY_LEVEL:
-            continue
-        left_name = normalized_name(left.get("name", ""))
-        for right in nodes[index + 1 :]:
-            if right.get("type") != left_type or right.get("type") in HIERARCHY_LEVEL:
-                continue
-            right_name = normalized_name(right.get("name", ""))
-            if len(left_name) < 4 or len(right_name) < 4:
-                continue
-            if left_name in right_name or right_name in left_name:
-                pairs.append(
-                    {
-                        "type": left_type,
-                        "left": node_label(left),
-                        "right": node_label(right),
-                    }
-                )
-    return pairs
-
-
-def detect_semantic_evidence_mismatches(
-    semantic_relationships: list[dict[str, Any]],
-    node_by_id: dict[str, dict[str, Any]],
-) -> list[dict[str, Any]]:
-    mismatches = []
-    for rel in semantic_relationships:
-        evidence = (rel.get("evidence") or [{}])[0]
-        line = evidence.get("start_line")
-        if not isinstance(line, int):
-            continue
-        source = node_by_id.get(rel.get("source"))
-        target = node_by_id.get(rel.get("target"))
-        if not source or not target:
-            continue
-        if not evidence_near_node(line, source) and not evidence_near_node(line, target):
-            mismatches.append(
-                {
-                    "relationship": relationship_label(rel),
-                    "evidence_line": line,
-                    "reason": rel.get("content", {}).get("reason", ""),
-                }
-            )
-    return mismatches
-
-
-def evidence_near_node(line: int, node: dict[str, Any]) -> bool:
-    for evidence in node.get("evidence", [])[:3]:
-        start = evidence.get("start_line", 0)
-        end = evidence.get("end_line", 0)
-        if start - 3 <= line <= end + 3:
-            return True
-    return False
-
-
-def detect_opposite_example_of_suspects(
-    relationships: list[dict[str, Any]],
-    node_by_id: dict[str, dict[str, Any]],
-) -> list[dict[str, Any]]:
-    suspects = []
-    pairs = [
-        ("无界", "有界"),
-        ("发散", "收敛"),
-        ("不收敛", "收敛"),
-    ]
-    for rel in relationships:
-        if rel.get("type") != "example_of":
-            continue
-        source = node_by_id.get(rel.get("source"))
-        target = node_by_id.get(rel.get("target"))
-        if not source or not target:
-            continue
-        if target.get("type") not in {"Concept", "Definition"}:
-            continue
-        source_text = f"{source.get('name', '')} {source.get('description', '')}"
-        target_name = str(target.get("name", ""))
-        target_text = f"{target.get('name', '')} {target.get('description', '')}"
-        for negative, positive in pairs:
-            if negative in source_text and target_name.startswith(positive) and negative not in target_text:
-                suspects.append(
-                    {
-                        "relationship": relationship_label(rel),
-                        "source": node_label(source),
-                        "target": node_label(target),
-                        "reason": rel.get("content", {}).get("reason", ""),
-                    }
-                )
-    return suspects
-
 
 def issue_block(
     items: list[dict[str, Any]],
@@ -1785,7 +1589,6 @@ def issue_block(
         "samples": [label_fn(item) for item in items[:sample_size]],
     }
 
-
 def node_label(node: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": node.get("id"),
@@ -1794,17 +1597,6 @@ def node_label(node: dict[str, Any]) -> dict[str, Any]:
         "name": node.get("name"),
         "description": str(node.get("description", ""))[:120],
     }
-
-
-def relationship_label(rel: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": rel.get("id"),
-        "type": rel.get("type"),
-        "source": rel.get("source"),
-        "target": rel.get("target"),
-        "reason": str(rel.get("content", {}).get("reason", ""))[:160],
-    }
-
 
 def print_text_report(report: dict[str, Any], sample_size: int) -> None:
     counts = report["counts"]
@@ -1878,6 +1670,18 @@ def print_text_report(report: dict[str, Any], sample_size: int) -> None:
                 f"{len(scoped['stable_edges']['gold_aligned'])} "
                 f"(union {scoped['edge_union_counts']['gold_aligned']})"
             )
+    relation_gold = report.get("relation_gold_evaluation")
+    if relation_gold:
+        print(
+            f"Relation gold: {relation_gold['matched_count']}/{relation_gold['positive_count']} "
+            f"(recall {relation_gold['recall']:.4f}, closed_world={relation_gold['closed_world']})"
+        )
+        for miss in relation_gold["misses"]:
+            print(
+                f"  [miss:{miss['status']}] {miss['gold_id']} "
+                f"{miss['source_gold_id']} -[{miss['type']}]-> {miss['target_gold_id']} "
+                f"({miss['detail']})"
+            )
     print()
     print("Node types:")
     for key, value in sorted(counts["node_count_by_type"].items()):
@@ -1899,7 +1703,6 @@ def print_text_report(report: dict[str, Any], sample_size: int) -> None:
         for sample in block["samples"][:sample_size]:
             print("  " + json.dumps(sample, ensure_ascii=False))
         print()
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

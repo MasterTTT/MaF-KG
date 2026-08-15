@@ -1,4 +1,8 @@
-# Semantic Linking (v5)
+# Semantic Linking (v5)（已归档 / ARCHIVED）
+
+> ⚠️ 本文描述已退役的 `maf-kg.agent.v5` `SemanticLinkingAgent` 设计。该模块已归档至
+> `legacy/SemanticLinkingAgent.py`，其依赖 `agents.ConceptFormulaExtractor` 已不存在，
+> 当前无法运行。活跃 schema 为 `maf-kg.semantic.v1.6.0`（Concept / Claim / Method）。
 
 The v5 `SemanticLinkingAgent` works on compact published graphs and proposes conservative patch edges.
 

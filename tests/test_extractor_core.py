@@ -22,6 +22,7 @@ from agents.Extractor import (
     Extractor,
     KGNode,
     KGRelation,
+    LogicalForm,
     NodeAction,
     NodeMemoryItem,
     NodeRecord,
@@ -43,7 +44,7 @@ class ProviderAdapterTests(unittest.TestCase):
         adapter = _provider_class("opencode-go")
         self.assertEqual(adapter.default_model, "deepseek-v4-flash")
         self.assertEqual(adapter.default_base_url, "https://opencode.ai/zen/go/v1")
-        self.assertEqual(adapter.api_key_envs, ("OPENCODE_GO_API_KEY",))
+        self.assertEqual(adapter.api_key_envs, ("OPENCODE_API_KEY",))
 
     def test_opencode_go_uses_openai_compatible_deepseek_payload(self) -> None:
         response = {
@@ -57,7 +58,7 @@ class ProviderAdapterTests(unittest.TestCase):
             ],
             "usage": {},
         }
-        with patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "unit-test"}, clear=False):
+        with patch.dict(os.environ, {"OPENCODE_API_KEY": "unit-test"}, clear=False):
             client = ProviderChatClient(
                 provider="opencode-go",
                 model="deepseek-v4-flash",
@@ -492,6 +493,173 @@ class ClaimKindTests(unittest.TestCase):
                 evidence=EvidenceRef(start_line=1, end_line=1),
             )
 
+    def test_claim_logical_form_preserves_joint_premises(self) -> None:
+        action = NodeAction(
+            ref_id="q1",
+            action="create",
+            type="Claim",
+            name="夹逼准则",
+            description="两个边界数列收敛到同一极限且夹住中间数列时，中间数列收敛到该极限。",
+            claim_kind="criterion",
+            logical_form={
+                "operator": "implies",
+                "premises": [
+                    "y_n <= x_n <= z_n",
+                    "lim y_n = a",
+                    "lim z_n = a",
+                ],
+                "conclusion": ["lim x_n = a"],
+                "converse_status": "unstated",
+            },
+            evidence=EvidenceRef(start_line=1, end_line=1),
+        )
+        self.assertEqual(len(action.logical_form.premises), 3)
+        self.assertEqual(action.logical_form.conclusion, ["lim x_n = a"])
+
+    def test_iff_logical_form_rejects_converse_status(self) -> None:
+        with self.assertRaises(ValidationError):
+            LogicalForm(
+                operator="iff",
+                premises=["左极限和右极限都存在且相等"],
+                conclusion=["函数极限存在"],
+                converse_status="proven",
+            )
+
+    def test_non_claim_rejects_logical_form(self) -> None:
+        with self.assertRaises(ValidationError):
+            NodeAction(
+                ref_id="c1",
+                action="create",
+                type="Concept",
+                name="数列",
+                description="按正整数下标排列的实数序列。",
+                logical_form={
+                    "operator": "implies",
+                    "premises": ["n 为正整数"],
+                    "conclusion": ["x_n 为数列的一项"],
+                },
+                evidence=EvidenceRef(start_line=1, end_line=1),
+            )
+
+    def test_reuse_initializes_logical_form_with_audit_record(self) -> None:
+        extractor = Extractor(save_output=False, verbose=False)
+        node = NodeRecord(
+            id=_node_id("Claim", "收敛数列必有界"),
+            type="Claim",
+            name="收敛数列必有界",
+            description="如果数列收敛，那么该数列有界。",
+            claim_kind="property",
+        )
+        action = NodeAction(
+            ref_id="q1",
+            action="reuse",
+            existing_id=node.id,
+            mention="收敛数列的有界性",
+            logical_form={
+                "operator": "implies",
+                "premises": ["数列收敛"],
+                "conclusion": ["数列有界"],
+                "converse_status": "disproved",
+            },
+            evidence=EvidenceRef(start_line=1, end_line=1),
+        )
+        evidence = Evidence(
+            source_path="source.md",
+            start_line=1,
+            end_line=1,
+            text="如果数列收敛，那么数列一定有界，但有界数列未必收敛。",
+            chunk_id="chunk_1",
+            heading_path=["数列的极限"],
+            teaching_block_id="theorem_1",
+            discourse_role="theorem",
+        )
+        outcome = extractor._merge_reuse_action(node, action, evidence)
+        self.assertEqual(outcome["logical_form_action"], "initialized")
+        self.assertEqual(
+            outcome["logical_form_revision"]["new_logical_form"]["converse_status"],
+            "disproved",
+        )
+        self.assertEqual(node.logical_form.conclusion, ["数列有界"])
+
+
+class LogicalFormReviewTests(unittest.TestCase):
+    @staticmethod
+    def claim(name: str, text: str) -> NodeRecord:
+        return NodeRecord(
+            id=_node_id("Claim", name),
+            type="Claim",
+            name=name,
+            description=text,
+            claim_kind="property",
+            evidence=[
+                Evidence(
+                    source_path="source.md",
+                    start_line=10,
+                    end_line=12,
+                    text=text,
+                    chunk_id="chunk_1",
+                    heading_path=["数列的极限"],
+                    teaching_block_id="theorem_1",
+                    discourse_role="theorem",
+                )
+            ],
+        )
+
+    def test_candidate_filter_requires_explicit_condition_signal(self) -> None:
+        conditional = self.claim("收敛数列必有界", "若数列收敛，则该数列有界。")
+        plain_property = self.claim("极限唯一性", "收敛数列的极限是唯一的。")
+        self.assertTrue(Extractor._is_logical_form_review_candidate(conditional))
+        self.assertFalse(Extractor._is_logical_form_review_candidate(plain_property))
+
+    def test_review_updates_only_returned_logical_form(self) -> None:
+        extractor = Extractor(
+            save_output=False,
+            verbose=False,
+            logical_form_review=True,
+        )
+        node = self.claim(
+            "收敛数列必有界",
+            "若数列收敛，则该数列有界；反之不一定成立。",
+        )
+        extractor.client = SimpleNamespace(
+            complete_json=lambda *_args, **_kwargs: {
+                "items": [
+                    {
+                        "node_id": node.id,
+                        "logical_form": {
+                            "operator": "implies",
+                            "premises": ["数列收敛"],
+                            "conclusion": ["数列有界"],
+                            "converse_status": "disproved",
+                        },
+                    }
+                ]
+            }
+        )
+        store = {node.id: node}
+        diagnostics = extractor._review_missing_logical_forms(
+            store,
+            ExtractionState(logical_form_review=True),
+        )
+        self.assertEqual(diagnostics["updated_node_ids"], [node.id])
+        self.assertEqual(store[node.id].logical_form.conclusion, ["数列有界"])
+
+    def test_review_requires_exact_candidate_coverage(self) -> None:
+        extractor = Extractor(
+            save_output=False,
+            verbose=False,
+            logical_form_review=True,
+        )
+        node = self.claim("收敛数列必有界", "若数列收敛，则该数列有界。")
+        extractor.client = SimpleNamespace(
+            complete_json=lambda *_args, **_kwargs: {"items": []}
+        )
+        with self.assertRaisesRegex(ValueError, "return every candidate exactly once"):
+            extractor._review_missing_logical_forms(
+                {node.id: node},
+                ExtractionState(logical_form_review=True),
+            )
+
 
 class CoverageLedgerTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -704,7 +872,6 @@ class CoveragePipelineTests(unittest.TestCase):
             "chunk_context_before_lines": 6,
             "chunk_context_after_lines": 4,
             "experimental_chunk_spans": (),
-            "experimental_skip_pure_example_chunks": False,
             "max_retries": 0,
             "request_timeout": 1,
             "include_exercises": False,
@@ -941,6 +1108,84 @@ class StructureAwareChunkTests(unittest.TestCase):
         self.assertEqual(extractor.source_context_by_line[5][2], "paragraph")
         self.assertEqual(extractor.source_context_by_line[6][2], "theorem")
 
+    def test_fresh_definitional_act_breaks_out_of_skipped_example_region(self) -> None:
+        extractor = Extractor(save_output=False, verbose=False)
+        lines = [
+            "# 第一节 映射与函数",
+            "# 一、映射",
+            "定义 设 X、Y 是两个非空集合，如果存在一个法则 f，则称 f 为映射。",
+            "例1 设 f: R → R, f(x) = x^2。",
+            "例2 设 g: R → R, g(x) = sin x。",
+            "设 f 是从集合 X 到集合 Y 的映射，若 R_f = Y，则称 f 为满射；若不同元素的像不同，则称 f 为单射。",
+            "上面例 1 中的映射既非单射又非满射。",
+            "# 2. 逆映射",
+        ]
+        state = extractor._chunk_document(
+            {
+                "raw_lines": lines,
+                "max_chunk_chars": 3200,
+                "chunk_strategy": "teaching-units",
+                "chunk_context_before_lines": 0,
+                "chunk_context_after_lines": 0,
+                "diagnostics": {},
+            }
+        )
+        skipped = state["diagnostics"]["skipped_teaching_units"]
+        self.assertEqual(skipped, [])
+        self.assertEqual(extractor.source_context_by_line[6][2], "paragraph")
+        self.assertTrue(any("满射" in chunk.text for chunk in state["chunks"]))
+
+    def test_example_inline_naming_gloss_does_not_break_example_block(self) -> None:
+        extractor = Extractor(save_output=False, verbose=False)
+        lines = [
+            "# 第一节 映射与函数",
+            "例7 函数 y = sgn x 的定义如下。",
+            "称为符号函数，它的定义域 D=(-∞,+∞)。",
+            "例8 不超过 x 的最大整数称为 x 的整数部分。",
+        ]
+        state = extractor._chunk_document(
+            {
+                "raw_lines": lines,
+                "max_chunk_chars": 3200,
+                "chunk_strategy": "teaching-units",
+                "chunk_context_before_lines": 0,
+                "chunk_context_after_lines": 0,
+                "diagnostics": {},
+            }
+        )
+        self.assertEqual(extractor.source_context_by_line[2][2], "example")
+        self.assertEqual(extractor.source_context_by_line[3][2], "example")
+        example_chunk = state["chunks"][0]
+        self.assertEqual(example_chunk.teaching_unit_kind, "example_sequence")
+
+    def test_teaching_units_keep_method_summary_after_example_without_transition_word(self) -> None:
+        extractor = Extractor(save_output=False, verbose=False)
+        lines = [
+            "# 第二节 数列的极限",
+            "例2 证明一个具体数列的极限。",
+            "证 从定义出发进行估计。",
+            "取 N 大于一个确定的数，结论成立。",
+            "注意 在利用数列极限定义论证时，重要的是指出正整数 N 确实存在。",
+            "例3 证明另一个具体极限。",
+            "证 直接计算。",
+            "定理1 收敛数列的极限唯一。",
+        ]
+        state = extractor._chunk_document(
+            {
+                "raw_lines": lines,
+                "max_chunk_chars": 3200,
+                "chunk_strategy": "teaching-units",
+                "chunk_context_before_lines": 0,
+                "chunk_context_after_lines": 0,
+                "diagnostics": {},
+            }
+        )
+        self.assertEqual(extractor.source_context_by_line[2][2], "example")
+        self.assertEqual(extractor.source_context_by_line[5][2], "paragraph")
+        self.assertTrue(any("重要的是指出正整数 N" in chunk.text for chunk in state["chunks"]))
+        skipped = state["diagnostics"]["skipped_teaching_units"]
+        self.assertFalse(any(item["start_line"] <= 5 <= item["end_line"] for item in skipped))
+
     def test_markdown_list_marker_does_not_hide_theorem_boundary(self) -> None:
         extractor = Extractor(save_output=False, verbose=False)
         lines = [
@@ -1084,7 +1329,7 @@ class StructureAwareChunkTests(unittest.TestCase):
                 }
             )
 
-    def test_experimental_mode_audits_and_skips_pure_example_chunks(self) -> None:
+    def test_teaching_units_keep_example_sequence_as_a_chunk(self) -> None:
         extractor = Extractor(save_output=False, verbose=False)
         state = extractor._chunk_document(
             {
@@ -1098,40 +1343,21 @@ class StructureAwareChunkTests(unittest.TestCase):
                     "定理1 一个可复用结论。",
                 ],
                 "max_chunk_chars": 3200,
+                "chunk_strategy": "teaching-units",
                 "chunk_context_before_lines": 0,
                 "chunk_context_after_lines": 0,
-                "experimental_chunk_spans": ((1, 2), (4, 6), (7, 7)),
-                "experimental_skip_pure_example_chunks": True,
                 "diagnostics": {},
             }
         )
-        self.assertEqual(
-            [(chunk.start_line, chunk.end_line) for chunk in state["chunks"]],
-            [(1, 2), (7, 7)],
-        )
-        skipped = state["diagnostics"]["experimental_skipped_chunks"]
-        self.assertEqual(len(skipped), 1)
-        self.assertEqual(skipped[0]["start_line"], 4)
-        self.assertEqual(skipped[0]["end_line"], 6)
-        self.assertEqual(skipped[0]["block_types"], ["example"])
-        self.assertEqual(len(skipped[0]["teaching_block_ids"]), 1)
-        self.assertRegex(skipped[0]["teaching_block_ids"][0], r"^teaching_\d+_4_6_")
+        spans = [(chunk.start_line, chunk.end_line) for chunk in state["chunks"]]
+        self.assertEqual(spans, [(1, 2), (4, 6), (7, 7)])
+        example_chunk = state["chunks"][1]
+        self.assertEqual(example_chunk.teaching_unit_kind, "example_sequence")
+        self.assertEqual(example_chunk.block_types, ("example",))
+        self.assertEqual(state["diagnostics"]["skipped_teaching_units"], [])
+        self.assertTrue(state["diagnostics"]["teaching_unit_coverage"]["covered_exactly_once"])
 
-    def test_skipping_examples_requires_explicit_chunk_spans(self) -> None:
-        extractor = Extractor(save_output=False, verbose=False)
-        with self.assertRaisesRegex(ValueError, "requires experimental_chunk_spans"):
-            extractor._chunk_document(
-                {
-                    "raw_lines": ["# 第一节 示例", "定义一个可复用概念。"],
-                    "max_chunk_chars": 3200,
-                    "chunk_context_before_lines": 0,
-                    "chunk_context_after_lines": 0,
-                    "experimental_skip_pure_example_chunks": True,
-                    "diagnostics": {},
-                }
-            )
-
-    def test_teaching_units_skip_consecutive_examples_and_filter_context(self) -> None:
+    def test_teaching_units_group_consecutive_examples_into_one_chunk(self) -> None:
         extractor = Extractor(save_output=False, verbose=False)
         state = extractor._chunk_document(
             {
@@ -1156,15 +1382,15 @@ class StructureAwareChunkTests(unittest.TestCase):
         )
         self.assertEqual(
             [(chunk.start_line, chunk.end_line) for chunk in state["chunks"]],
-            [(1, 2), (10, 10)],
+            [(1, 2), (4, 9), (10, 10)],
         )
-        self.assertNotIn("例1", state["chunks"][0].context_after_text)
-        self.assertNotIn("例2", state["chunks"][1].context_before_text)
-        skipped = state["diagnostics"]["skipped_teaching_units"]
-        self.assertEqual(len(skipped), 1)
-        self.assertEqual((skipped[0]["start_line"], skipped[0]["end_line"]), (4, 9))
-        self.assertEqual(skipped[0]["unit_kind"], "example_sequence")
-        self.assertTrue(state["diagnostics"]["teaching_unit_coverage"]["covered_exactly_once"])
+        example_chunk = state["chunks"][1]
+        self.assertEqual(example_chunk.teaching_unit_kind, "example_sequence")
+        self.assertEqual(
+            [block["discourse_role"] for block in example_chunk.teaching_blocks],
+            ["example", "example"],
+        )
+        self.assertEqual(state["diagnostics"]["skipped_teaching_units"], [])
 
     def test_teaching_units_keep_standalone_claim_separate_from_theorem_leadin(self) -> None:
         extractor = Extractor(save_output=False, verbose=False)
@@ -1590,6 +1816,51 @@ class StrictMergeTests(unittest.TestCase):
             "evidence": {"start_line": start, "end_line": end},
         }
 
+    def test_relation_reduction_prunes_only_inherited_concept_anchor(self) -> None:
+        store = {
+            ("claim_derived", "derived_from", "claim_basis"): RelationRecord(
+                source_id="claim_derived",
+                relation_type="derived_from",
+                target_id="claim_basis",
+            ),
+            ("claim_basis", "involves", "concept_shared"): RelationRecord(
+                source_id="claim_basis",
+                relation_type="involves",
+                target_id="concept_shared",
+            ),
+            ("claim_derived", "involves", "concept_shared"): RelationRecord(
+                source_id="claim_derived",
+                relation_type="involves",
+                target_id="concept_shared",
+            ),
+            ("claim_derived", "involves", "concept_new"): RelationRecord(
+                source_id="claim_derived",
+                relation_type="involves",
+                target_id="concept_new",
+            ),
+        }
+        pruned = self.extractor._prune_dominated_involves(store)
+        self.assertNotIn(("claim_derived", "involves", "concept_shared"), store)
+        self.assertIn(("claim_derived", "involves", "concept_new"), store)
+        self.assertIn(("claim_basis", "involves", "concept_shared"), store)
+        self.assertEqual(pruned[0]["inherited_through"], ["claim_basis"])
+
+    def test_relation_reduction_requires_explicit_derived_from(self) -> None:
+        store = {
+            ("claim_basis", "involves", "concept_shared"): RelationRecord(
+                source_id="claim_basis",
+                relation_type="involves",
+                target_id="concept_shared",
+            ),
+            ("claim_other", "involves", "concept_shared"): RelationRecord(
+                source_id="claim_other",
+                relation_type="involves",
+                target_id="concept_shared",
+            ),
+        }
+        self.assertEqual(self.extractor._prune_dominated_involves(store), [])
+        self.assertEqual(len(store), 2)
+
     def test_valid_response_commits_nodes_relations_and_expressions_atomically(self) -> None:
         chunk = self.chunk(lines=["函数", "极限"])
         self.extractor.source_latex_candidates = {"latex_L1_1": (1, r"\lim")}
@@ -2012,7 +2283,7 @@ class MemoryDtoTests(unittest.TestCase):
 
     @staticmethod
     def serialized_bytes(items: list[object]) -> int:
-        dumped = [item.model_dump(mode="json") for item in items]
+        dumped = [item.model_dump(mode="json", exclude_none=True) for item in items]
         return len(json.dumps(dumped, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
     def test_memory_dto_serializes_only_whitelist_fields(self) -> None:
@@ -2030,8 +2301,8 @@ class MemoryDtoTests(unittest.TestCase):
         self.assertGreater(len(node_memory), 0)
         for item in node_memory:
             self.assertEqual(
-                set(item.model_dump(mode="json")),
-                {"id", "type", "name", "aliases", "claim_kind", "short_description"},
+                set(item.model_dump(mode="json", exclude_none=True)),
+                {"id", "type", "name", "aliases", "short_description"},
             )
         for item in relation_memory:
             self.assertEqual(
@@ -2159,11 +2430,11 @@ class MemoryDtoTests(unittest.TestCase):
         self.assertLessEqual(self.extractor._memory_array_bytes(node_memory), 5000)
         self.assertLessEqual(self.extractor._memory_array_bytes(relation_memory), 3000)
         node_json = json.dumps(
-            [item.model_dump(mode="json") for item in node_memory],
+            [item.model_dump(mode="json", exclude_none=True) for item in node_memory],
             ensure_ascii=False, separators=(",", ":"),
         )
         rel_json = json.dumps(
-            [item.model_dump(mode="json") for item in relation_memory],
+            [item.model_dump(mode="json", exclude_none=True) for item in relation_memory],
             ensure_ascii=False, separators=(",", ":"),
         )
         self.assertIn('"node_memory":' + node_json, prompt)
@@ -2205,7 +2476,13 @@ class MemoryDtoTests(unittest.TestCase):
             )
         item = self.extractor._node_memory_item(nodes["node_0"])
         item_bytes = self.extractor._memory_item_bytes(item)
-        expected = len(json.dumps(item.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        expected = len(
+            json.dumps(
+                item.model_dump(mode="json", exclude_none=True),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
         self.assertEqual(item_bytes, expected)
         arr_bytes = self.extractor._memory_array_bytes([self.extractor._node_memory_item(nodes[f"node_{i}"]) for i in range(2)])
         node_memory, _, _ = self.extractor._build_memory_for_chunk(
@@ -2631,7 +2908,6 @@ class VerifierTests(unittest.TestCase):
             "chunk_context_before_lines": 6,
             "chunk_context_after_lines": 4,
             "experimental_chunk_spans": (),
-            "experimental_skip_pure_example_chunks": False,
             "max_retries": 0,
             "request_timeout": 1,
             "include_exercises": False,

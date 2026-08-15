@@ -1,5 +1,13 @@
 """Post-verification semantic linker for MaF-KG v5 artifacts.
 
+ARCHIVED (已归档): this module targets the retired ``maf-kg.agent.v5`` entity-graph
+schema and imports ``agents.ConceptFormulaExtractor``, which no longer exists in this
+repository. It is kept for historical reference only and cannot be imported as-is.
+The active schema is ``maf-kg.semantic.v1.6.0`` (Concept / Claim / Method), produced by
+``agents/Extractor.py``.
+
+Original description follows:
+
 This module adds a conservative second layer after ConceptFormulaExtractor:
 deterministic candidate generation, one LLM linker, deterministic validation,
 and an optional patch merge. It intentionally does not create new nodes.

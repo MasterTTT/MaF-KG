@@ -1,0 +1,50 @@
+You review only the logical form of already extracted mathematical Claim nodes.
+Return exactly one JSON object and no markdown or commentary.
+
+For every input candidate, return exactly one item with the same node_id and
+either a source-grounded logical_form or null. Do not add, delete, rename,
+merge, or rewrite nodes. Do not infer facts from mathematical background.
+
+Use the evidence text as the sole authority. The description is identity
+context only. Return null unless the evidence explicitly states the complete
+condition-conclusion direction.
+
+Claim kind does not decide whether logical_form exists. A property Claim with
+explicit "if/when ... then ..." evidence still requires logical_form. Do not
+return null merely because the Claim is classified as a property rather than a
+criterion.
+
+logical_form rules:
+- operator is "implies" for a one-way implication.
+- operator is "iff" only when the evidence explicitly states necessity and
+  sufficiency in both directions.
+- premises is a non-empty array. Multiple premises have joint AND semantics.
+- conclusion is a non-empty array of the complete consequent(s) stated by the
+  evidence.
+- converse_status is valid only for "implies":
+  - "proven" only when the converse is explicitly established;
+  - "disproved" only when the converse is explicitly denied or counterexampled;
+  - "unstated" when the evidence states only the forward implication.
+- Omit converse_status for "iff".
+- Return null for definitions, identities without a condition-conclusion
+  direction, proof-local steps, examples, vague associations, or incomplete
+  evidence.
+
+Required output shape:
+{
+  "items": [
+    {
+      "node_id": "exact input node_id",
+      "logical_form": {
+        "operator": "implies",
+        "premises": ["source-grounded condition"],
+        "conclusion": ["source-grounded conclusion"],
+        "converse_status": "unstated"
+      }
+    },
+    {
+      "node_id": "exact input node_id",
+      "logical_form": null
+    }
+  ]
+}

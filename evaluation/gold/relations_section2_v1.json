@@ -1,0 +1,97 @@
+{
+  "schema_version": "maf-kg.relation-gold.v1",
+  "source_file": "第一章第二节.md",
+  "annotation_status": "reviewed_positive_set",
+  "closed_world": false,
+  "notes": [
+    "This file contains reviewed positive relations only.",
+    "It supports recall, type, and direction checks, but not strict precision because the negative candidate universe is not closed.",
+    "Derived Claims do not repeat inherited involves edges."
+  ],
+  "relations": [
+    {
+      "gold_id": "s2_r01",
+      "source_gold_id": "s2_concept_sequence_limit",
+      "type": "defined_in_terms_of",
+      "target_gold_id": "s2_concept_sequence",
+      "evidence": {"start_line": 100, "end_line": 118}
+    },
+    {
+      "gold_id": "s2_r02",
+      "source_gold_id": "s2_concept_sequence_boundedness",
+      "type": "defined_in_terms_of",
+      "target_gold_id": "s2_concept_sequence",
+      "evidence": {"start_line": 269, "end_line": 277}
+    },
+    {
+      "gold_id": "s2_r03",
+      "source_gold_id": "s2_concept_subsequence",
+      "type": "special_case_of",
+      "target_gold_id": "s2_concept_sequence",
+      "evidence": {"start_line": 343, "end_line": 353}
+    },
+    {
+      "gold_id": "s2_r04",
+      "source_gold_id": "s2_property_limit_uniqueness",
+      "type": "involves",
+      "target_gold_id": "s2_concept_sequence_limit",
+      "evidence": {"start_line": 247, "end_line": 249}
+    },
+    {
+      "gold_id": "s2_r05",
+      "source_gold_id": "s2_property_convergent_sequence_bounded",
+      "type": "involves",
+      "target_gold_id": "s2_concept_sequence_limit",
+      "evidence": {"start_line": 291, "end_line": 311}
+    },
+    {
+      "gold_id": "s2_r06",
+      "source_gold_id": "s2_property_convergent_sequence_bounded",
+      "type": "involves",
+      "target_gold_id": "s2_concept_sequence_boundedness",
+      "evidence": {"start_line": 291, "end_line": 311}
+    },
+    {
+      "gold_id": "s2_r07",
+      "source_gold_id": "s2_property_sign_preservation",
+      "type": "involves",
+      "target_gold_id": "s2_concept_sequence_limit",
+      "evidence": {"start_line": 323, "end_line": 334}
+    },
+    {
+      "gold_id": "s2_r09",
+      "source_gold_id": "s2_property_subsequence_limit",
+      "type": "involves",
+      "target_gold_id": "s2_concept_sequence_limit",
+      "evidence": {"start_line": 357, "end_line": 363}
+    },
+    {
+      "gold_id": "s2_r10",
+      "source_gold_id": "s2_property_subsequence_limit",
+      "type": "involves",
+      "target_gold_id": "s2_concept_subsequence",
+      "evidence": {"start_line": 357, "end_line": 363}
+    },
+    {
+      "gold_id": "s2_r16",
+      "source_gold_id": "s2_property_limit_sign_corollary",
+      "type": "derived_from",
+      "target_gold_id": "s2_property_sign_preservation",
+      "evidence": {"start_line": 337, "end_line": 339}
+    },
+    {
+      "gold_id": "s2_r17",
+      "source_gold_id": "s2_criterion_distinct_subsequence_limits",
+      "type": "derived_from",
+      "target_gold_id": "s2_property_subsequence_limit",
+      "evidence": {"start_line": 357, "end_line": 365}
+    },
+    {
+      "gold_id": "s2_c01",
+      "source_gold_id": "s2_method_epsilon_n",
+      "type": "uses",
+      "target_gold_id": "s2_concept_sequence_limit",
+      "evidence": {"start_line": 100, "end_line": 205}
+    }
+  ]
+}

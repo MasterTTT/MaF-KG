@@ -1,6 +1,10 @@
-# MaF-KG Schema v5
+# MaF-KG Schema v5（已归档 / ARCHIVED）
 
-Note: this file name is kept for repo continuity, but the active extractor schema is now `maf-kg.agent.v5`.
+> ⚠️ 本文档描述的是**已退役**的 `maf-kg.agent.v5` 实体图谱 schema 及其多 Agent 管线
+> （NodeResolver / RelationAgent / NormalizerAgent / VerificationAgent）。该管线的
+> 生产者代码已不在本仓库。当前活跃 schema 是 `maf-kg.semantic.v1.6.0`
+> （Concept / Claim / Method），见 `docs/semantic_layer_v1.md` 与 `agents/Extractor.py`。
+> 本文档仅作历史参考保留，不代表当前提取器的 schema。
 
 ## Top-Level Object
 

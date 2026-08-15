@@ -16,7 +16,7 @@
 | 类型 | 边界 |
 | --- | --- |
 | `Concept` | 可跨局部段落复用的数学概念、命名对象或类别；定义浓缩进 `description` |
-| `Claim` | 教材明确陈述、可判真假的一般性数学结论，包括定理、性质、推论、判据和恒等规律 |
+| `Claim` | 教材明确陈述、可判真假的一般性数学结论，包括定理、性质、推论、判据和恒等规律；显式蕴含或充要条件可附带 `logical_form` |
 | `Method` | 面向一类问题、具有操作过程和预期结果的可复用方法 |
 
 定义、定理、性质、推论、证明、例题、习题、图示、章和节均视为教材话语角色，不是本层节点类型。
@@ -33,6 +33,32 @@
 | `special_case_of` | Concept -> Concept | 前一概念是后一概念的明确特例 |
 
 本层不抽取 `prerequisite_of`、`similar_to` 或通用 `related_to`，也不自动补传递边。
+
+关系遵循最小充分连接原则：独立 Claim 只连接其主要 Concept；派生 Claim 已通过
+`derived_from` 接入语义上下文时，不再把描述中出现的 Concept 全部重复连接。
+合并阶段按一个可审计的支配规则执行约简：若 `A derived_from B`，且 A 与 B 均
+`involves C`，则删除 `A involves C`；A 新引入且 B 未连接的 Concept 保留。程序
+不根据名称、相似度或外部数学知识删除关系，被删除的边记录在 diagnostics 中。
+
+### Claim logical_form
+
+`logical_form` 是 Claim 的可选结构，不是新节点或新关系。它只编码教材明确陈述的
+命题方向：
+
+```json
+{
+  "operator": "implies",
+  "premises": ["数列收敛"],
+  "conclusion": "数列有界",
+  "converse_status": "disproved"
+}
+```
+
+- `operator` 只允许 `implies` 或 `iff`；
+- `premises` 非空，多个元素整体按 AND 解释；
+- `converse_status` 只用于 `implies`，允许 `proven/disproved/unstated`；
+- 普通恒等式、无条件性质、证明步骤和例题推导不添加该字段；
+- KU 可以在后续从成员 Claim 汇总逻辑摘要，但 KU 本身不承担命题真假。
 
 ### MathExpression
 
@@ -62,7 +88,9 @@ LaTeX 只能引用程序从 Markdown 中识别出的原文 candidate，不允许
 }
 ```
 
-节点保留 `id/type/name/aliases/description/evidence`；关系保留 `id/type/source_id/target_id/evidence`。不输出 `score`、`confidence`、`quality` 或类型专属 `content`。
+节点保留 `id/type/name/aliases/description/evidence`，Claim 另有 `claim_kind` 和可选
+`logical_form`；关系保留 `id/type/source_id/target_id/evidence`。不输出 `score`、
+`confidence`、`quality` 或类型专属 `content`。
 
 ## 4. 执行流程
 

@@ -85,8 +85,8 @@ def classify_definition_segments(
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT_DIR = ROOT / "prompts"
 DEFAULT_INPUT = ROOT / "data" / "raw" / "第一章第一节_映射与函数.md"
-DEFAULT_OUTPUT = ROOT / "KG" / "第一章第一节_映射与函数_semantic_v1_6_0.json"
-SCHEMA_VERSION = "maf-kg.semantic.v1.6.0"
+DEFAULT_OUTPUT = ROOT / "KG" / "第一章第一节_映射与函数_semantic_v1_7_0.json"
+SCHEMA_VERSION = "maf-kg.semantic.v1.7.0"
 CHUNK_STRATEGIES = ["budget", "teaching-units"]
 RELATION_SIGNATURES: dict[str, tuple[tuple[str, str], ...]] = {
     "involves": (("Claim", "Concept"),),
@@ -100,6 +100,8 @@ RELATION_SIGNATURES: dict[str, tuple[tuple[str, str], ...]] = {
 
 NodeType = Literal["Concept", "Claim", "Method"]
 ClaimKind = Literal["property", "criterion", "identity", "result"]
+LogicalOperator = Literal["implies", "iff"]
+ConverseStatus = Literal["proven", "disproved", "unstated"]
 RelationType = Literal[
     "involves",
     "uses",
@@ -125,6 +127,28 @@ class EvidenceRef(BaseModel):
     start_line: int
     end_line: int
 
+class LogicalForm(BaseModel):
+    operator: LogicalOperator
+    premises: list[str]
+    conclusion: list[str]
+    converse_status: ConverseStatus | None = None
+
+    @model_validator(mode="after")
+    def validate_logical_form(self) -> "LogicalForm":
+        premises = [re.sub(r"\s+", " ", premise).strip() for premise in self.premises]
+        if not premises or any(not premise for premise in premises):
+            raise ValueError("logical_form premises must contain non-empty source-grounded conditions")
+        normalized_premises = _unique_preserve_order(premises)
+        conclusions = [re.sub(r"\s+", " ", c).strip() for c in self.conclusion]
+        if not conclusions or any(not c for c in conclusions):
+            raise ValueError("logical_form conclusion must contain non-empty source-grounded statements")
+        normalized_conclusions = _unique_preserve_order(conclusions)
+        if self.operator == "iff" and self.converse_status is not None:
+            raise ValueError("iff logical_form must omit converse_status")
+        self.premises = normalized_premises
+        self.conclusion = normalized_conclusions
+        return self
+
 class KGNode(BaseModel):
     id: str
     type: NodeType
@@ -132,7 +156,14 @@ class KGNode(BaseModel):
     aliases: list[str] = Field(default_factory=list)
     description: str = ""
     claim_kind: ClaimKind | None = None
+    logical_form: LogicalForm | None = None
     evidence: list[Evidence] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_claim_fields(self) -> "KGNode":
+        if self.type != "Claim" and self.logical_form is not None:
+            raise ValueError("logical_form is valid only for Claim nodes")
+        return self
 
 class KGRelation(BaseModel):
     id: str
@@ -165,7 +196,14 @@ class NodeMemoryItem(BaseModel):
     name: str
     aliases: list[str] = Field(default_factory=list)
     claim_kind: ClaimKind | None = None
+    logical_form: LogicalForm | None = None
     short_description: str = ""
+
+    @model_validator(mode="after")
+    def validate_claim_fields(self) -> "NodeMemoryItem":
+        if self.type != "Claim" and self.logical_form is not None:
+            raise ValueError("logical_form is valid only for Claim nodes")
+        return self
 
 class RelationMemoryItem(BaseModel):
     source_id: str
@@ -182,6 +220,7 @@ class NodeAction(BaseModel):
     aliases: list[str] = Field(default_factory=list)
     description: str = ""
     claim_kind: ClaimKind | None = None
+    logical_form: LogicalForm | None = None
     evidence: EvidenceRef
     reason: str = ""
 
@@ -201,6 +240,8 @@ class NodeAction(BaseModel):
                 raise ValueError("create Claim actions require claim_kind")
             if self.type != "Claim" and self.claim_kind is not None:
                 raise ValueError("claim_kind is valid only for Claim nodes")
+            if self.type != "Claim" and self.logical_form is not None:
+                raise ValueError("logical_form is valid only for Claim nodes")
         if not self.ref_id.strip():
             raise ValueError("node action ref_id must not be empty")
         return self
@@ -223,6 +264,13 @@ class ChunkExtractionResponse(BaseModel):
     expressions: list[ProposedExpression] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
 
+class LogicalFormReviewItem(BaseModel):
+    node_id: str
+    logical_form: LogicalForm | None = None
+
+class LogicalFormReviewResponse(BaseModel):
+    items: list[LogicalFormReviewItem]
+
 class NodeRecord(BaseModel):
     id: str
     type: NodeType
@@ -230,7 +278,14 @@ class NodeRecord(BaseModel):
     aliases: list[str] = Field(default_factory=list)
     description: str = ""
     claim_kind: ClaimKind | None = None
+    logical_form: LogicalForm | None = None
     evidence: list[Evidence] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_claim_fields(self) -> "NodeRecord":
+        if self.type != "Claim" and self.logical_form is not None:
+            raise ValueError("logical_form is valid only for Claim nodes")
+        return self
 
 class RelationRecord(BaseModel):
     source_id: str
@@ -307,7 +362,6 @@ class ExtractionState(TypedDict, total=False):
     chunk_context_before_lines: int
     chunk_context_after_lines: int
     experimental_chunk_spans: tuple[tuple[int, int], ...]
-    experimental_skip_pure_example_chunks: bool
     max_retries: int
     request_timeout: float
     max_tokens: int
@@ -323,6 +377,7 @@ class ExtractionState(TypedDict, total=False):
     thinking: str
     reasoning_effort: str
     coverage_review: bool
+    logical_form_review: bool
     run_started_at: str
     raw_lines: list[str]
     chunks: list[DocumentChunk]
@@ -464,13 +519,14 @@ def _make_teaching_unit_group(
     reason: str,
     *,
     skipped: bool = False,
+    unit_kind: str | None = None,
 ) -> TeachingUnitGroup:
-    unit_kind = "example_sequence" if skipped else _teaching_unit_kind(blocks, reason)
+    resolved_kind = unit_kind or ("example_sequence" if skipped else _teaching_unit_kind(blocks, reason))
     return TeachingUnitGroup(
         blocks=list(blocks),
-        unit_kind=unit_kind,
+        unit_kind=resolved_kind,
         grouping_reason=reason,
-        anchor_block_ids=_teaching_unit_anchor_ids(blocks, unit_kind),
+        anchor_block_ids=_teaching_unit_anchor_ids(blocks, resolved_kind),
         skipped=skipped,
     )
 
@@ -558,16 +614,16 @@ def _build_teaching_unit_groups(
 
         if block.kind == "example":
             flush("example_boundary")
-            skipped_blocks = list(pending_headings)
+            example_blocks = list(pending_headings)
             pending_headings.clear()
             while i < len(blocks) and blocks[i].kind == "example":
-                skipped_blocks.append(blocks[i])
+                example_blocks.append(blocks[i])
                 i += 1
             groups.append(
                 _make_teaching_unit_group(
-                    skipped_blocks,
+                    example_blocks,
                     "explicit_example_sequence",
-                    skipped=True,
+                    unit_kind="example_sequence",
                 )
             )
             continue
@@ -1213,7 +1269,7 @@ class OpenCodeGoProviderAdapter(DeepSeekProviderAdapter):
 
     name = "opencode-go"
     default_base_url = "https://opencode.ai/zen/go/v1"
-    api_key_envs = ("OPENCODE_GO_API_KEY",)
+    api_key_envs = ("OPENCODE_API_KEY",)
     model_envs = ("OPENCODE_GO_MODEL",)
     base_url_envs = ("OPENCODE_GO_BASE_URL",)
 
@@ -1475,7 +1531,6 @@ class Extractor:
         chunk_context_before_lines: int = 6,
         chunk_context_after_lines: int = 4,
         experimental_chunk_spans: tuple[tuple[int, int], ...] = (),
-        experimental_skip_pure_example_chunks: bool = False,
         max_retries: int = 2,
         request_timeout: float = 180,
         max_tokens: int = 12000,
@@ -1496,6 +1551,7 @@ class Extractor:
         embedding_memory: bool = False,
         seed_graph_path: str | Path | None = None,
         coverage_review: bool = False,
+        logical_form_review: bool = False,
     ) -> None:
         self.input_path = Path(input_path)
         self.output_path = Path(output_path)
@@ -1514,7 +1570,6 @@ class Extractor:
         self.chunk_context_before_lines = chunk_context_before_lines
         self.chunk_context_after_lines = chunk_context_after_lines
         self.experimental_chunk_spans = tuple(experimental_chunk_spans)
-        self.experimental_skip_pure_example_chunks = experimental_skip_pure_example_chunks
         self.max_retries = max_retries
         self.request_timeout = request_timeout
         self.max_tokens = max_tokens
@@ -1543,6 +1598,10 @@ class Extractor:
         if coverage_review and chunk_strategy != "teaching-units":
             raise ValueError("coverage_review requires chunk_strategy='teaching-units'")
         self.coverage_review = coverage_review
+        self.logical_form_review = logical_form_review
+        self.logical_form_review_prompt = (
+            _load_prompt("logical_form_review.txt") if logical_form_review else ""
+        )
         self._sem_embed_cache: dict[str, list[float]] = {}
         self._sem_judge_cache: dict[tuple[str, str], bool] = {}
         self._chunk_embed_cache: dict[str, list[float]] = {}
@@ -1567,7 +1626,6 @@ class Extractor:
             "chunk_context_before_lines": self.chunk_context_before_lines,
             "chunk_context_after_lines": self.chunk_context_after_lines,
             "experimental_chunk_spans": self.experimental_chunk_spans,
-            "experimental_skip_pure_example_chunks": self.experimental_skip_pure_example_chunks,
             "max_retries": self.max_retries,
             "request_timeout": self.request_timeout,
             "max_tokens": self.max_tokens,
@@ -1583,6 +1641,7 @@ class Extractor:
             "thinking": self.thinking,
             "reasoning_effort": self.reasoning_effort,
             "coverage_review": self.coverage_review,
+            "logical_form_review": self.logical_form_review,
             "run_started_at": datetime.now(timezone.utc).isoformat(),
             "diagnostics": {},
         }
@@ -1742,6 +1801,23 @@ class Extractor:
         def is_definition(text: str) -> bool:
             return bool(re.match(r"^\s*定义\s*\d*\s+设", without_markdown_list_marker(text)))
 
+        def is_fresh_definitional_act(text: str) -> bool:
+            """A line opening a new conditional definition outside any example.
+
+            Chinese textbooks define named classes with patterns such as
+            "设 f 是从集合 X 到集合 Y 的映射，若 R_f = Y ... 则称 f 为满射"
+            without the word 定义. When such a line appears while extending an
+            example block, it must terminate the example: example-local content
+            is skipped wholesale, so absorbing a general definition here would
+            silently drop taught content. The prefix discriminates a fresh
+            definitional act from an inline naming gloss of the current
+            example object ("这函数称为绝对值函数").
+            """
+            normalized = without_markdown_list_marker(text).strip()
+            if not re.match(r"^(设|若|如果|假设)", normalized):
+                return False
+            return bool(re.search(r"(则称|那么称|称为|叫做|记为|记作|统称为|定义为)", normalized))
+
         def is_conclusion_transition(text: str) -> bool:
             return bool(
                 re.search(
@@ -1840,7 +1916,11 @@ class Extractor:
                         or (kind_fn in {"property", "corollary", "proof"} and is_property(nxt))
                     ):
                         break
-                    if kind_fn in {"example", "proof"} and saw_conclusion and is_exposition_restart(nxt):
+                    if kind_fn == "example" and is_exposition_restart(nxt):
+                        break
+                    if kind_fn == "example" and is_fresh_definitional_act(nxt):
+                        break
+                    if kind_fn == "proof" and saw_conclusion and is_exposition_restart(nxt):
                         break
                     if is_conclusion_transition(nxt):
                         saw_conclusion = True
@@ -1919,14 +1999,9 @@ class Extractor:
                 f"Unsupported chunk strategy {chunk_strategy!r}; expected one of {CHUNK_STRATEGIES}"
             )
         experimental_spans = tuple(state.get("experimental_chunk_spans", ()))
-        skip_pure_examples = bool(state.get("experimental_skip_pure_example_chunks", False))
         if experimental_spans and chunk_strategy == "teaching-units":
             raise ValueError(
                 "experimental_chunk_spans cannot be combined with chunk_strategy='teaching-units'"
-            )
-        if skip_pure_examples and not experimental_spans:
-            raise ValueError(
-                "experimental_skip_pure_example_chunks requires experimental_chunk_spans"
             )
         grouped_units: list[TeachingUnitGroup] = []
         if experimental_spans:
@@ -2036,21 +2111,6 @@ class Extractor:
                 for group_blocks, reason in merged_budget_groups
             ]
 
-        skipped_experimental_groups: list[TeachingUnitGroup] = []
-        if skip_pure_examples:
-            retained_groups: list[TeachingUnitGroup] = []
-            for group in grouped_units:
-                if group.blocks and all(blk.kind == "example" for blk in group.blocks):
-                    skipped_group = _make_teaching_unit_group(
-                        group.blocks,
-                        "experimental_pure_example_skip",
-                        skipped=True,
-                    )
-                    skipped_experimental_groups.append(skipped_group)
-                    continue
-                retained_groups.append(group)
-            grouped_units = [*retained_groups, *skipped_experimental_groups]
-
         processed_groups = [group for group in grouped_units if not group.skipped]
         skipped_groups = [group for group in grouped_units if group.skipped]
         skipped_line_numbers = {
@@ -2116,16 +2176,6 @@ class Extractor:
             {"start_line": start, "end_line": end}
             for start, end in experimental_spans
         ]
-        diagnostics["experimental_skip_pure_example_chunks"] = skip_pure_examples
-        diagnostics["experimental_skipped_chunks"] = [
-            {
-                "start_line": group.blocks[0].start_line,
-                "end_line": group.blocks[-1].end_line,
-                "block_types": [blk.kind for blk in group.blocks],
-                "teaching_block_ids": [blk.teaching_block_id for blk in group.blocks],
-            }
-            for group in skipped_experimental_groups
-        ]
         diagnostics["skipped_teaching_units"] = [
             {
                 "start_line": group.blocks[0].start_line,
@@ -2137,7 +2187,6 @@ class Extractor:
                 "anchor_block_ids": list(group.anchor_block_ids),
             }
             for group in skipped_groups
-            if group not in skipped_experimental_groups
         ]
         if chunk_strategy == "teaching-units" and not experimental_spans:
             processed_block_count = sum(len(group.blocks) for group in processed_groups)
@@ -2193,6 +2242,7 @@ class Extractor:
                 aliases=list(node.get("aliases", [])),
                 description=node.get("description", ""),
                 claim_kind=node.get("claim_kind"),
+                logical_form=node.get("logical_form"),
                 evidence=[Evidence(**entry) for entry in node.get("evidence", [])],
             )
         for rel in data.get("relations", []):
@@ -2349,7 +2399,9 @@ class Extractor:
             self._log(
                 f"Extractor chunk {idx}/{len(state['chunks'])} done: "
                 f"create={summary['created_node_count']}, reuse={summary['reused_node_count']}, "
-                f"+{summary['new_relation_count']} relations, +{summary['new_expression_count']} expressions, "
+                f"+{summary['new_relation_count']} relations, "
+                f"pruned={summary['pruned_relation_count']}, "
+                f"+{summary['new_expression_count']} expressions, "
                 f"totals={len(node_store)} nodes/{len(relation_store)} relations/{len(expression_store)} expressions"
             )
         coverage_ledger = self._build_coverage_ledger(
@@ -2483,6 +2535,10 @@ class Extractor:
                 expression_store,
                 chunk_strategy=str(state.get("chunk_strategy", "budget")),
             )
+        logical_form_review_diag = self._review_missing_logical_forms(
+            node_store,
+            state,
+        )
         result = self._finalize_result(
             state["input_path"],
             lines,
@@ -2505,6 +2561,7 @@ class Extractor:
                     "uncovered_after": coverage_ledger.get("uncovered_count", 0),
                     "chunk_summaries": coverage_review_summaries,
                 },
+                "logical_form_review": logical_form_review_diag,
                 "run_config": self._run_config(state),
                 "api_summary": self._api_summary(client.request_history),
                 "api_requests": client.request_history,
@@ -2526,6 +2583,97 @@ class Extractor:
                 self._log(f"Verify pass failed (fail-safe): {exc}")
                 result.diagnostics["verify"] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
         return {**state, "result": result}
+
+    @staticmethod
+    def _is_logical_form_review_candidate(node: NodeRecord) -> bool:
+        if node.type != "Claim" or node.logical_form is not None:
+            return False
+        source_text = "\n".join(evidence.text for evidence in node.evidence)
+        combined = f"{node.description}\n{source_text}"
+        return bool(
+            re.search(r"(?:如果|若).{0,240}(?:那么|则)", combined, re.DOTALL)
+            or re.search(r"(?:必要|充分|充要|充分必要)条件", combined)
+        )
+
+    def _review_missing_logical_forms(
+        self,
+        node_store: dict[str, NodeRecord],
+        state: ExtractionState,
+    ) -> dict[str, Any]:
+        enabled = bool(state.get("logical_form_review", False))
+        candidates = [
+            node
+            for node in sorted(node_store.values(), key=lambda item: item.id)
+            if self._is_logical_form_review_candidate(node)
+        ]
+        diagnostics: dict[str, Any] = {
+            "enabled": enabled,
+            "candidate_count": len(candidates),
+            "candidate_node_ids": [node.id for node in candidates],
+            "updated_count": 0,
+            "updated_node_ids": [],
+        }
+        if not enabled or not candidates:
+            diagnostics["status"] = "disabled" if not enabled else "no_candidates"
+            return diagnostics
+
+        payload = {
+            "candidates": [
+                {
+                    "node_id": node.id,
+                    "name": node.name,
+                    "description": node.description,
+                    "evidence": [
+                        {
+                            "start_line": evidence.start_line,
+                            "end_line": evidence.end_line,
+                            "text": evidence.text,
+                        }
+                        for evidence in node.evidence
+                    ],
+                }
+                for node in candidates
+            ]
+        }
+        self._log(f"Logical-form review start: {len(candidates)} candidate Claim(s)")
+        response = LogicalFormReviewResponse.model_validate(
+            self._client(state).complete_json(
+                self.logical_form_review_prompt,
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                label="logical_form_review",
+            )
+        )
+        expected_ids = [node.id for node in candidates]
+        returned_ids = [item.node_id for item in response.items]
+        if len(returned_ids) != len(set(returned_ids)):
+            raise ValueError("Logical-form review returned duplicate node_id values")
+        if set(returned_ids) != set(expected_ids):
+            raise ValueError(
+                "Logical-form review must return every candidate exactly once; "
+                f"expected={sorted(expected_ids)}, returned={sorted(returned_ids)}"
+            )
+
+        updated_ids: list[str] = []
+        for item in response.items:
+            if item.logical_form is None:
+                continue
+            node_store[item.node_id].logical_form = item.logical_form
+            updated_ids.append(item.node_id)
+        diagnostics.update(
+            {
+                "status": "completed",
+                "updated_count": len(updated_ids),
+                "updated_node_ids": sorted(updated_ids),
+                "null_node_ids": sorted(
+                    item.node_id for item in response.items if item.logical_form is None
+                ),
+            }
+        )
+        self._log(
+            f"Logical-form review done: {len(updated_ids)} updated, "
+            f"{len(candidates) - len(updated_ids)} unchanged"
+        )
+        return diagnostics
 
     def _validate_chunk_response(
         self,
@@ -2719,7 +2867,7 @@ class Extractor:
     def _memory_item_bytes(item: BaseModel) -> int:
         return len(
             json.dumps(
-                item.model_dump(mode="json"),
+                item.model_dump(mode="json", exclude_none=True),
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode("utf-8")
@@ -2729,7 +2877,7 @@ class Extractor:
     def _memory_array_bytes(items: list[BaseModel]) -> int:
         return len(
             json.dumps(
-                [item.model_dump(mode="json") for item in items],
+                [item.model_dump(mode="json", exclude_none=True) for item in items],
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode("utf-8")
@@ -2786,6 +2934,7 @@ class Extractor:
             name=node.name,
             aliases=node.aliases,
             claim_kind=node.claim_kind,
+            logical_form=node.logical_form,
             short_description=self._short_description(node.description),
         )
 
@@ -2856,8 +3005,8 @@ class Extractor:
             },
             "defined_term_hints": self._extract_defined_terms(chunk.text),
             "source_latex_candidates": source_latex_candidates,
-            "node_memory": [item.model_dump(mode="json") for item in node_memory],
-            "relation_memory": [item.model_dump(mode="json") for item in relation_memory],
+            "node_memory": [item.model_dump(mode="json", exclude_none=True) for item in node_memory],
+            "relation_memory": [item.model_dump(mode="json", exclude_none=True) for item in relation_memory],
         }
         if verifier_guidance:
             payload["verifier_guidance"] = verifier_guidance
@@ -2894,6 +3043,9 @@ class Extractor:
                 "name": node.name,
                 "description": node.description,
                 "claim_kind": node.claim_kind,
+                "logical_form": (
+                    node.logical_form.model_dump(mode="json") if node.logical_form else None
+                ),
                 "evidence": evidence_blocks(node.evidence),
             }
             for node in sorted(result.nodes, key=lambda item: (item.type, item.name, item.id))
@@ -3066,6 +3218,7 @@ class Extractor:
                 aliases=list(node.aliases),
                 description=node.description,
                 claim_kind=node.claim_kind,
+                logical_form=node.logical_form,
                 evidence=list(node.evidence),
             )
             for node in result.nodes
@@ -3378,11 +3531,9 @@ class Extractor:
 
     def _judge_same_concept(self, name_a: str, desc_a: str, name_b: str, desc_b: str) -> bool:
         import os
+        import urllib.error
         import urllib.request
 
-        api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("DS_API_KEY")
-        if not api_key:
-            raise RuntimeError("semantic dedupe requires DEEPSEEK_API_KEY")
         sys_prompt = (
             "你是数学知识图谱的命名判定器。给定两个数学概念名及其上下文描述，判断它们"
             "是否指代同一个数学对象。同一对象的不同写法（同义改写、措辞顺序不同、含 "
@@ -3405,17 +3556,36 @@ class Extractor:
             "temperature": 0,
             "response_format": {"type": "json_object"},
         }
-        req = urllib.request.Request(
-            "https://api.deepseek.com/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        endpoints = (
+            ("https://opencode.ai/zen/go/v1/chat/completions", "OPENCODE_API_KEY"),
+            ("https://api.deepseek.com/chat/completions", "DEEPSEEK_API_KEY"),
         )
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            content = json.loads(resp.read())["choices"][0]["message"]["content"]
-        try:
-            return bool(json.loads(content).get("same", False))
-        except json.JSONDecodeError:
-            return False
+        errors: list[str] = []
+        for url, key_env in endpoints:
+            api_key = os.getenv(key_env)
+            if not api_key:
+                errors.append(f"{key_env} not set")
+                continue
+            try:
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+                )
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    response = json.loads(resp.read())
+                if response.get("code") not in (None, 0):
+                    errors.append(f"{url} API error {response.get('code')}: {response.get('message')}")
+                    continue
+                content = response["choices"][0]["message"]["content"]
+                try:
+                    return bool(json.loads(content).get("same", False))
+                except json.JSONDecodeError:
+                    return False
+            except urllib.error.URLError as exc:
+                errors.append(f"{url} unreachable: {exc}")
+                continue
+        raise RuntimeError("semantic dedupe judge failed on all endpoints: " + "; ".join(errors))
 
     def _embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Batch embed texts via local ollama qwen3-embedding. Raises on failure;
@@ -3573,6 +3743,8 @@ class Extractor:
                             ref_id,
                             f"claim_kind mismatch for {existing.id}: {action.claim_kind} != {existing.claim_kind}",
                         )
+                if action.logical_form is not None and existing.type != "Claim":
+                    fail("node_action", ref_id, f"logical_form supplied for non-Claim reuse: {existing.id}")
                 planned_nodes.append(
                     {"action": action, "kind": "reuse", "existing_id": existing_id, "evidence": evidence}
                 )
@@ -3592,7 +3764,7 @@ class Extractor:
                         if final_id in allowed_existing_ids
                         else "memory_retrieval_miss"
                     )
-                    if not self.semantic_dedupe:
+                    if conflict_kind == "model_decision_conflict" and not self.semantic_dedupe:
                         fail(
                             "node_action",
                             ref_id,
@@ -3786,6 +3958,7 @@ class Extractor:
                     aliases=_canonical_aliases(sanitized.name, sanitized.aliases),
                     description=sanitized.description,
                     claim_kind=sanitized.claim_kind,
+                    logical_form=sanitized.logical_form,
                     evidence=[evidence],
                 )
                 created_refs.add(ref_id)
@@ -3832,6 +4005,8 @@ class Extractor:
             )
             new_relation_count += 1
 
+        pruned_relations = self._prune_dominated_involves(relation_store)
+
         new_expression_count = 0
         for plan in planned_expressions:
             key = (plan["owner_id"], plan["role"], plan["latex"])
@@ -3860,6 +4035,8 @@ class Extractor:
             "created_node_count": created_node_count,
             "reused_node_count": reused_node_count,
             "new_relation_count": new_relation_count,
+            "pruned_relation_count": len(pruned_relations),
+            "pruned_relations": pruned_relations,
             "new_expression_count": new_expression_count,
             "total_nodes": len(node_store),
             "total_relations": len(relation_store),
@@ -3890,6 +4067,7 @@ class Extractor:
             aliases=_canonical_aliases(name, action.aliases),
             description=description,
             claim_kind=action.claim_kind,
+            logical_form=action.logical_form,
             evidence=EvidenceRef(start_line=evidence.start_line, end_line=evidence.end_line),
             reason=action.reason.strip(),
         )
@@ -3952,6 +4130,34 @@ class Extractor:
                 )
             existing.claim_kind = action.claim_kind
 
+        logical_form_action = "kept"
+        logical_form_revision: dict[str, Any] | None = None
+        if action.logical_form is not None:
+            if existing.type != "Claim":
+                raise ValueError(f"logical_form supplied for non-Claim reuse: {existing.id}")
+            previous_logical_form = existing.logical_form
+            if previous_logical_form is None:
+                logical_form_action = "initialized"
+                existing.logical_form = action.logical_form
+            elif previous_logical_form != action.logical_form:
+                logical_form_action = "replaced"
+                existing.logical_form = action.logical_form
+            else:
+                logical_form_action = "unchanged"
+            if logical_form_action in {"initialized", "replaced"}:
+                logical_form_revision = {
+                    "action": logical_form_action,
+                    "previous_logical_form": (
+                        previous_logical_form.model_dump(mode="json")
+                        if previous_logical_form is not None
+                        else None
+                    ),
+                    "new_logical_form": action.logical_form.model_dump(mode="json"),
+                    "start_line": evidence.start_line,
+                    "end_line": evidence.end_line,
+                    "reason": action.reason.strip(),
+                }
+
         previous_aliases = list(existing.aliases)
         existing.aliases = _canonical_aliases(existing.name, [*existing.aliases, *action.aliases])
         aliases_added = [alias for alias in existing.aliases if alias not in previous_aliases]
@@ -3979,6 +4185,8 @@ class Extractor:
             "aliases_added": aliases_added,
             "description_action": description_action,
             "description_revision": description_revision,
+            "logical_form_action": logical_form_action,
+            "logical_form_revision": logical_form_revision,
         }
 
     def _append_node_evidence(self, node: NodeRecord, evidence: Evidence) -> None:
@@ -3992,6 +4200,47 @@ class Extractor:
 
     def _relation_signature_valid(self, relation_type: str, source_type: str, target_type: str) -> bool:
         return (source_type, target_type) in RELATION_SIGNATURES.get(relation_type, ())
+
+    @staticmethod
+    def _prune_dominated_involves(
+        relation_store: dict[tuple[str, str, str], RelationRecord],
+    ) -> list[dict[str, Any]]:
+        """Remove only concept anchors already supplied by a direct basis Claim."""
+        derived_bases: dict[str, set[str]] = {}
+        concept_anchors: dict[str, set[str]] = {}
+        for relation in relation_store.values():
+            if relation.relation_type == "derived_from":
+                derived_bases.setdefault(relation.source_id, set()).add(relation.target_id)
+            elif relation.relation_type == "involves":
+                concept_anchors.setdefault(relation.source_id, set()).add(relation.target_id)
+
+        pruned: list[dict[str, Any]] = []
+        for derived_id, basis_ids in sorted(derived_bases.items()):
+            inherited_anchors: dict[str, list[str]] = {}
+            for basis_id in sorted(basis_ids):
+                for concept_id in sorted(concept_anchors.get(basis_id, set())):
+                    inherited_anchors.setdefault(concept_id, []).append(basis_id)
+            duplicate_concepts = concept_anchors.get(derived_id, set()) & inherited_anchors.keys()
+            # Never strip a derived Claim to zero anchors: retain one principal
+            # involves so the Claim stays retrievable without walking derived_from.
+            if duplicate_concepts and duplicate_concepts == concept_anchors.get(derived_id, set()):
+                duplicate_concepts = set(sorted(duplicate_concepts)[1:])
+            for concept_id in sorted(duplicate_concepts):
+                key = _relation_key(derived_id, "involves", concept_id)
+                if key not in relation_store:
+                    continue
+                del relation_store[key]
+                pruned.append(
+                    {
+                        "source_id": derived_id,
+                        "relation_type": "involves",
+                        "target_id": concept_id,
+                        "inherited_through": inherited_anchors[concept_id],
+                        "rule": "direct_derived_from_anchor_dominance",
+                    }
+                )
+        return pruned
+
     def _append_relation_evidence(self, relation: RelationRecord, evidence: Evidence) -> None:
         sig = (evidence.start_line, evidence.end_line, evidence.text.strip())
         existing = {(e.start_line, e.end_line, e.text.strip()) for e in relation.evidences}
@@ -4038,9 +4287,6 @@ class Extractor:
                 {"start_line": start, "end_line": end}
                 for start, end in state.get("experimental_chunk_spans", ())
             ],
-            "experimental_skip_pure_example_chunks": state.get(
-                "experimental_skip_pure_example_chunks", False
-            ),
             "max_retries": state.get("max_retries"),
             "request_timeout": state.get("request_timeout"),
             "request_delay": state.get("request_delay"),
@@ -4050,6 +4296,7 @@ class Extractor:
             "resume_enabled": state.get("resume"),
             "include_exercises": state.get("include_exercises"),
             "coverage_review_enabled": state.get("coverage_review", False),
+            "logical_form_review_enabled": state.get("logical_form_review", False),
         }
 
     def _api_summary(self, records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -4117,6 +4364,7 @@ class Extractor:
                 aliases=_canonical_aliases(node.name, node.aliases),
                 description=node.description,
                 claim_kind=node.claim_kind,
+                logical_form=node.logical_form,
                 evidence=sorted(node.evidence, key=lambda item: (item.start_line, item.end_line)),
             )
             for node in sorted(node_store.values(), key=lambda item: (item.type, item.name, item.id))
@@ -4194,6 +4442,11 @@ class Extractor:
             for decision in memory_decisions
             if decision.get("description_revision")
         ]
+        pruned_relations = [
+            relation
+            for summary in chunk_summaries
+            for relation in summary.get("pruned_relations", [])
+        ]
         diagnostics["audit"] = {
             "isolated_node_count": len(isolated_nodes),
             "isolated_node_ids": isolated_nodes,
@@ -4210,6 +4463,8 @@ class Extractor:
             ),
             "reuse_surface_review_count": len(reuse_surface_reviews),
             "description_revision_count": len(description_revisions),
+            "pruned_relation_count": len(pruned_relations),
+            "pruned_relations": pruned_relations,
         }
         diagnostics["title"] = self._title_from_lines(lines)
         return ExtractionResult(
@@ -4257,7 +4512,7 @@ class Extractor:
         return self.input_path.stem
 
     def _cache_dir(self) -> Path:
-        path = ROOT / "node_cache" / "semantic_layer_v1_6_0"
+        path = ROOT / "node_cache" / "semantic_layer_v1_7_0"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -4283,8 +4538,8 @@ class Extractor:
                 "text": chunk.text,
                 "context_after_text": chunk.context_after_text,
             },
-            "node_memory": [item.model_dump(mode="json") for item in node_memory],
-            "relation_memory": [item.model_dump(mode="json") for item in relation_memory],
+            "node_memory": [item.model_dump(mode="json", exclude_none=True) for item in node_memory],
+            "relation_memory": [item.model_dump(mode="json", exclude_none=True) for item in relation_memory],
             "source_latex_candidates": self._source_latex_candidates_for_chunk(chunk),
             "provider": state["provider"],
             "model": state["model"],
@@ -4397,14 +4652,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Every nonblank source line and teaching block must be covered exactly once."
         ),
     )
-    parser.add_argument(
-        "--experimental-skip-pure-example-chunks",
-        action="store_true",
-        help=(
-            "Experiment-only: audit but do not send chunks composed solely of example blocks. "
-            "Requires --experimental-chunk-spans."
-        ),
-    )
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--request-timeout", type=float, default=180)
     parser.add_argument("--max-tokens", type=int, default=12000)
@@ -4463,6 +4710,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "and never creates facts by rule."
         ),
     )
+    parser.add_argument(
+        "--logical-form-review",
+        action="store_true",
+        help=(
+            "Review only existing Claim nodes that lack logical_form but whose evidence "
+            "contains an explicit implication or condition signal."
+        ),
+    )
     parser.add_argument("--check-config", action="store_true", help="Check the selected provider configuration without calling the model.")
     return parser
 
@@ -4497,7 +4752,6 @@ def main() -> None:
         chunk_context_before_lines=args.chunk_context_before_lines,
         chunk_context_after_lines=args.chunk_context_after_lines,
         experimental_chunk_spans=args.experimental_chunk_spans,
-        experimental_skip_pure_example_chunks=args.experimental_skip_pure_example_chunks,
         max_retries=args.max_retries,
         request_timeout=args.request_timeout,
         max_tokens=args.max_tokens,
@@ -4518,6 +4772,7 @@ def main() -> None:
         embedding_memory=args.embedding_memory,
         seed_graph_path=args.seed_graph,
         coverage_review=args.coverage_review,
+        logical_form_review=args.logical_form_review,
     )
     try:
         result = extractor.run()

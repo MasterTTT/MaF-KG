@@ -53,6 +53,11 @@ Claim
     criterion, or identity.
 - Textbook labels (theorem, property, corollary) are discourse roles and do
   not override claim_kind.
+- logical_form is optional and valid only for Claim. When present, verify that
+  the evidence explicitly supports the listed premises, their joint AND
+  reading, the conclusion, the implies/iff operator, and any converse_status.
+  A proof-local implication or a converse inferred only from mathematical
+  knowledge is unsupported.
 
 Method
 - An explicitly taught, reusable process for a class of mathematical problems
@@ -91,21 +96,26 @@ Apply these checks to every item:
 3. claim_kind correctness: does the claim_kind match the mathematical function
    the source states? A criterion must decide a named judgment; an identity
    must be a canonical symbolic law; a corollary identity is still identity.
-4. Name accuracy: does the node name match the textbook's own expression of the
+4. Logical-form correctness: when logical_form is present, is every premise,
+   the conclusion, the implication direction, and the converse status explicit
+   in the evidence? For iff, does the evidence support both directions?
+5. Name accuracy: does the node name match the textbook's own expression of the
    idea? Flag renamed, coined, or textbook-numbered names (e.g. "定理1" as a
    node name). Chinese names for Chinese sources are expected. Math symbols
    count as part of the name, and LaTeX/Unicode spellings of the same symbol
    are equivalent.
-5. Over-splitting: is a single textbook result split into multiple Claim
+6. Over-splitting: is a single textbook result split into multiple Claim
    nodes, or one definition into several Concepts, without source support?
-6. Under-splitting: does one node bundle two independently taught results?
-7. Example/proof pollution: is a node or relation supported only by example
+7. Under-splitting: does one node bundle two independently taught results?
+8. Example/proof pollution: is a node or relation supported only by example
    content, proof steps, or exercise text?
-8. Relation validity: is the relation type among the seven allowed types, with
+9. Relation validity: is the relation type among the seven allowed types, with
    endpoints of the correct node types and the correct direction, supported by
    the cited evidence? special_case_of requires strict subsumption, not mere
-   set membership or shared features.
-9. Omission: is a clearly taught, reusable mathematical concept, claim, or
+   set membership or shared features. Reject redundant involves edges that
+   merely repeat concepts already supplied through a local derived_from
+   connection without adding a principal semantic anchor.
+10. Omission: is a clearly taught, reusable mathematical concept, claim, or
    method present in the evidence text but absent from the extraction? Report
    its textbook name in missed_nodes. Do not report mere mentions, roadmap
    sentences, local variables, or example-local objects.
