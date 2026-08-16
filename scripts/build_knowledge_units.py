@@ -1,131 +1,128 @@
 #!/usr/bin/env python
-"""Layer-2 KnowledgeUnit experiment (Chapter 1).
+"""Layer-2 KnowledgeUnit organizer (LLM, per v1 design).
 
-Deterministic MVP organizer + a small layer-1 merge demonstration.
+Single-agent KnowledgeUnitOrganizer: process one section at a time, feed the
+section's layer-1 nodes + heading hierarchy to the LLM, which outputs the
+KnowledgeUnits (central teaching objectives) with centers_on/contains.
 
-Pipeline:
-  1. layer-1 merge: collapse a curated list of granularity fragments
-     (redirect relations, drop the fragment node).
-  2. build the source outline: (section, subsection) -> line ranges, from the
-     chapter-1 merged markdown files.
-  3. assign each first-layer node to a (section, subsection) via its evidence
-     source_path + start_line.
-  4. one KnowledgeUnit per subsection: ``centers_on`` = definitional Concepts,
-     ``contains`` = the remaining nodes in that subsection.
-  5. ``depends_on`` between units, derived from derived_from edges crossing
-     unit boundaries.
-  6. semantic reference: each member records (id, type, name, description), so
-     a later re-extraction can re-resolve by semantic identity instead of the
-     content-hash id.
+Heading is only a *candidate* boundary; the organizer may merge sections,
+skip pure-structural headings, or split a coarse subsection.
+
+Engineering:
+  * stable KU ids: content-hash (sha1 of section + name), not sequential.
+  * model / source files / prompt are CLI-configurable (no hardcode).
+  * output records run metadata (model, prompt sha, config, token usage).
 
 Usage:
   python scripts/build_knowledge_units.py <kg.json> --out <ku.json>
+      [--model deepseek-v4-flash] [--src-files a.md,b.md] [--prompt file.txt]
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import sys
+import urllib.error
+import urllib.request
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 SCHEMA = "maf-kg.knowledge-unit.v1"
 
-# Source files that produced the Chapter-1 graph (merged, exercise-free).
-SRC_FILES = [
+DEFAULT_MODEL = "deepseek-v4-flash"
+DEFAULT_SRC_FILES = [
     "E:/MaF-KG/data/raw/第一章前五节_合并_无习题.md",
     "E:/MaF-KG/data/raw/第一章后五节_合并_无习题.md",
 ]
+JUDGE_ENDPOINTS = (
+    ("https://opencode.ai/zen/go/v1/chat/completions", "OPENCODE_API_KEY"),
+    ("https://api.deepseek.com/chat/completions", "DEEPSEEK_API_KEY"),
+)
 
-# Curated layer-1 granularity fragments: canonical name -> fragment names to absorb.
-FRAGMENT_MERGES: dict[str, list[str]] = {
-    "函数的增量": ["增量"],
-    "复合函数构成条件": ["多个函数顺次构成复合函数的条件"],
-}
+DEFAULT_SYSTEM_PROMPT = (
+    "你是高等数学知识图谱第二层（KnowledgeUnit）的组织器。\n"
+    "第二层不抽新语义，只把第一层 Concept/Claim/Method 按教材的『中心教学目标』组织成知识单元。\n"
+    "规则：\n"
+    "- 一个知识单元 = 一个可教学、可复习的中心教学目标（如『数列极限的定义』『收敛数列的性质』）。\n"
+    "- 标题只是候选边界，不是硬边界：你可以合并多个小节、跳过纯结构标题、或把一个粗小节拆成多个单元。\n"
+    "- 不要把两个不同的中心教学目标合并成一个单元（例如『单调有界准则』与『自然常数 e / 第二个重要极限』应拆成两个单元）。\n"
+    "- 每个单元选 centers_on：直接定义该单元中心目标的节点（定义性 Concept 或核心定理 Claim），选 1–3 个，宁缺毋滥。\n"
+    "- 其余支撑节点放 contains：该单元明确教授的支撑内容（性质、推论、方法、例子里的一般结论）。\n"
+    "- 一个节点可被多个单元 contains，但最多在一个单元做 centers_on。\n"
+    "- 只引用给出的节点别名（n1、n2…），不要新造节点，不要用『其他』单元：每个节点都要归入有明确教学目标的具体单元。\n"
+    '只输出 JSON：{"units":[{"name":"...","objective":"一句话中心教学目标","centers_on":["n2"],"contains":["n1","n5"]}]}'
+)
 
 
-# ---------------------------------------------------------------------------
-# layer-1 merge
-# ---------------------------------------------------------------------------
-
-def merge_fragments(data: dict) -> list[dict]:
-    """Merge curated fragments in place; return a log of what was merged."""
-    nodes = data["nodes"]
-    relations = data.setdefault("relations", [])
-    by_name: dict[str, str] = {n["name"]: n["id"] for n in nodes}
-    merged: list[dict] = []
-
-    for canon_name, frag_names in FRAGMENT_MERGES.items():
-        canon_id = by_name.get(canon_name)
-        if canon_id is None:
-            merged.append({"canonical": canon_name, "fragments": frag_names,
-                           "status": "canonical_missing"})
+def _llm_json(system: str, user: str, model: str) -> tuple[dict, dict]:
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+    errors: list[str] = []
+    for url, key_env in JUDGE_ENDPOINTS:
+        api_key = os.getenv(key_env)
+        if not api_key:
+            errors.append(f"{key_env} not set")
             continue
-        for frag_name in frag_names:
-            frag_id = by_name.get(frag_name)
-            if frag_id is None:
-                merged.append({"canonical": canon_name, "fragment": frag_name,
-                               "status": "fragment_missing"})
-                continue
-            # redirect relations: fragment -> canonical
-            for r in relations:
-                if r["source_id"] == frag_id:
-                    r["source_id"] = canon_id
-                if r["target_id"] == frag_id:
-                    r["target_id"] = canon_id
-            # drop the fragment node
-            nodes[:] = [n for n in nodes if n["id"] != frag_id]
-            merged.append({"canonical": canon_name, "fragment": frag_name,
-                           "status": "merged"})
-    return merged
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+            )
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                data = json.loads(resp.read())
+            usage = data.get("usage", {})
+            return json.loads(data["choices"][0]["message"]["content"]), usage
+        except (urllib.error.URLError, json.JSONDecodeError, KeyError) as exc:
+            errors.append(f"{url}: {exc}")
+            continue
+    raise SystemExit("LLM organizer failed on all endpoints: " + "; ".join(errors))
 
 
 # ---------------------------------------------------------------------------
-# source outline
+# outline: section -> {file, start, end, subs[]}
 # ---------------------------------------------------------------------------
 
 _SECTION_RE = re.compile(r"^#\s*第[一二三四五六七八九十]+节")
 _SUB_RE = re.compile(r"^#\s*[一二三四五六七八九十]+、")
 
 
-def build_outline() -> dict[str, list[dict]]:
-    """Return {section_name: [{'name': sub, 'start': L, 'end': R}, ...]}."""
-    outline: dict[str, list[dict]] = defaultdict(list)
-    for path in SRC_FILES:
+def build_outline(src_files: list[str]) -> dict[str, dict]:
+    outline: dict[str, dict] = {}
+    for path in src_files:
         lines = Path(path).read_text(encoding="utf-8").split("\n")
-        cur_section: str | None = None
-        cur_sub: dict | None = None
+        base = Path(path).name
+        cur: dict | None = None
         for i, line in enumerate(lines, start=1):
             if _SECTION_RE.match(line):
-                cur_section = re.sub(r"^#\s*", "", line.strip())
-                cur_sub = None
-            elif _SUB_RE.match(line) and cur_section is not None:
-                if cur_sub is not None:
-                    cur_sub["end"] = i - 1
-                cur_sub = {"name": re.sub(r"^#\s*", "", line.strip()), "start": i, "end": len(lines)}
-                outline[cur_section].append(cur_sub)
-            if cur_sub is not None:
-                cur_sub["end"] = i
-        if cur_section is not None and cur_sub is not None:
-            cur_sub["end"] = len(lines)
-    return dict(outline)
+                if cur is not None:
+                    cur["end"] = i - 1
+                name = re.sub(r"^#\s*", "", line.strip())
+                cur = {"file": base, "start": i, "end": len(lines), "subs": []}
+                outline[name] = cur
+            elif _SUB_RE.match(line) and cur is not None:
+                cur["subs"].append(re.sub(r"^#\s*", "", line.strip()))
+        if cur is not None:
+            cur["end"] = len(lines)
+    return outline
 
 
-def source_basename(node: dict) -> str:
-    for ev in node.get("evidence", []):
-        return Path(ev.get("source_path", "")).name
-    return ""
-
-
-def start_line_of(node: dict, basename: str) -> int | None:
-    for ev in node.get("evidence", []):
-        if Path(ev.get("source_path", "")).name == basename:
-            return ev.get("start_line")
-    return None
-
+# ---------------------------------------------------------------------------
+# section attribution (heading first, evidence-line fallback)
+# ---------------------------------------------------------------------------
 
 def heading_section(node: dict) -> str | None:
     for ev in node.get("evidence", []):
@@ -135,99 +132,59 @@ def heading_section(node: dict) -> str | None:
     return None
 
 
+def section_from_line(node: dict, outline: dict[str, dict]) -> str | None:
+    for ev in node.get("evidence", []):
+        base = Path(ev.get("source_path", "")).name
+        sl = ev.get("start_line")
+        if base and sl is not None:
+            for name, o in outline.items():
+                if o["file"] == base and o["start"] <= sl <= o["end"]:
+                    return name
+    return None
+
+
+def section_of(node: dict, outline: dict[str, dict]) -> str:
+    return heading_section(node) or section_from_line(node, outline) or "(未定位)"
+
+
 # ---------------------------------------------------------------------------
-# KnowledgeUnit building
+# organizer
 # ---------------------------------------------------------------------------
 
-def build_knowledge_units(data: dict) -> dict:
-    nodes = data["nodes"]
-    relations = data["relations"]
-    nid = {n["id"]: n for n in nodes}
-    outline = build_outline()
+def stable_ku_id(section: str, name: str) -> str:
+    h = hashlib.sha1(f"{section}|{name}".encode()).hexdigest()[:12]
+    return f"ku_{h}"
 
-    # source_path (normalized basename) -> which merged file
-    def section_key(ev_src: str) -> str:
-        for path in SRC_FILES:
-            if Path(path).name in ev_src:
-                return path
-        return ""
 
-    # assign each node to (section_name, subsection_name)
-    node_unit: dict[str, tuple[str, str]] = {}
-    for n in nodes:
-        base = source_basename(n)
-        sl = start_line_of(n, base) if base else None
-        section = heading_section(n)
-        sub = None
-        if base and sl is not None and section is not None:
-            for s in outline.get(section, []):
-                if s["start"] <= sl <= s["end"]:
-                    sub = s["name"]
-                    break
-        if section is None:
-            section = "(未定位)"
-        if sub is None:
-            # sections without 一、二、… subsections fall back to one unit per section
-            sub = section
-        node_unit[n["id"]] = (section, sub)
+def organize_section(section_name: str, nodes: list[dict], relations: list[dict],
+                     subs: list[str], system: str, model: str) -> tuple[list[dict], dict]:
+    ids = [n["id"] for n in nodes]
+    alias = {full: f"n{i+1}" for i, full in enumerate(ids)}
+    alias_to_id = {a: f for f, a in alias.items()}
 
-    # group nodes by unit
-    units: dict[tuple[str, str], list[str]] = defaultdict(list)
-    for node_id, (sec, sub) in node_unit.items():
-        units[(sec, sub)].append(node_id)
+    lines = []
+    for i, n in enumerate(nodes):
+        a = alias[n["id"]]
+        desc = (n.get("description", "") or "").replace("\n", " ")[:70]
+        rels = [
+            r["type"] + "->" + alias.get(r["target_id"], "?")
+            for r in relations if r["source_id"] == n["id"] and r["target_id"] in alias
+        ]
+        lines.append(f"{a} [{n['type']}] {n['name']} | {desc}" + (f" | 关系:{','.join(rels)}" if rels else ""))
 
-    # build KnowledgeUnits
-    kus: list[dict] = []
-    ku_id_by_key: dict[tuple[str, str], str] = {}
-    counter = 0
-    for (sec, sub), member_ids in sorted(units.items()):
-        counter += 1
-        ku_id = f"ku_{counter:03d}"
-        ku_id_by_key[(sec, sub)] = ku_id
-        centers = []
-        contains = []
-        for mid in member_ids:
-            n = nid[mid]
-            ref = {"id": mid, "type": n["type"], "name": n["name"],
-                   "description": (n.get("description", "") or "")[:80]}
-            # centers_on: definitional Concepts (evidence discourse_role == definition)
-            roles = {ev.get("discourse_role") for ev in n.get("evidence", [])}
-            if n["type"] == "Concept" and "definition" in roles:
-                centers.append(ref)
-            else:
-                contains.append(ref)
-        kus.append({
-            "id": ku_id,
-            "type": "KnowledgeUnit",
-            "name": sub if sub != "(未定位小节)" else f"{sec} / {sub}",
-            "aliases": [],
-            "description": f"{sec} · {sub}",
-            "evidence": [],
-        })
-        # attach centers_on/contains as top-level relations (v1 schema style)
-        kus[-1]["_centers_on"] = centers
-        kus[-1]["_contains"] = contains
+    user = (
+        f"节：{section_name}\n"
+        + (f"小节候选：{'、'.join(subs)}\n" if subs else "（本节无 一、二、… 小节标题）\n")
+        + "\n第一层节点（用别名引用）：\n" + "\n".join(lines)
+        + "\n\n请组织该节的 KnowledgeUnit。"
+    )
 
-    # depends_on: derived_from edges crossing units
-    depends: list[dict] = []
-    for r in relations:
-        if r["type"] != "derived_from":
-            continue
-        a = node_unit.get(r["source_id"])
-        b = node_unit.get(r["target_id"])
-        if a and b and a != b:
-            depends.append({"source_ku": ku_id_by_key.get(a, a),
-                            "target_ku": ku_id_by_key.get(b, b)})
-
-    return {
-        "schema_version": SCHEMA,
-        "source_graphs": ["第一章前五节_合并_semantic_v1_7_0", "第一章后五节_合并_semantic_v1_7_0"],
-        "knowledge_units": kus,
-        "relations_centers_on": [],
-        "relations_contains": [],
-        "relations_depends_on": depends,
-        "diagnostics": {"unit_count": len(kus), "note": "centers_on/contains stored inline per unit as _centers_on/_contains"},
-    }
+    resp, usage = _llm_json(system, user, model)
+    units = resp.get("units", [])
+    for u in units:
+        u["centers_on"] = [alias_to_id[a] for a in u.get("centers_on", []) if a in alias_to_id]
+        u["contains"] = [alias_to_id[a] for a in u.get("contains", []) if a in alias_to_id]
+    return units, usage
 
 
 # ---------------------------------------------------------------------------
@@ -237,29 +194,106 @@ def build_knowledge_units(data: dict) -> dict:
 def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
-    ap = argparse.ArgumentParser(description="Layer-2 KnowledgeUnit experiment (Chapter 1).")
+    ap = argparse.ArgumentParser(description="Layer-2 KnowledgeUnit organizer (LLM).")
     ap.add_argument("input", help="Chapter-1 KG JSON.")
     ap.add_argument("--out", required=True, help="Output KnowledgeUnit JSON.")
+    ap.add_argument("--model", default=DEFAULT_MODEL, help="Judge model name.")
+    ap.add_argument("--src-files", default=",".join(DEFAULT_SRC_FILES),
+                    help="Comma-separated source markdown files.")
+    ap.add_argument("--prompt", help="Optional system prompt file (defaults to built-in).")
+    ap.add_argument("--sections", help="Comma list of section names to process (default: all).")
     args = ap.parse_args()
 
+    src_files = [s.strip() for s in args.src_files.split(",") if s.strip()]
+    system = Path(args.prompt).read_text(encoding="utf-8") if args.prompt else DEFAULT_SYSTEM_PROMPT
+    prompt_sha = hashlib.sha256(system.encode()).hexdigest()
+
     data = json.loads(Path(args.input).read_text(encoding="utf-8"))
-    print(f"input: {len(data['nodes'])} nodes / {len(data['relations'])} relations")
+    nodes = data["nodes"]
+    relations = data["relations"]
+    nid = {n["id"]: n for n in nodes}
+    outline = build_outline(src_files)
 
-    merge_log = merge_fragments(data)
-    print(f"layer-1 merge: {len([m for m in merge_log if m['status']=='merged'])} merged")
-    for m in merge_log:
-        print(f"  [{m['status']}] {m.get('canonical','')} <- {m.get('fragment','') or m.get('fragments','')}")
-    print(f"after merge: {len(data['nodes'])} nodes / {len(data['relations'])} relations")
+    by_section: dict[str, list[dict]] = defaultdict(list)
+    for n in nodes:
+        by_section[section_of(n, outline)].append(n)
 
-    ku = build_knowledge_units(data)
-    Path(args.out).write_text(json.dumps(ku, ensure_ascii=False, indent=2), encoding="utf-8")
+    only = set(x.strip() for x in (args.sections or "").split(",")) if args.sections else None
+    sections = [s for s in only if s in by_section] if only else [s for s in by_section]
 
-    print(f"\nKnowledgeUnits: {ku['diagnostics']['unit_count']}")
-    for k in ku["knowledge_units"]:
-        c = len(k["_centers_on"])
-        s = len(k["_contains"])
-        print(f"  {k['id']}  centers={c} contains={s}  {k['name']}")
-    print(f"depends_on edges: {len(ku['relations_depends_on'])}")
+    kus: list[dict] = []
+    diagnostics: dict[str, Any] = {"uncovered": {}, "invalid_refs": [], "multi_center": []}
+    usage_totals: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    request_count = 0
+
+    for sec in sections:
+        sec_nodes = by_section[sec]
+        subs = outline.get(sec, {}).get("subs", [])
+        units, usage = organize_section(sec, sec_nodes, relations, subs, system, args.model)
+        request_count += 1
+        for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            usage_totals[k] += int(usage.get(k, 0))
+        sec_ids = {n["id"] for n in sec_nodes}
+
+        center_seen: dict[str, str] = {}
+        assigned: set[str] = set()
+        for u in units:
+            centers = [c for c in u.get("centers_on", []) if c in sec_ids]
+            contains = [c for c in u.get("contains", []) if c in sec_ids]
+            invalid = [c for c in u.get("centers_on", []) + u.get("contains", []) if c not in sec_ids]
+            if invalid:
+                diagnostics["invalid_refs"].extend(f"{u.get('name')}:{x}" for x in invalid)
+            for c in centers:
+                if c in center_seen:
+                    diagnostics["multi_center"].append(f"{c} 在 {center_seen[c]} 和 {u.get('name')} 都做中心")
+                center_seen[c] = u.get("name", "")
+            assigned |= set(centers) | set(contains)
+            ku_id = stable_ku_id(sec, u.get("name", ""))
+            # KU evidence: carry the section outline (file + line range) as a synthetic evidence
+            ev = []
+            o = outline.get(sec)
+            if o:
+                ev = [{"source_path": o["file"], "start_line": o["start"], "end_line": o["end"],
+                       "text": f"{sec}（{u.get('name','')}）"}]
+            kus.append({
+                "id": ku_id,
+                "type": "KnowledgeUnit",
+                "name": u.get("name", ""),
+                "aliases": [],
+                "description": u.get("objective", ""),
+                "evidence": ev,
+                "centers_on": [{"id": c, "type": nid[c]["type"], "name": nid[c]["name"],
+                                "description": (nid[c].get("description", "") or "")[:80]} for c in centers],
+                "contains": [{"id": c, "type": nid[c]["type"], "name": nid[c]["name"],
+                              "description": (nid[c].get("description", "") or "")[:80]} for c in contains],
+            })
+        uncovered = sec_ids - assigned
+        if uncovered:
+            diagnostics["uncovered"][sec] = [nid[c]["name"] for c in uncovered]
+
+    out = {
+        "schema_version": SCHEMA,
+        "source_graphs": [args.input],
+        "knowledge_units": kus,
+        "diagnostics": diagnostics,
+        "run": {
+            "model": args.model,
+            "prompt_sha256": prompt_sha,
+            "endpoints": [url for url, _ in JUDGE_ENDPOINTS],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "src_files": src_files,
+            "request_count": request_count,
+            "usage_totals": usage_totals,
+        },
+    }
+    Path(args.out).write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"KnowledgeUnits: {len(kus)}")
+    for k in kus:
+        print(f"  {k['id']}  centers={len(k['centers_on'])} contains={len(k['contains'])}  {k['name']}")
+    print(f"uncovered: {sum(len(v) for v in diagnostics['uncovered'].values())}  "
+          f"invalid: {len(diagnostics['invalid_refs'])}  multi-center: {len(diagnostics['multi_center'])}")
+    print(f"tokens: {usage_totals['total_tokens']}  requests: {request_count}")
     print(f"wrote -> {args.out}")
     return 0
 
