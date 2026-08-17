@@ -34,6 +34,18 @@
 | "其他"单元 | prompt 明令每个节点归入具体单元；0 uncovered |
 | KU 无教材证据 | 每个单元带节级证据（源文件 + 行号范围） |
 
+## 2.1 闸门加固（2026-08-18，v5 起）
+
+把"记录型"校验升级为"失败型"（输出仍落盘以便检查，失败可 `--sections` 定点重跑）：
+
+| 隐患 | 修复 |
+|---|---|
+| 跨节节点归属漂移（幽灵节根因：函数的增量被归入第二章"第一节 导数概念"） | 节归属改为**优先同章 evidence**（`--chapter 第一章`）；dry 模拟确认仅 1 节点归属变化 |
+| 跨节重复中心检测失效（`center_seen` 每节重置） | `center_seen` **全局化**，跨节 multi-center 直接 FAIL |
+| 无效引用后单元变 0 中心、静默产出空壳 | **0 中心单元 FAIL**（记录单元与节） |
+| uncovered 只记录不提醒 | **uncovered > 0 即 FAIL**，提示带 `--sections` 重跑 |
+| 边界扫描靠临时命令 | 工具化：`scripts/scan_ku_boundaries.py`（SMALL / SINGLETON / CENTER-HEAVY） |
+
 ## 3. 结果（v3）
 
 - **44 个 KnowledgeUnit**（覆盖全部 10 节），校验全绿：uncovered 0、invalid 0、multi-center 0。

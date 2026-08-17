@@ -114,6 +114,25 @@ def main() -> int:
                 "dropped_nodes": list(fx["node_ids"]),
                 "rationale": fx["rationale"],
             })
+        elif fx["action"] == "demote_center":
+            # move a node from centers_on to contains of the SAME unit
+            # (used when the global multi-center gate fires: the node must
+            # keep only one centers_on home, demote the secondary occurrence).
+            nodes = [next((m for m in src.get("centers_on", []) if m["id"] == nid), None)
+                     for nid in fx["node_ids"]]
+            if any(m is None for m in nodes):
+                raise SystemExit(f"{fx['id']}: node(s) {fx['node_ids']} not in centers_on of {src['id']}")
+            src["centers_on"] = [m for m in src.get("centers_on", []) if m["id"] not in fx["node_ids"]]
+            existing = {m["id"] for m in src.get("contains", [])}
+            for m in nodes:
+                if m["id"] not in existing:
+                    src["contains"].append(m)
+            applied.append({
+                "id": fx["id"], "action": fx["action"],
+                "source_unit": f"{src['id']} ({src['name']})",
+                "demoted_nodes": list(fx["node_ids"]),
+                "rationale": fx["rationale"],
+            })
         else:
             raise SystemExit(f"{fx['id']}: unknown action {fx['action']}")
 
@@ -123,7 +142,8 @@ def main() -> int:
 
     Path(args.out).write_text(json.dumps(ku, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print(f"units before: 44  after: {len(units)}")
+    units_removed = sum(1 for a in applied if a["action"] == "merge_unit")
+    print(f"units before: {len(units) + units_removed}  after: {len(units)}")
     for a in applied:
         print(f"  {a['id']} {a['action']}: {a.get('source_unit')}"
               + (f" -> {a.get('target_unit')}" if a.get("target_unit") else ""))
