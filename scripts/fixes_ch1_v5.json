@@ -1,0 +1,10 @@
+[
+  {
+    "id": "FIX-2-v5",
+    "action": "drop_contains_node",
+    "source_unit_id": "ku_ff901ace6a0e",
+    "target_unit_id": null,
+    "node_ids": ["claim_a_x_n_在_x_时的极限_e42de005804849"],
+    "rationale": "例题级局部结论，非独立教学目标；且为有理分式极限公式 m=0 特例。"
+  }
+]
