@@ -58,14 +58,23 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Apply reviewed boundary fixes to KU JSON.")
     ap.add_argument("input", help="KnowledgeUnit JSON (v3).")
     ap.add_argument("--out", required=True, help="Output fixed KnowledgeUnit JSON.")
+    ap.add_argument("--fix-list", default=None,
+                    help="Optional JSON file with the fix list (same entry schema as the built-in "
+                         "FIXES). Defaults to the built-in list.")
     args = ap.parse_args()
 
     ku = json.loads(Path(args.input).read_text(encoding="utf-8"))
     units = ku["knowledge_units"]
     by_id = {u["id"]: u for u in units}
 
+    fix_list = FIXES
+    if args.fix_list:
+        fix_list = json.loads(Path(args.fix_list).read_text(encoding="utf-8"))
+        if not isinstance(fix_list, list):
+            raise SystemExit("--fix-list must be a JSON array of fix objects")
+
     applied: list[dict] = []
-    for fx in FIXES:
+    for fx in fix_list:
         src = by_id.get(fx["source_unit_id"])
         if src is None:
             raise SystemExit(f"{fx['id']}: source unit {fx['source_unit_id']} not found")

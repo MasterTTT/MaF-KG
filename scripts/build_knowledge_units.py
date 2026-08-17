@@ -121,15 +121,26 @@ def build_outline(src_files: list[str]) -> dict[str, dict]:
 
 
 # ---------------------------------------------------------------------------
-# section attribution (heading first, evidence-line fallback)
+# section attribution (same-chapter evidence preference, line fallback)
 # ---------------------------------------------------------------------------
 
-def heading_section(node: dict) -> str | None:
+def heading_section(node: dict, chapter: str) -> str | None:
+    """Pick the section from evidence heading_path, preferring same-chapter evidence.
+
+    A node may carry evidence from several files (e.g. a concept re-used by a
+    later chapter). Blindly taking the *first* evidence puts the node into a
+    phantom section of another chapter (observed bug: 函数的增量 landed in a
+    one-node "第一节 导数概念" bucket). Prefer evidence whose heading_path[0]
+    starts with the chapter being processed; fall back to first usable evidence.
+    """
+    usable: list[str] = []
     for ev in node.get("evidence", []):
         hp = ev.get("heading_path", [])
         if len(hp) > 1:
-            return hp[1]
-    return None
+            if hp[0] and chapter and hp[0].startswith(chapter):
+                return hp[1]
+            usable.append(hp[1])
+    return usable[0] if usable else None
 
 
 def section_from_line(node: dict, outline: dict[str, dict]) -> str | None:
@@ -143,8 +154,8 @@ def section_from_line(node: dict, outline: dict[str, dict]) -> str | None:
     return None
 
 
-def section_of(node: dict, outline: dict[str, dict]) -> str:
-    return heading_section(node) or section_from_line(node, outline) or "(未定位)"
+def section_of(node: dict, outline: dict[str, dict], chapter: str) -> str:
+    return heading_section(node, chapter) or section_from_line(node, outline) or "(未定位)"
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +213,8 @@ def main() -> int:
                     help="Comma-separated source markdown files.")
     ap.add_argument("--prompt", help="Optional system prompt file (defaults to built-in).")
     ap.add_argument("--sections", help="Comma list of section names to process (default: all).")
+    ap.add_argument("--chapter", default="第一章",
+                    help="Chapter prefix for evidence-based section attribution (default: 第一章).")
     args = ap.parse_args()
 
     src_files = [s.strip() for s in args.src_files.split(",") if s.strip()]
@@ -216,15 +229,16 @@ def main() -> int:
 
     by_section: dict[str, list[dict]] = defaultdict(list)
     for n in nodes:
-        by_section[section_of(n, outline)].append(n)
+        by_section[section_of(n, outline, args.chapter)].append(n)
 
     only = set(x.strip() for x in (args.sections or "").split(",")) if args.sections else None
     sections = [s for s in only if s in by_section] if only else [s for s in by_section]
 
     kus: list[dict] = []
-    diagnostics: dict[str, Any] = {"uncovered": {}, "invalid_refs": [], "multi_center": []}
+    diagnostics: dict[str, Any] = {"uncovered": {}, "invalid_refs": [], "multi_center": [], "zero_center": []}
     usage_totals: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     request_count = 0
+    center_seen: dict[str, str] = {}  # GLOBAL across sections: a node may be centers_on in at most one unit
 
     for sec in sections:
         sec_nodes = by_section[sec]
@@ -235,18 +249,20 @@ def main() -> int:
             usage_totals[k] += int(usage.get(k, 0))
         sec_ids = {n["id"] for n in sec_nodes}
 
-        center_seen: dict[str, str] = {}
         assigned: set[str] = set()
         for u in units:
             centers = [c for c in u.get("centers_on", []) if c in sec_ids]
             contains = [c for c in u.get("contains", []) if c in sec_ids]
             invalid = [c for c in u.get("centers_on", []) + u.get("contains", []) if c not in sec_ids]
             if invalid:
-                diagnostics["invalid_refs"].extend(f"{u.get('name')}:{x}" for x in invalid)
+                diagnostics["invalid_refs"].extend(f"{sec}:{u.get('name')}:{x}" for x in invalid)
+            if not centers:
+                diagnostics["zero_center"].append(f"{sec}:{u.get('name')}")
             for c in centers:
                 if c in center_seen:
-                    diagnostics["multi_center"].append(f"{c} 在 {center_seen[c]} 和 {u.get('name')} 都做中心")
-                center_seen[c] = u.get("name", "")
+                    diagnostics["multi_center"].append(
+                        f"{c} 在 {center_seen[c]} 和 {sec}:{u.get('name')} 都做中心")
+                center_seen[c] = f"{sec}:{u.get('name')}"
             assigned |= set(centers) | set(contains)
             ku_id = stable_ku_id(sec, u.get("name", ""))
             # KU evidence: carry the section outline (file + line range) as a synthetic evidence
@@ -292,9 +308,29 @@ def main() -> int:
     for k in kus:
         print(f"  {k['id']}  centers={len(k['centers_on'])} contains={len(k['contains'])}  {k['name']}")
     print(f"uncovered: {sum(len(v) for v in diagnostics['uncovered'].values())}  "
-          f"invalid: {len(diagnostics['invalid_refs'])}  multi-center: {len(diagnostics['multi_center'])}")
+          f"invalid: {len(diagnostics['invalid_refs'])}  "
+          f"multi-center: {len(diagnostics['multi_center'])}  "
+          f"zero-center: {len(diagnostics['zero_center'])}")
     print(f"tokens: {usage_totals['total_tokens']}  requests: {request_count}")
     print(f"wrote -> {args.out}")
+
+    # Fail-loud gates: structural violations must not pass silently (the output
+    # is still written above so the failure can be inspected and retried with
+    # --sections). Coverage gaps are surfaced the same way instead of being
+    # recorded-and-forgotten.
+    problems: list[str] = []
+    for sec, nodes in sorted(diagnostics["uncovered"].items()):
+        problems.append(f"  uncovered in {sec}: {', '.join(nodes)}")
+    for entry in diagnostics["multi_center"]:
+        problems.append(f"  multi-center: {entry}")
+    for entry in diagnostics["zero_center"]:
+        problems.append(f"  zero-center unit: {entry}")
+    if problems:
+        print("FAIL (structural violations):", file=sys.stderr)
+        print("\n".join(problems), file=sys.stderr)
+        print("Retry hint: re-run the failing section(s) with --sections after reviewing the output.",
+              file=sys.stderr)
+        return 1
     return 0
 
 
