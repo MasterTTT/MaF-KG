@@ -1,8 +1,10 @@
 # 实验记录：第二层 KnowledgeUnit（第一章）
 
-日期：2026-08-15（session 内）；2026-08-18 边界修正 v4
-脚本：`scripts/build_knowledge_units.py`、`scripts/apply_ku_boundary_fixes.py`、`scripts/build_ku_depends.py`
+日期：2026-08-15（session 内）；2026-08-18 边界修正 v4；2026-08-18 depends_on LLM 语义审核版 v4
+脚本：`scripts/build_knowledge_units.py`、`scripts/apply_ku_boundary_fixes.py`、`scripts/build_ku_depends.py`、
+`scripts/build_ku_depends_candidates.py`、`scripts/review_ku_depends_llm.py`、`scripts/finalize_ku_depends.py`
 最终产出：`KG/第一章_knowledge_units_v3.json`（44 个）→ `KG/第一章_knowledge_units_v4.json`（43 个，边界修正版）
+→ `KG/第一章_knowledge_units_v6.json`（46 个，当前基线）；`KG/第一章_ku_depends_v4.json`（45 条，LLM 语义审核版）
 
 ## 0. 六项决策（本实验据此执行）
 
@@ -52,7 +54,9 @@
 - 幽灵节消失（10 请求 = 10 节）；`函数的增量` 已**天然**落回 `函数的连续性` contains（此前靠人工 FIX-1 修进去）。
 - v3（44）→ v5（46）与 v3→v4 的"修正"不同：v5 是**在修复后代码上的全新生成**，第一节多出 `函数的四则运算`、`分段函数与常见特殊函数` 等更细的单元；第四节把 `无穷小定义` 与 `f(x)=A+α` 合并为一个两中心单元（同为"无穷小与极限关系"目标）。
 
-## 4. depends_on（v3，随 v6 单元对齐）
+## 4. depends_on（v3 确定性版 → v4 LLM 语义审核版）
+
+### 4.1 v3：确定性 derived_from 聚合（历史）
 
 脚本 `scripts/build_ku_depends.py`：把跨单元的 `derived_from` 边聚合为 KU 间 `depends_on`。v6（46 单元）产出 **5 条**：
 
@@ -62,7 +66,57 @@
 - `复合函数的连续性与极限换序 → 复合函数的极限运算法则`
 - `自然常数e与第二个重要极限 → 复合函数的极限运算法则`
 
-v2（8 条，v4 单元对齐）→ v3（5 条）：v5 单元重组后部分跨单元 `derived_from` 边落入同单元，故聚合边收敛。确定性版仅覆盖 `derived_from` 表达的前置（稀疏）；LLM 语义审核版留作后续。
+v2（8 条，v4 单元对齐）→ v3（5 条）：v5 单元重组后部分跨单元 `derived_from` 边落入同单元，故聚合边收敛。
+**注意：v3 的 5 条中 2 条是 node→KU 映射 bug 的假边**（见 §4.3），v4 起不再以 v3 文件为基线，改为从图上重算。
+
+### 4.2 v4：LLM 语义审核版（P2 流程，2026-08-18 会话）
+
+三阶段全脚本化，对应交接文档 §12 P2：
+
+1. **候选生成** `scripts/build_ku_depends_candidates.py`：
+   - 强信号：跨 KU 的 `derived_from` / `defined_in_terms_of` / `uses`；
+   - 弱信号：`involves` 仅在被涉及节点是目标 KU 的 center、且目标非基础桶（映射、函数的基本概念）时保留；
+   - 两跳链候选：A→B→C 全跨 KU（derived_from/defined_in_terms_of/uses），仅当该对无直接信号，
+     用于覆盖「连续性→(单侧极限)→函数极限定义」这类图上只有间接路的先修；
+   - `special_case_of` 不参与（从属关系 ≠ 先修）。产出 **56 候选**。
+2. **LLM 审核** `scripts/review_ku_depends_llm.py` + `prompts/ku_depends_review.txt`：
+   deepseek-v4-flash 分批（15/批 → 4 请求，56378 tokens）逐候选输出 accept/strength/reason。
+   判定纪律：中心教学目标层面的先修语义；拒绝「仅内容相关 / 被讨论对象 / 教材章节顺序 /
+   方向倒置的 involves / 通用基础锚 / special_case 投影」。
+   → **45 接受 / 11 拒绝**；11 条拒绝人工复核全部合理（含 2 处方向倒置、3 处"被讨论对象"、
+   3 处伪锚「无穷小→数列」链断裂、2 处反例/主题相关）。
+3. **人工复核 + 终版** `scripts/finalize_ku_depends.py`：
+   - 基线改为**从图上按修复后映射重算**跨 KU `derived_from`（9 条，全部被 LLM 接受）；
+   - 解析真实 L1 关系 id 写入 `derived_from_edges`（9 条全为合法 `relation_*` id）；
+   - 终版 `KG/第一章_ku_depends_v4.json`：**45 条**，Neo4j 兼容（`source_ku/target_ku/count/derived_from_edges`），
+     全部边源/目标引用落在 46 个单元内，无 count=0；逐边 audit（basis/strength/reason/evidence/chain）在 `audit.edges`。
+
+新增的有价值依赖（v3 无）：**函数的连续性 → 函数极限的定义**（目标案例）、函数的间断点及其分类 → 极限定义/单侧极限、
+单侧极限 → 函数极限定义、自然常数e → 单调有界/夹逼准则、第一个重要极限 → 夹逼准则、
+连续函数的和差积商的连续性 → 极限四则（v3 假边的正确形态）、初等函数 → 基本初等函数、
+反双曲→双曲→基本初等函数、函数的基本概念 → 映射 等。
+
+### 4.3 本会话工程修正（三个 bug）
+
+1. **node→KU 映射中心优先**：一个节点可在一个 KU 做 center 又做多个 KU 的 contains 成员；
+   旧实现 contains 后写覆盖 center 导致归属漂移。修复为 center 先写、contains 只 `setdefault`。
+   直接影响候选正确性（如 `复合函数的极限运算法则→初等函数` 实为 `→复合函数`）。
+2. **v3 基线 2 条映射假边**（旧 `build_ku_depends.py` 受同一 bug 影响）：
+   - `初等函数连续性→极限的四则运算法则` 实应为 `连续函数的和、差、积、商的连续性→极限的四则运算法则`
+     （底层边 `连续函数的和、差、积、商仍在同一点连续` 的归属被覆盖）；
+   - `初等函数连续性→复合函数的连续性与极限换序` 的底层边在修复后映射下为**同 KU 内部边**，本不应成 KU 依赖。
+   两处均由 v4 的按图重算基线自动纠正。
+3. **审核批次 index 按批重置**：批次内 `enumerate` 从 0 起导致 verdicts 与候选错位（v1 次运行作废）；
+   修复为全局下标并重跑（v2 审核文件 `KG/第一章_ku_depends_review_v2.json`）。
+
+### 4.4 与 v3 对照
+
+| 版本 | 边数 | 说明 |
+|---|---|---|
+| v1 | 8 | v4 单元对齐（历史，确定性） |
+| v2 | 8 | v4 单元对齐（历史，确定性） |
+| v3 | 5 | v6 单元对齐，确定性 derived_from 聚合（含 2 条映射假边） |
+| **v4** | **45** | 修复映射后按图重算基线（9）+ LLM 语义审核新增（36），逐边有 evidence 与判据 |
 
 ## 5. 边界扫描（人工审核）
 
@@ -95,7 +149,8 @@ v3 的 44 个单元中 12 个 ≤2 节点，大多**合理**（单定义/单定�
 
 ## 7. 已知局限与下一步
 
-1. **depends_on 为确定性稀疏版**（v3：5 条）；LLM 语义审核版待做（补 连续性→极限定义 这类非 derived_from 前置）。
+1. ~~depends_on 确定性稀疏版~~ **已完成 LLM 语义审核版**（v4：45 条，§4.2）；后续可在 Neo4j 内复核全图，
+   并按需人工 Gold 审核依赖边（`audit.edges` 已带逐边证据与判据）。
 2. ~~边界人工审核~~ **已完成**（v4 修正，v5 天然归位，仅 FIX-2 类例题节点待 LLM 审核统一处理）。
 3. **layer-1 粒度合并仅演示**（§1 决策 3）：完整语义碎片目录仍需语义合并 agent。
 4. **未人工订单元 Gold**：正式冻结前需 Gold。

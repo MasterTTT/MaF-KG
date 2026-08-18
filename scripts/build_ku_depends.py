@@ -6,6 +6,14 @@ endpoints land in different KnowledgeUnits, emit depends_on(source_ku ->
 target_ku). Deduplicated per unit pair, with the underlying edge ids kept for
 audit. LLM review is intentionally a separate later step.
 
+NOTE: node->KU mapping uses center priority (a node may be a center in one KU
+and a contains member in others; contains must not overwrite centers).
+
+Since 2026-08-18 the LLM-reviewed pipeline supersedes this file for new
+experiments: scripts/build_ku_depends_candidates.py + review_ku_depends_llm.py
++ finalize_ku_depends.py (v4). Files named *_v1/v2/v3 are historical outputs of
+this deterministic pass.
+
 Usage:
   python scripts/build_ku_depends.py <ku.json> <graph.json> --out <deps.json>
 """
@@ -36,8 +44,11 @@ def main() -> int:
 
     node_to_ku: dict[str, str] = {}
     for u in ku["knowledge_units"]:
-        for m in u.get("centers_on", []) + u.get("contains", []):
+        for m in u.get("centers_on", []):
             node_to_ku[m["id"]] = u["id"]
+    for u in ku["knowledge_units"]:
+        for m in u.get("contains", []):
+            node_to_ku.setdefault(m["id"], u["id"])
 
     deps: dict[tuple[str, str], list[str]] = defaultdict(list)
     for r in graph.get("relations", []):
