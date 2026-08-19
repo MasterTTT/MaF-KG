@@ -1,0 +1,28 @@
+[
+  {
+    "id": "FIX-3",
+    "action": "move_member",
+    "source_unit_id": "ku_624b6d0ee58d",
+    "target_unit_id": "ku_0510ab5ddfc3",
+    "node_ids": ["claim_收敛数列必有界_d457ca15043e6b"],
+    "promote_center": true,
+    "rationale": "Gold F1：收敛数列必有界 是第二节定理2（收敛数列的有界性，前五节 L1131-1151）的核心结论，应为 收敛数列的性质 的中心；当前因证据锚在第六节引用处（L312）被组织进 单调有界准则 contains。"
+  },
+  {
+    "id": "FIX-4",
+    "action": "move_member",
+    "source_unit_id": "ku_624b6d0ee58d",
+    "target_unit_id": "ku_0510ab5ddfc3",
+    "node_ids": ["claim_收敛数列的有界性_b7eabadc89d7a4"],
+    "promote_center": false,
+    "rationale": "Gold F1/F2：收敛数列的有界性 与 收敛数列必有界 语义重复（同一结论不同文字），移至 收敛数列的性质 contains；L1 级去重留待 合并目录 处理。"
+  },
+  {
+    "id": "FIX-5",
+    "action": "add_member",
+    "target_unit_id": "ku_e2e26b8f466b",
+    "node_ids": ["claim_常用的等价无穷小关系式_db2f78b8f9c096"],
+    "promote_center": false,
+    "rationale": "Gold F4：常用的等价无穷小关系式（sin x~x 等，第七节例2 L428-432）应属 等价无穷小及其代换 的支撑成员；原组织进 初等函数在其定义区间内的连续性 contains（证据锚第九节 L836），现多成员复用加入本单元。"
+  }
+]

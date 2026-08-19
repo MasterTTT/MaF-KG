@@ -13,11 +13,24 @@ Fix list is the outcome of the manual boundary review of
          from ku_c1f225464a1b 有理分式函数在无穷远处的极限 contains
          Rationale: 例题级局部结论，非独立教学目标；且是有理分式极限公式 m=0 特例。
 
+Actions (v4/v7 扩展):
+  merge_unit       : merge a whole unit into another unit (nodes -> target.contains).
+  drop_contains_node: drop nodes from a unit's contains.
+  demote_center    : move nodes from centers_on to contains of the SAME unit.
+  move_member      : move nodes between units (contains/centers), optional
+                     promote_center to make them centers of the target unit
+                     (used for Gold-driven 归属漂移 fixes, e.g. 收敛数列必有界
+                     -> 收敛数列的性质.center).
+  add_member       : add nodes to a target unit's contains/centers without
+                     removing them anywhere else (multi-member reuse; the node
+                     must already exist in some unit of the JSON).
+
 Fails loudly if expected ids are missing, so the fix list can never silently
 drift from the data. Every applied fix is recorded in the output `fixes` array.
 
 Usage:
   python scripts/apply_ku_boundary_fixes.py <ku.json> --out <ku-fixed.json>
+      [--fix-list fixes.json]
 """
 
 from __future__ import annotations
@@ -75,10 +88,10 @@ def main() -> int:
 
     applied: list[dict] = []
     for fx in fix_list:
-        src = by_id.get(fx["source_unit_id"])
-        if src is None:
+        src = by_id.get(fx["source_unit_id"]) if fx.get("source_unit_id") else None
+        if fx.get("source_unit_id") and src is None:
             raise SystemExit(f"{fx['id']}: source unit {fx['source_unit_id']} not found")
-        tgt = by_id.get(fx["target_unit_id"]) if fx["target_unit_id"] else None
+        tgt = by_id.get(fx["target_unit_id"]) if fx.get("target_unit_id") else None
 
         moving: list[dict] = []
         if fx["action"] == "merge_unit":
@@ -131,6 +144,56 @@ def main() -> int:
                 "id": fx["id"], "action": fx["action"],
                 "source_unit": f"{src['id']} ({src['name']})",
                 "demoted_nodes": list(fx["node_ids"]),
+                "rationale": fx["rationale"],
+            })
+        elif fx["action"] == "move_member":
+            # move nodes from one unit to another (contains or centers,
+            # promote_center=True makes them centers of the target).
+            if tgt is None:
+                raise SystemExit(f"{fx['id']}: target unit {fx['target_unit_id']} not found")
+            moving = []
+            for nid in fx["node_ids"]:
+                node = next((m for m in src.get("centers_on", []) + src.get("contains", [])
+                             if m["id"] == nid), None)
+                if node is None:
+                    raise SystemExit(f"{fx['id']}: node {nid} not in {src['id']}")
+                moving.append(node)
+            src["centers_on"] = [m for m in src.get("centers_on", []) if m["id"] not in fx["node_ids"]]
+            src["contains"] = [m for m in src.get("contains", []) if m["id"] not in fx["node_ids"]]
+            existing = {m["id"] for m in tgt.get("centers_on", []) + tgt.get("contains", [])}
+            for node in moving:
+                if node["id"] in existing:
+                    continue
+                (tgt["centers_on"] if fx.get("promote_center") else tgt["contains"]).append(node)
+            applied.append({
+                "id": fx["id"], "action": fx["action"],
+                "source_unit": f"{src['id']} ({src['name']})",
+                "target_unit": f"{tgt['id']} ({tgt['name']})",
+                "moved_nodes": list(fx["node_ids"]),
+                "promote_center": bool(fx.get("promote_center")),
+                "rationale": fx["rationale"],
+            })
+        elif fx["action"] == "add_member":
+            # add nodes to one unit without removing them elsewhere (the node
+            # must already exist in some unit of this JSON).
+            if tgt is None:
+                raise SystemExit(f"{fx['id']}: target unit {fx['target_unit_id']} not found")
+            added = []
+            for nid in fx["node_ids"]:
+                node = next((m for u in units if u["id"] != tgt["id"]
+                             for m in u.get("centers_on", []) + u.get("contains", [])
+                             if m["id"] == nid), None)
+                if node is None:
+                    raise SystemExit(f"{fx['id']}: node {nid} not found in any unit")
+                existing = {m["id"] for m in tgt.get("centers_on", []) + tgt.get("contains", [])}
+                if nid not in existing:
+                    (tgt["centers_on"] if fx.get("promote_center") else tgt["contains"]).append(node)
+                    added.append(nid)
+            applied.append({
+                "id": fx["id"], "action": fx["action"],
+                "target_unit": f"{tgt['id']} ({tgt['name']})",
+                "added_nodes": added,
+                "promote_center": bool(fx.get("promote_center")),
                 "rationale": fx["rationale"],
             })
         else:

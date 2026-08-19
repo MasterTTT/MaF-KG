@@ -1,10 +1,12 @@
 # 实验记录：第二层 KnowledgeUnit（第一章）
 
-日期：2026-08-15（session 内）；2026-08-18 边界修正 v4；2026-08-18 depends_on LLM 语义审核版 v4
+日期：2026-08-15（session 内）；2026-08-18 边界修正 v4；2026-08-18 depends_on LLM 语义审核版 v4；2026-08-18 KU Gold v1 + 边界修正 v7
 脚本：`scripts/build_knowledge_units.py`、`scripts/apply_ku_boundary_fixes.py`、`scripts/build_ku_depends.py`、
-`scripts/build_ku_depends_candidates.py`、`scripts/review_ku_depends_llm.py`、`scripts/finalize_ku_depends.py`
+`scripts/build_ku_depends_candidates.py`、`scripts/review_ku_depends_llm.py`、`scripts/finalize_ku_depends.py`、
+`scripts/check_ku_gold.py`
 最终产出：`KG/第一章_knowledge_units_v3.json`（44 个）→ `KG/第一章_knowledge_units_v4.json`（43 个，边界修正版）
-→ `KG/第一章_knowledge_units_v6.json`（46 个，当前基线）；`KG/第一章_ku_depends_v4.json`（45 条，LLM 语义审核版）
+→ `KG/第一章_knowledge_units_v6.json`（46 个）→ **`KG/第一章_knowledge_units_v7.json`（46 个，Gold 对齐版，当前基线）**；
+`KG/第一章_ku_depends_v4.json`（45 条，LLM 语义审核版，v7 下仍全部有效）
 
 ## 0. 六项决策（本实验据此执行）
 
@@ -132,6 +134,35 @@ v3 的 44 个单元中 12 个 ≤2 节点，大多**合理**（单定义/单定�
 - **v4（v3 + FIX-1/FIX-2）**：`函数的增量` 并入 `函数的连续性`（44→43）；`a/x^n` 从 contains 移除。
 - **v6（v5 + FIX-2-v5）**：闸门修复后 `函数的增量` 无需再修（天然归位）；`a/x^n` 仍被 organizer 放进 contains，按同一理由再次 drop（46 单元不变，fix-list 见 `scripts/fixes_ch1_v5.json`）。
 - v5 边界扫描（`scan_ku_boundaries.py`）：10 个 SMALL 全部合理，4 个 SINGLETON（柯西准则 / 函数的四则运算 / 连续函数四则运算 / 归结原则）为正当单目标单元，保留。
+
+## 5.2 KU Gold v1 与边界修正 v7（2026-08-18）
+
+**Gold**：`evaluation/gold/ku_gold_ch1_v1.json`（46 单元：名称 / 中心目标 / expected centers / 必含节点 / 
+禁止合并对 14 组，全部带教材出处行号）；检查器 `scripts/check_ku_gold.py`（Gold FAIL = 期望中心缺失 / 必含缺失 / 
+禁止合并对缺失；WARN = 额外中心，供人工确认）。
+
+**复核重点项**（交接文档 §12 P1）：单调有界准则/e、数列极限性质、等价无穷小、函数极限保序性全部核对——
+保序性确系第五节定理5（前五节 L2025-2028），当前归 `极限的四则运算法则` contains **正确**；
+`收敛数列的性质` 的中心缺"收敛数列必有界"（发现 F1）；`等价无穷小及其代换` 缺"常用的等价无穷小关系式"（发现 F4）。
+
+**v6→v7 修正**（fix-list `scripts/fixes_ch1_v6.json`，应用 `apply_ku_boundary_fixes.py` 新增 `move_member` / `add_member` 动作）：
+
+| Fix | 动作 | 内容 | 依据 |
+|---|---|---|---|
+| FIX-3 | move_member(promote) | `收敛数列必有界` → `收敛数列的性质`.centers | 第二节定理2（前五节 L1131-1151）；证据被锚在第六节引用处（L312） |
+| FIX-4 | move_member | `收敛数列的有界性` → `收敛数列的性质`.contains | 同上（与 FIX-3 语义重复，L1 级去重留待合并目录） |
+| FIX-5 | add_member | `常用的等价无穷小关系式` → `等价无穷小及其代换`.contains | 第七节例2（后五节 L428-432）；原组织进 [31]（证据锚第九节 L836），现多成员复用 |
+
+**v7 验证**：数量 46、闸门全绿（zero-center 0 / multi-center 0）；**Gold 检查 FAIL 0 / WARN 0**；
+边界扫描 11 SMALL（10 与 v5 相同 + 收敛数列的性质 4 centers 转 CENTER-HEAVY，系定理1-4 全面覆盖，可辩护）；
+**depends v4 在 v7 下全部有效**（候选对集合不变，新增对恰为已拒绝的 11 对，无未审核新对）。
+
+**Gold findings F1–F5**（随 Gold 文件保存）：
+- F1 [high] 收敛数列必有界/有界性 归属漂移（已由 FIX-3/4 修复）；
+- F2 [medium] L1 重复抽取：收敛数列必有界 vs 收敛数列的有界性 同结论两节点 → 属 L1 合并目录（剩余工作 #3）；
+- F3 [info] 夹逼准则 contains 复用两个重要极限命题节点（合规）；
+- F4 [medium] 常用的等价无穷小关系式 归属漂移（已由 FIX-5 修复）；
+- F5 [info] 换元法求复合函数的极限 保持单一归属 [29]：多成员复用会引入跨 KU uses 边需重审 depends，暂缓。
 
 ## 6. Neo4j 导入（2026-08-18）
 
