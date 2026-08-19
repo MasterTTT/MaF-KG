@@ -72,7 +72,7 @@ def _llm_json(system: str, user: str, model: str) -> tuple[dict, dict]:
     }
     errors: list[str] = []
     for url, key_env in JUDGE_ENDPOINTS:
-        api_key = os.getenv(key_env)
+        api_key = (os.getenv(key_env) or "").strip()  # tolerate CRLF-tainted env files
         if not api_key:
             errors.append(f"{key_env} not set")
             continue

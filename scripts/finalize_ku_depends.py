@@ -7,13 +7,14 @@ deterministic derived_from edges with the *fixed* node->KU mapping, resolves
 real L1 relation ids for derived_from evidence, and writes the final
 Neo4j-compatible depends_on JSON.
 
-Final edge set = deterministic derived_from baseline (fixed mapping)
+Final edge set = prior depends (--prior-depends, carried unconditionally)
+                 + deterministic derived_from baseline (recomputed from graph)
                  + candidates accepted by the judge (+human approvals)
                  - candidates dropped by human rejections.
 
 Usage:
   python scripts/finalize_ku_depends.py <review.json> <graph.json> <ku.json>
-      --out <final.json> [--overrides overrides.json]
+      --out <final.json> [--overrides overrides.json] [--prior-depends prior.json]
 """
 
 from __future__ import annotations
@@ -47,6 +48,8 @@ def main() -> int:
     ap.add_argument("ku", help="KnowledgeUnit JSON (v6).")
     ap.add_argument("--out", required=True, help="Final depends_on JSON.")
     ap.add_argument("--overrides", help="Optional JSON: {\"approve\":[idx],\"reject\":[idx]}.")
+    ap.add_argument("--prior-depends", help="Optional prior depends JSON carried forward unconditionally "
+                                            "(e.g. the chapter-1 v4 edges when extending to chapter 2).")
     args = ap.parse_args()
 
     review = json.loads(Path(args.review).read_text(encoding="utf-8"))
@@ -97,6 +100,22 @@ def main() -> int:
 
     edges: dict[tuple[str, str], dict[str, Any]] = {}
     dropped_baseline: list[dict[str, Any]] = []
+
+    # prior edges carried forward unconditionally (e.g. chapter-1 v4 when extending)
+    if args.prior_depends:
+        prior = json.loads(Path(args.prior_depends).read_text(encoding="utf-8"))
+        for e in prior.get("depends_on", []):
+            key = (e["source_ku"], e["target_ku"])
+            if key not in edges:
+                edges[key] = {
+                    "source_ku": key[0], "target_ku": key[1],
+                    "source_name": ku_index.get(key[0], key[0]),
+                    "target_name": ku_index.get(key[1], key[1]),
+                    "count": e.get("count", 1),
+                    "derived_from_edges": e.get("derived_from_edges"),
+                    "audit": {"basis": "prior", "judge": None, "evidence": [],
+                              "chain_via": [], "prior_from": str(Path(args.prior_depends).resolve())},
+                }
 
     accepted = [i for i, c in enumerate(review["candidates"])
                 if final_accept(i) and (i in verdict_by_idx or i in overrides["approve"])]
