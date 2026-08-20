@@ -4075,19 +4075,25 @@ class Extractor:
     def _sanitize_evidence(self, evidence: EvidenceRef, chunk: DocumentChunk, source_path: str, raw_lines: list[str]) -> Evidence:
         start = evidence.start_line
         end = evidence.end_line
-        evidence_line_numbers = {
+        # The model only ever sees the chunk span PLUS its context window
+        # (both rendered with line-number prefixes), so an evidence endpoint in
+        # the context window is a legitimate grounding on text the model saw,
+        # not a hallucination. Accept endpoints from chunk.text and
+        # context_before/after; log a warning when they fall outside the span.
+        visible_line_numbers = {
             int(match.group(1))
-            for line in chunk.text.splitlines()
+            for text in (chunk.text, chunk.context_before_text, chunk.context_after_text)
+            for line in text.splitlines()
             if (match := re.match(r"^([0-9]+):", line))
         }
-        if start not in evidence_line_numbers or end not in evidence_line_numbers:
+        if start not in visible_line_numbers or end not in visible_line_numbers or end < start:
             raise ValueError(
                 f"Evidence endpoints are not visible source lines in {chunk.id}: L{start}-L{end}"
             )
-        if start < chunk.start_line or end > chunk.end_line or end < start:
-            raise ValueError(
-                f"Evidence lines outside current chunk {chunk.id}: L{start}-L{end}, "
-                f"expected L{chunk.start_line}-L{chunk.end_line}"
+        if start < chunk.start_line or end > chunk.end_line:
+            self._log(
+                f"[Extractor] evidence L{start}-L{end} in {chunk.id} falls in the context "
+                f"window (outside span L{chunk.start_line}-L{chunk.end_line}); accepted"
             )
         source_excerpt = _text_snippet(raw_lines, start, end)
         if not source_excerpt.strip():
