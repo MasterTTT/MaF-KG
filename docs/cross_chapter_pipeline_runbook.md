@@ -47,8 +47,13 @@ python -X utf8 scripts\verify_graph.py <第X章 抽取图> --seed <上一章 rep
 python -X utf8 scripts\build_knowledge_units.py <第X章 repaired 图> `
   --out "E:\MaF-KG\KG\第X章_knowledge_units_v1.json" `
   --model deepseek-v4-flash --chapter 第X章 `
+  --sections "第一节 ...,第二节 ..." `
   --src-files "E:\MaF-KG\data\raw\第X章_全章_无习题.md"
 ```
+
+> 必须传 `--sections` 限定为本章节：输入是累计图（含前几章 seed 节点），不限定会把
+> 前几章节点也组织一遍（第四章曾误出 105 单元含旧章内容）。Ch3 之后每章都加。
+> 注意 `--sections` 与 `--src-files` 里的章节名必须逐字一致（见节标题）。
 
 ## 4. depends（确定性 v1，与第三章同模式）
 
