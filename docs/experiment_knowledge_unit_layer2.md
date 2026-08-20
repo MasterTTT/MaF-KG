@@ -281,6 +281,17 @@ v3 的 44 个单元中 12 个 ≤2 节点，大多**合理**（单定义/单定�
   `牛顿-莱布尼茨公式→积分上限的函数及其导数`。
 - **合并**：→ `第一二三四五章_knowledge_units_merged.json`（**111 KU**）/ `第一二三四五章_ku_depends_merged.json`（98）。
 
+## 6.7 第六章增量全链路（2026-08-20 夜间）
+
+- **切片**：`第六章_全章_无习题.md`（782 行 / 3 节 / 去 3 习题块）。
+- **L1 抽取**（seed=第五章 repaired 546/892）：**574 节点（+28 新增）/ 920 关系 / 425 表达式**，22 chunk，identity_conflict 0。
+- **Verifier**（`--seed 第五章 repaired --judge --apply`）：命中多判 keep（"极限节点不存在/已 defined_in_terms_of"），
+  **0 补边**；3 项人工待定（等速直线运动的路程公式、微分形式不变性、隐函数的显化）。Ch6 repaired == raw。
+- **L2**（`--sections` 3 节）→ **第六章 KU v1：9 单元**（定积分的元素法 / 直角与极坐标平面图形面积 /
+  旋转体体积 / 平行截面立体体积 / 平面曲线弧长 / 变力作功 / 水压力 / 引力），全闸门绿，3 请求。
+- **depends（第六章 v1）**：确定性 0 条（应用公式多靠 uses/defined_in_terms_of，语义 depends 待 LLM 审核版）。
+- **合并**：→ `第一二三四五六章_knowledge_units_merged.json`（**120 KU**）/ `第一二三四五六章_ku_depends_merged.json`（98）。
+
 ## 7. 已知局限与下一步
 
 1. ~~depends_on 确定性稀疏版~~ **已完成 LLM 语义审核版**（v4：45 条，§4.2；两章合并 v1：82 条，§6.2；
