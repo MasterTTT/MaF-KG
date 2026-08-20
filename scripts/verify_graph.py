@@ -408,11 +408,20 @@ def apply_decisions(data: dict, g: Graph, decisions: list[dict]) -> tuple[list[d
         name = dec.get("name", "")
         detail = dec.get("detail", "")
         if verdict == "add_relation":
-            if "->" not in detail:
-                skipped.append({"node_id": node_id, "name": name, "verdict": verdict,
-                                "detail": detail, "reason": "detail missing '->'"})
-                continue
-            rel_type, target_name = (part.strip() for part in detail.split("->", 1))
+            # Accept both "rel_type -> target" and "rel_type: target" detail
+            # forms (and an optional "add_relation:" prefix) — the judge prompt
+            # asks for the colon form, the parser previously only read arrows,
+            # which silently dropped every decision.
+            detail_stripped = detail.strip()
+            if "->" in detail_stripped:
+                rel_type, target_name = (part.strip() for part in detail_stripped.split("->", 1))
+            else:
+                match = re.match(r"^(?:add_relation\s*[:：]\s*)?([a-z_]+)\s*[:：]\s*(.+)$", detail_stripped)
+                if not match:
+                    skipped.append({"node_id": node_id, "name": name, "verdict": verdict,
+                                    "detail": detail, "reason": "detail not parseable (rel_type: target)"})
+                    continue
+                rel_type, target_name = match.group(1).strip(), match.group(2).strip()
             target_id = resolve_target(g, target_name)
             if target_id is None:
                 skipped.append({"node_id": node_id, "name": name, "verdict": verdict,
