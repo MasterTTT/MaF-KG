@@ -241,6 +241,31 @@ v3 的 44 个单元中 12 个 ≤2 节点，大多**合理**（单定义/单定�
 
 - 跨章依赖抽查正确：求导法则→函数四则运算/导数的定义、反函数求导法则→反函数等。
 
+## 6.5 第四章增量全链路（2026-08-20 夜间）
+
+- **切片**：`build_chapter_noex.py` 从 `高等数学上册第七版(同济大学数学系).md`（**完整 7 章版**，20639 行）切
+  `第四章_全章_无习题.md`（1423 行 / 5 节 / 去 6 习题块）。注：`高等数学上册第七版.md`（410KB）只到第四章开头，
+  四章起必须用完整版 903KB 文件。
+- **L1 抽取**（`--provider deepseek`，seed=第三章 repaired 485/804）：**485 节点（418 seed + 67 新增）/ 790 关系 / 358 表达式**，49 chunk。
+  两次抽取器固化（见下）后才跑通。
+- **抽取器新固化（本章踩坑，均已提交）**：
+  1. 证据端点允许落在 chunk 上下文窗口（`_sanitize_evidence`；模型引用 context 行"倒代换 L867"不再硬失败，打印 warning）——commit `3847bc7c`；
+  2. 同名 create 自动转 reuse 并记入 identity_conflicts 审计（模型重排列积分表行，如 q2 余切函数的积分公式、q6/q9 x²−a² 同名）——commit `310db043`；
+  3. reuse 的 claim_kind 标签差异改为保留 canonical + 记日志（两处：phase1 校验与 phase2 `_merge_reuse_action`）——commit `8c23df72`、`a71d251b`。
+- **Verifier**（`--seed 第三章 repaired --judge --apply`）：44 命中（新 14）→ LLM 判定 → **应用 14 条补边**
+  （涉及 10 / special_case_of 2 / defined_in_terms_of 1 / uses 1；如 积分曲线→原函数、万能代换→三角函数、
+  递推公式→不定积分等）。**修复一个 apply 解析 bug**：judge 的 detail 是冒号式 `involves: 不定积分`，而 apply
+  只认 `->`，首轮 12 条全被 skip（repaired==raw）；已兼容两种格式（commit `3ff8ea07`）。产出
+  **`第四章_全章_semantic_v1_7_0_deepseek_flash_high_repaired.json`（485 节点 / 804 关系）**。
+- **L2 组织**：**必须 `--sections` 限定本章节**（输入是累计图，不带会把前三章 seed 节点也组织一遍——首次误出
+  105 单元含旧章，重跑后 10 单元，全闸门绿）。**第四章 KU v1：10 单元**（原函数与不定积分概念 / 基本积分表 /
+  不定积分性质 / 第一类换元法 / 第二类换元法 / 分部积分法 / 有理函数的积分 / 万能代换 / 简单根式代换 / 积分表的使用），
+  5 请求 / 24343 tokens。
+- **depends（第四章 v1）**：确定性 `build_ku_depends.py` **0 条**（无跨单元 derived_from 边；本章主要靠
+  uses/defined_in_terms_of，语义 depends 需 LLM 审核版）。
+- **合并**：`merge_ku_layers.py` → `第一二三四章_knowledge_units_merged.json`（**99 KU**）/ `第一二三四章_ku_depends_merged.json`（95，Ch4 未增）。
+- **遗留**：第四章 depends LLM 审核版待做；第四章 KU 无 Gold；`光的折射定律` verifier 判 involves 正弦函数（与旧建议 drop 冲突，待人工复核）。
+
 ## 7. 已知局限与下一步
 
 1. ~~depends_on 确定性稀疏版~~ **已完成 LLM 语义审核版**（v4：45 条，§4.2；两章合并 v1：82 条，§6.2；
