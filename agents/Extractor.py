@@ -3944,10 +3944,19 @@ class Extractor:
                 if candidate is None:
                     raise ValueError(f"unknown latex_candidate_id: {candidate_id}")
                 line_no, latex = candidate
-                if line_no < evidence.start_line or line_no > evidence.end_line:
+                # Consistent with _sanitize_evidence: the model only grounds on lines
+                # it saw (chunk span + context window). Require the latex candidate line
+                # to be in that visible set rather than strictly inside a (possibly
+                # context-window) evidence span.
+                visible_line_numbers = {
+                    int(match.group(1))
+                    for text in (chunk.text, chunk.context_before_text, chunk.context_after_text)
+                    for line in text.splitlines()
+                    if (match := re.match(r"^([0-9]+):", line))
+                }
+                if line_no not in visible_line_numbers:
                     raise ValueError(
-                        f"LaTeX candidate {candidate_id} at L{line_no} is outside evidence "
-                        f"L{evidence.start_line}-L{evidence.end_line}"
+                        f"LaTeX candidate {candidate_id} at L{line_no} is not visible in {chunk.id}"
                     )
             except ValueError as exc:
                 fail("expression", expression_ref, str(exc))
