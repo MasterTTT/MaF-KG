@@ -3739,10 +3739,25 @@ class Extractor:
                     if existing.type != "Claim":
                         fail("node_action", ref_id, f"claim_kind supplied for non-Claim reuse: {existing.id}")
                     if existing.claim_kind is not None and action.claim_kind != existing.claim_kind:
-                        fail(
-                            "node_action",
-                            ref_id,
-                            f"claim_kind mismatch for {existing.id}: {action.claim_kind} != {existing.claim_kind}",
+                        # A reuse's claim_kind is a coarse re-tag the model attached on top of
+                        # an explicit reuse intent; the canonical first-created tag wins. Keep
+                        # the existing tag and record the mismatch instead of aborting the run.
+                        conflict_notes.append(
+                            {
+                                "conflict_kind": "reuse_claim_kind_mismatch",
+                                "action": "keep_existing",
+                                "ref_id": ref_id,
+                                "node_id": existing_id,
+                                "name": existing.name,
+                                "existing_claim_kind": existing.claim_kind,
+                                "proposed_claim_kind": action.claim_kind,
+                                "start_line": evidence.start_line,
+                                "end_line": evidence.end_line,
+                            }
+                        )
+                        self._log(
+                            f"[Extractor] reuse_claim_kind_mismatch {ref_id} for {existing_id}: "
+                            f"keep canonical {existing.claim_kind} (model suggested {action.claim_kind})"
                         )
                 if action.logical_form is not None and existing.type != "Claim":
                     fail("node_action", ref_id, f"logical_form supplied for non-Claim reuse: {existing.id}")
