@@ -3691,6 +3691,7 @@ class Extractor:
         """
         planned_nodes: list[dict[str, Any]] = []
         ref_to_final: dict[str, str] = {}
+        conflict_notes: list[dict[str, Any]] = []
 
         def fail(kind: str, ref: str, reason: str, details: dict[str, Any] | None = None) -> None:
             raise ChunkMergeError(chunk.id, kind, ref, reason, details)
@@ -3765,23 +3766,28 @@ class Extractor:
                         else "memory_retrieval_miss"
                     )
                     if conflict_kind == "model_decision_conflict" and not self.semantic_dedupe:
-                        fail(
-                            "node_action",
-                            ref_id,
-                            f"{conflict_kind}: canonical {node_type} name already exists as {final_id}: "
-                            f"{sanitized.name}",
+                        # The model re-created a node it was explicitly shown; exact-name
+                        # identity is deterministic and safe to collapse, so auto-reuse it
+                        # and record the conflict in the audit instead of aborting the whole
+                        # chapter run (formula/table re-listings trigger this benignly).
+                        conflict_notes.append(
                             {
                                 "conflict_kind": conflict_kind,
-                                "proposed_type": node_type,
-                                "proposed_name": sanitized.name,
-                                "existing_id": final_id,
+                                "action": "auto_reused",
+                                "ref_id": ref_id,
+                                "node_id": final_id,
+                                "type": node_type,
+                                "name": sanitized.name,
                                 "existing_type": node_store[final_id].type,
-                                "existing_name": node_store[final_id].name,
-                                "existing_was_in_node_memory": final_id in allowed_existing_ids,
+                                "proposed_description": sanitized.description,
+                                "existing_description": node_store[final_id].description,
                                 "start_line": evidence.start_line,
                                 "end_line": evidence.end_line,
-                                "reason": action.reason.strip(),
-                            },
+                            }
+                        )
+                        self._log(
+                            f"[Extractor] conflict_auto_reuse {ref_id}: {sanitized.name} "
+                            f"-> existing {final_id} in {chunk.id}"
                         )
                     planned_nodes.append(
                         {
@@ -3796,23 +3802,39 @@ class Extractor:
                     ref_to_final[ref_id] = final_id
                     continue
                 if final_id in planned_node_type:
-                    fail(
-                        "node_action",
-                        ref_id,
-                        f"duplicate canonical node created twice in this chunk: {final_id}",
+                    # Two create actions in this same chunk collapse to the same canonical
+                    # name (e.g. re-listed integral-table rows). Auto-reuse the later one
+                    # onto the earlier planned node and record it.
+                    conflict_notes.append(
                         {
                             "conflict_kind": "model_decision_conflict",
-                            "proposed_type": node_type,
-                            "proposed_name": sanitized.name,
-                            "existing_id": final_id,
+                            "action": "auto_reused_within_chunk",
+                            "ref_id": ref_id,
+                            "node_id": final_id,
+                            "type": node_type,
+                            "name": sanitized.name,
                             "existing_type": planned_node_type[final_id],
                             "existing_name": planned_node_name[final_id],
-                            "existing_was_in_node_memory": False,
                             "start_line": evidence.start_line,
                             "end_line": evidence.end_line,
-                            "reason": action.reason.strip(),
-                        },
+                        }
                     )
+                    self._log(
+                        f"[Extractor] conflict_auto_reuse_within_chunk {ref_id}: "
+                        f"{sanitized.name} -> {final_id} in {chunk.id}"
+                    )
+                    planned_nodes.append(
+                        {
+                            "action": action,
+                            "kind": "reuse",
+                            "existing_id": final_id,
+                            "evidence": evidence,
+                            "extra_aliases": [sanitized.name],
+                            "semantic_merged": True,
+                        }
+                    )
+                    ref_to_final[ref_id] = final_id
+                    continue
                 if self.semantic_dedupe and node_type == "Concept":
                     duplicate_id = self._semantic_duplicate_id(
                         sanitized.name, sanitized.description, node_store
@@ -4043,8 +4065,8 @@ class Extractor:
             "total_expressions": len(expression_store),
             "skipped_item_count": 0,
             "skipped_items": [],
-            "identity_conflict_count": 0,
-            "identity_conflicts": [],
+            "identity_conflict_count": len(conflict_notes),
+            "identity_conflicts": conflict_notes,
             "pending_node_count": len(pending_refs),
             "pending_node_refs": pending_refs,
             "decisions": decisions,
