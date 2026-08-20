@@ -266,6 +266,21 @@ v3 的 44 个单元中 12 个 ≤2 节点，大多**合理**（单定义/单定�
 - **合并**：`merge_ku_layers.py` → `第一二三四章_knowledge_units_merged.json`（**99 KU**）/ `第一二三四章_ku_depends_merged.json`（95，Ch4 未增）。
 - **遗留**：第四章 depends LLM 审核版待做；第四章 KU 无 Gold；`光的折射定律` verifier 判 involves 正弦函数（与旧建议 drop 冲突，待人工复核）。
 
+## 6.6 第五章增量全链路（2026-08-20 夜间）
+
+- **切片**：`第五章_全章_无习题.md`（1552 行 / 4 节 / 去 6 习题块）。
+- **L1 抽取**（seed=第四章 repaired 485/804）：**546 节点（+61 新增）/ 892 关系 / 408 表达式**，44 chunk。
+  途中踩 2 个模型关系类型笔误（chunk8 `involves` Claim→Claim、chunk24 `special_case_of` Concept→Claim），
+  重试即越（模型自纠正）；抽取器 claim_kind 容错补齐第二处（`a71d251b`）后 chunk23 才过。
+- **Verifier**（`--seed 第四章 repaired --judge --apply`）：39 命中（新 14）→ **LLM 全部判 keep、0 补边**
+  （多数理由：图内无独立"极限"节点，不臆造 `defined_in_terms_of→极限`；或已有 special_case_of/继承 involves）。
+  2 项 retag（微分形式不变性→Claim、隐函数的显化→Method）仍归人工待定。Ch5 repaired == raw（546/892）。
+- **L2**：`--sections` 限定 4 节 → **第五章 KU v1：12 单元**（定积分的定义 / 基本性质 / 中值定理 /
+  积分上限函数 / 牛顿-莱布尼茨公式 / 换元法 / 分部积分法 / 两种反常积分 / 近似计算等），全闸门绿，4 请求。
+- **depends（第五章 v1：3 条）**：`无界函数的反常积分→牛顿-莱布尼茨公式`、`无穷限反常积分→牛顿-莱布尼茨公式`、
+  `牛顿-莱布尼茨公式→积分上限的函数及其导数`。
+- **合并**：→ `第一二三四五章_knowledge_units_merged.json`（**111 KU**）/ `第一二三四五章_ku_depends_merged.json`（98）。
+
 ## 7. 已知局限与下一步
 
 1. ~~depends_on 确定性稀疏版~~ **已完成 LLM 语义审核版**（v4：45 条，§4.2；两章合并 v1：82 条，§6.2；
