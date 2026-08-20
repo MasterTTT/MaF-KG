@@ -4168,10 +4168,14 @@ class Extractor:
             if existing.type != "Claim":
                 raise ValueError(f"claim_kind supplied for non-Claim reuse: {existing.id}")
             if existing.claim_kind is not None and action.claim_kind != existing.claim_kind:
-                raise ValueError(
-                    f"claim_kind mismatch for {existing.id}: {action.claim_kind} != {existing.claim_kind}"
+                # A reuse over an explicit canonical node must not be aborted for a coarse
+                # claim_kind re-tag; keep the canonical tag and log the difference.
+                self._log(
+                    f"[Extractor] reuse_claim_kind_keep {existing.id}: keep {existing.claim_kind} "
+                    f"(model suggested {action.claim_kind})"
                 )
-            existing.claim_kind = action.claim_kind
+            else:
+                existing.claim_kind = action.claim_kind
 
         logical_form_action = "kept"
         logical_form_revision: dict[str, Any] | None = None
