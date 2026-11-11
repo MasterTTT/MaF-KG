@@ -1,0 +1,584 @@
+{
+  "review_live01": [
+    {
+      "label": "P01",
+      "method": "direct",
+      "section": "ch5_s4",
+      "repeat": 2,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "dsh",
+      "nodes": {
+        "full": 7,
+        "missing": 2
+      },
+      "relations": {
+        "full": 3
+      },
+      "support": {
+        "yes": 13
+      },
+      "prediction_sha256": "a255ce6e05dcd1fc788020dffca73d819257c1abc555d187f98715bb6987efd1",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P02",
+      "method": "edc",
+      "section": "ch5_s4",
+      "repeat": 1,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "dsh",
+      "nodes": {
+        "full": 2,
+        "partial": 5,
+        "missing": 2
+      },
+      "relations": {
+        "partial": 3
+      },
+      "support": {
+        "yes": 11,
+        "partial": 4
+      },
+      "prediction_sha256": "73a690afb30e6109aa61940f6a164832e03ec86aac845675602a4dc55670105b",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P03",
+      "method": "edc",
+      "section": "ch3_s2",
+      "repeat": 2,
+      "status": "failed",
+      "failure_kind": "no_output"
+    },
+    {
+      "label": "P04",
+      "method": "itext2kg",
+      "section": "ch5_s4",
+      "repeat": 2,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "dsh",
+      "nodes": {
+        "partial": 1,
+        "name_only": 3,
+        "missing": 5
+      },
+      "relations": {
+        "partial": 1,
+        "missing": 2
+      },
+      "support": {
+        "yes": 10,
+        "partial": 2,
+        "no": 2
+      },
+      "prediction_sha256": "f8cb5319b2ca56e3fc3f5143d1d32f74fdd2bab3a5a45a4a7dbabdded8bc98ae",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P05",
+      "method": "direct",
+      "section": "ch3_s2",
+      "repeat": 2,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "dsh",
+      "nodes": {
+        "full": 3,
+        "partial": 1,
+        "missing": 2
+      },
+      "relations": {
+        "full": 2
+      },
+      "support": {
+        "yes": 10,
+        "partial": 1
+      },
+      "prediction_sha256": "5546ae36a375f889384b8cfea95499104a6053ce1f6945b036ba3f7008a2526f",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P06",
+      "method": "maf",
+      "section": "ch5_s4",
+      "repeat": 2,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "dsh",
+      "nodes": {
+        "full": 4,
+        "partial": 2,
+        "missing": 3
+      },
+      "relations": {
+        "full": 1,
+        "partial": 2
+      },
+      "support": {
+        "yes": 10
+      },
+      "prediction_sha256": "3dc16b9719d247e528427cd4c1043b589a597b6b3aab6b73c3038d28132eb456",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P07",
+      "method": "direct",
+      "section": "ch7_s4",
+      "repeat": 2,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "dsh",
+      "nodes": {
+        "full": 8,
+        "partial": 1
+      },
+      "relations": {
+        "full": 2,
+        "partial": 3
+      },
+      "support": {
+        "yes": 16
+      },
+      "prediction_sha256": "613502eed37b518294bf6d794b6705fafce8b68bc954d017b0127922602b0ec2",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P08",
+      "method": "direct",
+      "section": "ch3_s2",
+      "repeat": 1,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "luna",
+      "nodes": {
+        "full": 3,
+        "partial": 1,
+        "missing": 2
+      },
+      "relations": {
+        "full": 2
+      },
+      "support": {
+        "yes": 14
+      },
+      "prediction_sha256": "9122e4c7d4d28b300eff1102f8778356489d3584c22e4585f1da0a54091c2d8f",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P09",
+      "method": "maf",
+      "section": "ch7_s4",
+      "repeat": 2,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "dsh",
+      "nodes": {
+        "full": 8,
+        "partial": 1
+      },
+      "relations": {
+        "full": 3,
+        "partial": 2
+      },
+      "support": {
+        "yes": 16
+      },
+      "prediction_sha256": "2b84d973abb61ce0decd8cc08b205637bcaa28768ae814940654c795d694f140",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P10",
+      "method": "itext2kg",
+      "section": "ch7_s4",
+      "repeat": 2,
+      "status": "failed",
+      "failure_kind": null
+    },
+    {
+      "label": "P11",
+      "method": "edc",
+      "section": "ch5_s4",
+      "repeat": 2,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "dsh",
+      "nodes": {
+        "full": 5,
+        "partial": 3,
+        "missing": 1
+      },
+      "relations": {
+        "partial": 3
+      },
+      "support": {
+        "yes": 33
+      },
+      "prediction_sha256": "7a230d17dd05bf0938bfa5c45d146769db199fa6c84cb550276ad8122fea3d86",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P12",
+      "method": "maf",
+      "section": "ch3_s2",
+      "repeat": 1,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "luna",
+      "nodes": {
+        "full": 4,
+        "partial": 1,
+        "missing": 1
+      },
+      "relations": {
+        "full": 1,
+        "partial": 1
+      },
+      "support": {
+        "yes": 23
+      },
+      "prediction_sha256": "bb824de9017925c49ba991ed08f2d99723bd283b616c3fecbd8613c139fd237c",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P13",
+      "method": "itext2kg",
+      "section": "ch7_s4",
+      "repeat": 1,
+      "status": "failed",
+      "failure_kind": null
+    },
+    {
+      "label": "P14",
+      "method": "direct",
+      "section": "ch7_s4",
+      "repeat": 1,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "dsh",
+      "nodes": {
+        "full": 8,
+        "partial": 1
+      },
+      "relations": {
+        "full": 2,
+        "partial": 3
+      },
+      "support": {
+        "yes": 19
+      },
+      "prediction_sha256": "5111d3fcb33f837da084238630a9a25c43a67aea6435ff9228bff0d64ee45fbc",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P15",
+      "method": "itext2kg",
+      "section": "ch3_s2",
+      "repeat": 2,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "dsh",
+      "nodes": {
+        "full": 1,
+        "partial": 2,
+        "name_only": 3
+      },
+      "relations": {
+        "partial": 2
+      },
+      "support": {
+        "yes": 10,
+        "partial": 8
+      },
+      "prediction_sha256": "81402996a7abcb03ea4be8c927e1e1a8386c722e654a304e1d8f4dca213f1e49",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P16",
+      "method": "edc",
+      "section": "ch7_s4",
+      "repeat": 2,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "dsh",
+      "nodes": {
+        "full": 5,
+        "partial": 4
+      },
+      "relations": {
+        "partial": 5
+      },
+      "support": {
+        "yes": 12,
+        "partial": 2
+      },
+      "prediction_sha256": "942fda682b92ad4b1f9cddb8cda9bd79935728fc602198f0f20c06e53189fda2",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P17",
+      "method": "maf",
+      "section": "ch5_s4",
+      "repeat": 1,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "dsh",
+      "nodes": {
+        "full": 6,
+        "partial": 1,
+        "missing": 2
+      },
+      "relations": {
+        "full": 3
+      },
+      "support": {
+        "yes": 25
+      },
+      "prediction_sha256": "e0742abdfe5c020d9e58e500cd2d9f32273c1ae01ba598b11a558cca993ed2d3",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P18",
+      "method": "edc",
+      "section": "ch3_s2",
+      "repeat": 1,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "luna",
+      "nodes": {
+        "partial": 5,
+        "missing": 1
+      },
+      "relations": {
+        "partial": 2
+      },
+      "support": {
+        "yes": 8,
+        "partial": 7
+      },
+      "prediction_sha256": "28ca9ea6fdb25685841b83fd344fa0a37a1ee20ce8a7b931486fd53e406cc3be",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P19",
+      "method": "edc",
+      "section": "ch7_s4",
+      "repeat": 1,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "dsh",
+      "nodes": {
+        "full": 6,
+        "partial": 3
+      },
+      "relations": {
+        "partial": 4,
+        "name_only": 1
+      },
+      "support": {
+        "yes": 14,
+        "partial": 1
+      },
+      "prediction_sha256": "8bae27a6e8c9912e4352a8bb08bc00fee0fc6fec3a7ebe4de1c201aecff5f17d",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P20",
+      "method": "itext2kg",
+      "section": "ch5_s4",
+      "repeat": 1,
+      "status": "failed",
+      "failure_kind": null
+    },
+    {
+      "label": "P21",
+      "method": "direct",
+      "section": "ch5_s4",
+      "repeat": 1,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "dsh",
+      "nodes": {
+        "full": 7,
+        "missing": 2
+      },
+      "relations": {
+        "full": 3
+      },
+      "support": {
+        "yes": 13
+      },
+      "prediction_sha256": "3988b4e1e12023dca56d1bf991f75e8d3ea7817ff2db84835d2e135095e0822a",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P22",
+      "method": "maf",
+      "section": "ch3_s2",
+      "repeat": 2,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "dsh",
+      "nodes": {
+        "full": 4,
+        "partial": 1,
+        "missing": 1
+      },
+      "relations": {
+        "partial": 2
+      },
+      "support": {
+        "yes": 14
+      },
+      "prediction_sha256": "93fec8e0f0c57400a135ddc2b6535e8c2ed7d1efe4e3a79318251a157b53a650",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P23",
+      "method": "itext2kg",
+      "section": "ch3_s2",
+      "repeat": 1,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "luna",
+      "nodes": {
+        "full": 1,
+        "partial": 1,
+        "name_only": 2,
+        "missing": 2
+      },
+      "relations": {
+        "missing": 2
+      },
+      "support": {
+        "yes": 10,
+        "no": 1,
+        "undecided": 19
+      },
+      "prediction_sha256": "7e6463181a17bb0fb1d2c5cc13786dfcd2d20b9210666d05985dd28a1983bc0a",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P24",
+      "method": "maf",
+      "section": "ch7_s4",
+      "repeat": 1,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "dsh",
+      "nodes": {
+        "full": 8,
+        "partial": 1
+      },
+      "relations": {
+        "full": 5
+      },
+      "support": {
+        "yes": 25
+      },
+      "prediction_sha256": "0e45971fd295a9409f73726ef36286e88ce63692afecf26b54003faeac1966d4",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    }
+  ],
+  "review_guarded02": [
+    {
+      "label": "P01",
+      "method": "itext2kg",
+      "section": "ch7_s4",
+      "repeat": 2,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "dsh",
+      "nodes": {
+        "full": 4,
+        "partial": 3,
+        "missing": 2
+      },
+      "relations": {
+        "partial": 4,
+        "missing": 1
+      },
+      "support": {
+        "yes": 17,
+        "partial": 3,
+        "undecided": 32
+      },
+      "prediction_sha256": "1a8c77afaca7ed714810da237f0b6907936b4dcbe004f991d0f37f9398f190f5",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P02",
+      "method": "itext2kg",
+      "section": "ch5_s4",
+      "repeat": 1,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "dsh",
+      "nodes": {
+        "partial": 2,
+        "name_only": 4,
+        "missing": 3
+      },
+      "relations": {
+        "partial": 2,
+        "name_only": 1
+      },
+      "support": {
+        "yes": 26,
+        "partial": 5
+      },
+      "prediction_sha256": "086700a0d40a24accf4387a083954e9339c4e79d0f563f668aff6dd778a063b0",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    },
+    {
+      "label": "P03",
+      "method": "itext2kg",
+      "section": "ch7_s4",
+      "repeat": 1,
+      "status": "reviewed",
+      "validate": "OK",
+      "provenance_class": "dsh",
+      "nodes": {
+        "full": 4,
+        "partial": 3,
+        "missing": 2
+      },
+      "relations": {
+        "partial": 4,
+        "missing": 1
+      },
+      "support": {
+        "yes": 13,
+        "partial": 3,
+        "undecided": 24
+      },
+      "prediction_sha256": "34cd09bcd5da56281222a4110d6c2b7b3c75e58606f61ce9b2da397d3c6e7afd",
+      "packet_sha256_match": true,
+      "review_hash_state": "match"
+    }
+  ]
+}

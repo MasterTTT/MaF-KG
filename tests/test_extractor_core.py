@@ -191,7 +191,7 @@ class MemoryMergeTests(unittest.TestCase):
         self.assertEqual(outcome["description_action"], "replaced")
         self.assertEqual(outcome["description_revision"]["previous_description"], "旧描述")
 
-    def test_identity_conflict_distinguishes_model_error_from_retrieval_miss(self) -> None:
+    def test_exact_duplicate_reuses_canonical_identity(self) -> None:
         existing = NodeRecord(
             id=_node_id("Concept", "复合函数"),
             type="Concept",
@@ -226,22 +226,25 @@ class MemoryMergeTests(unittest.TestCase):
         for allowed, expected in [({existing.id}, "model_decision_conflict"), (set(), "memory_retrieval_miss")]:
             with self.subTest(expected=expected):
                 store = {existing.id: existing.model_copy(deep=True)}
-                with self.assertRaises(ChunkMergeError) as cm:
-                    self.extractor._merge_chunk_response(
-                        response,
-                        chunk,
-                        "source.md",
-                        ["复合函数"],
-                        store,
-                        {},
-                        {},
-                        allowed_existing_ids=allowed,
-                    )
-                self.assertEqual(cm.exception.item_kind, "node_action")
-                self.assertEqual(cm.exception.item_ref, "c1")
-                self.assertEqual(cm.exception.details["conflict_kind"], expected)
+                result = self.extractor._merge_chunk_response(
+                    response,
+                    chunk,
+                    "source.md",
+                    ["复合函数"],
+                    store,
+                    {},
+                    {},
+                    allowed_existing_ids=allowed,
+                )
+                self.assertEqual(result["created_node_count"], 0)
+                self.assertEqual(result["reused_node_count"], 1)
+                self.assertEqual(len(store), 1)
+                if allowed:
+                    self.assertEqual(result["identity_conflicts"][0]["conflict_kind"], expected)
+                    self.assertEqual(result["identity_conflicts"][0]["action"], "auto_reused")
                 self.assertIn(existing.id, store)
-                self.assertEqual(store[existing.id].description, "已有定义")
+                self.assertEqual(store[existing.id].description, "重复定义")
+                self.assertEqual(len(store[existing.id].evidence), 1)
 
 
 class SemanticDedupeTests(unittest.TestCase):
@@ -2041,7 +2044,7 @@ class StrictMergeTests(unittest.TestCase):
                 response, chunk, "source.md", ["函数", "极限"], {}, {}, {}, set()
             )
 
-    def test_duplicate_canonical_node_in_chunk_fails_chunk(self) -> None:
+    def test_duplicate_canonical_node_in_chunk_is_reused_and_audited(self) -> None:
         chunk = self.chunk()
         response = ChunkExtractionResponse(
             node_actions=[
@@ -2053,13 +2056,14 @@ class StrictMergeTests(unittest.TestCase):
             notes=[],
         )
         node_store: dict[str, NodeRecord] = {}
-        with self.assertRaises(ChunkMergeError) as cm:
-            self.extractor._merge_chunk_response(
-                response, chunk, "source.md", ["函数"], node_store, {}, {}, set()
-            )
-        self.assertEqual(cm.exception.item_kind, "node_action")
-        self.assertIn("duplicate canonical node", cm.exception.reason)
-        self.assertEqual(node_store, {})
+        result = self.extractor._merge_chunk_response(
+            response, chunk, "source.md", ["函数"], node_store, {}, {}, set()
+        )
+        self.assertEqual(len(node_store), 1)
+        self.assertEqual(result["created_node_count"], 1)
+        self.assertEqual(result["reused_node_count"], 1)
+        self.assertEqual(result["identity_conflicts"][0]["action"], "auto_reused_within_chunk")
+        self.assertEqual(result["identity_conflicts"][0]["ref_id"], "c2")
 
     def test_reuse_of_unknown_memory_id_fails_chunk(self) -> None:
         chunk = self.chunk()
@@ -2084,7 +2088,7 @@ class StrictMergeTests(unittest.TestCase):
         self.assertEqual(cm.exception.item_kind, "node_action")
         self.assertIn("was not supplied in node_memory", cm.exception.reason)
 
-    def test_reuse_claim_kind_mismatch_fails_chunk(self) -> None:
+    def test_reuse_claim_kind_mismatch_preserves_canonical_kind(self) -> None:
         chunk = self.chunk()
         existing = NodeRecord(
             id=_node_id("Claim", "极限唯一性"),
@@ -2112,11 +2116,12 @@ class StrictMergeTests(unittest.TestCase):
             notes=[],
         )
         store = {existing.id: existing.model_copy(deep=True)}
-        with self.assertRaises(ChunkMergeError) as cm:
-            self.extractor._merge_chunk_response(
-                response, chunk, "source.md", ["函数"], store, {}, {}, {existing.id}
-            )
-        self.assertIn("claim_kind mismatch", cm.exception.reason)
+        result = self.extractor._merge_chunk_response(
+            response, chunk, "source.md", ["函数"], store, {}, {}, {existing.id}
+        )
+        self.assertEqual(result["reused_node_count"], 1)
+        self.assertEqual(result["identity_conflicts"][0]["conflict_kind"], "reuse_claim_kind_mismatch")
+        self.assertEqual(result["identity_conflicts"][0]["action"], "keep_existing")
         self.assertEqual(store[existing.id].claim_kind, "property")
 
     def test_pending_unlinked_is_recorded_for_valid_response(self) -> None:

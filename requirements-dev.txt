@@ -1,0 +1,6 @@
+-r requirements.txt
+networkx>=3.6,<4
+numpy>=2,<3
+pytest>=9,<10
+rank-bm25==0.2.2
+tqdm>=4.66,<5

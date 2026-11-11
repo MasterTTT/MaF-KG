@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import uuid
 import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1366,6 +1367,7 @@ class ProviderChatClient:
             expected = api_key_env or " or ".join(adapter_class.api_key_envs)
             raise RuntimeError(f"{provider} API key not found. Set {expected}.")
         self.provider = provider
+        self.session_id = str(uuid.uuid4()) if self.adapter.name == "opencode-go" else None
         self.endpoint_url = _completion_url(base_url)
         self.model = model
         self.temperature = temperature
@@ -1459,6 +1461,8 @@ class ProviderChatClient:
             "Connection": "close",
             "User-Agent": f"MaF-KG-SemanticExtractor/0.1 ({self.provider})",
         }
+        if self.session_id is not None:
+            headers["x-opencode-session"] = self.session_id
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
