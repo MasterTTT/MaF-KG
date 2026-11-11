@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 .claude/
 tmp/
+.tmp/
 .tmp_*.txt
 
 # Local workspaces, credentials and generated artifacts are not source code.
